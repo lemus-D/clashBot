@@ -1,0 +1,13 @@
+# Virtual Environment
+.venv/
+
+# Python compiled files (junk)
+__pycache__/
+*.pyc
+
+# PyCharm settings (user-specific settings you shouldn't share)
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
