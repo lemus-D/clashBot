@@ -3,6 +3,7 @@ import numpy as np
 import pywinctl as gw
 import mss
 import supervision as sv
+from src.cardClasses import Troop
 from inference import get_model
 from dotenv import load_dotenv
 import os
@@ -13,6 +14,26 @@ load_dotenv()
 # Replace with your actual Project ID and Version Number (e.g., "troop-counter/2")
 MODEL_ID = "troop-counter/7"
 API_KEY = os.getenv('API_KEY')  # Find this in your Roboflow Settings
+
+
+def extract_data_loop(detections, monitor):
+    for box, class_name in zip(detections.xyxy, detections.data["class_name"]):
+        # 1. Unpack the Box Coordinates (from the capture window)
+        x_min, y_min, x_max, y_max = box
+
+        # 2. Calculate the Center Point (useful for clicking)
+        center_x = (x_min + x_max) / 2
+        center_y = (y_min + y_max) / 2
+
+        # 3. Convert to GLOBAL Screen Coordinates
+        # We add the window's offset so the mouse knows where to go
+        global_x = center_x + monitor["left"]
+        global_y = center_y + monitor["top"]
+
+        # 4. Use the Data (Example: Print it out)
+        troop =  Troop(class_name, global_x, global_y)
+
+        print(f"Found: {class_name} at Screen Pos: ({global_x:.0f}, {global_y:.0f})")
 
 
 def start_window_cap(window_name):
@@ -58,6 +79,8 @@ def start_window_cap(window_name):
 
             # Convert results to Supervision format
             detections = sv.Detections.from_inference(results)
+
+            extract_data_loop(detections, monitor)
 
             # Draw boxes and labels on the frame
             annotated_frame = box_annotator.annotate(scene=frame.copy(), detections=detections)

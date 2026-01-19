@@ -1,8 +1,3 @@
-import cv2
-import numpy as np
-import pywinctl as gw
-import mss
-import windowCap
 from src.windowCap import start_window_cap
 
 #Defining the capture window
