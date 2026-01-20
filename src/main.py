@@ -4,7 +4,8 @@ from src.windowCap import start_window_cap
 WINDOW_TITLE = 'BlueStacks App Player 1'
 
 def main():
-    start_window_cap(WINDOW_TITLE)
+    start_window_cap(WINDOW_TITLE,enable_mouse_control=True)
+
 
 if __name__ == '__main__':
     main()
