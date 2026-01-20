@@ -11,6 +11,12 @@ import time
 
 load_dotenv()
 
+# Suppress unnecessary model warnings
+os.environ['CORE_MODEL_SAM_ENABLED'] = 'False'
+os.environ['CORE_MODEL_SAM3_ENABLED'] = 'False'
+os.environ['CORE_MODEL_GAZE_ENABLED'] = 'False'
+os.environ['CORE_MODEL_YOLO_WORLD_ENABLED'] = 'False'
+
 # --- CONFIGURATION ---
 MODEL_ID = "troop-counter/7"
 API_KEY = os.getenv('API_KEY')
