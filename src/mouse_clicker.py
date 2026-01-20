@@ -19,7 +19,7 @@ os.environ['CORE_MODEL_YOLO_WORLD_ENABLED'] = 'False'
 
 # --- CONFIGURATION ---
 MODEL_ID = "troop-counter/7"
-API_KEY = os.getenv('API_KEY')
+API_KEY = "3tOzI22g4MrXRmtxbJnZ"
 
 # PyAutoGUI safety settings
 pyautogui.FAILSAFE = True  # Move mouse to corner to abort
@@ -249,12 +249,14 @@ class ClashRoyaleBot:
 
 def main():
     # Initialize bot
-    bot = ClashRoyaleBot(window_name="BlueStacks")  # Adjust window name
+    bot = ClashRoyaleBot(window_name="BlueStacks App Player 1")  # Adjust window name
     bot.load_model()
+
+    print("Bot running. Press 'q' to quit.")
 
     # Run with mouse control disabled for safety
     # Set to True when ready to test mouse control
-    bot.run_detection_loop(enable_mouse_control=False)
+    bot.run_detection_loop(enable_mouse_control=True)
 
 
 if __name__ == "__main__":
