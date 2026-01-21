@@ -1,0 +1,7 @@
+Use OCR or other text reading model to read tower health using text cords to tell what health is from what
+Count time and elixir (account for double triple elixir)
+Defining playable area (we may have to give it base card type information)(account for towers taken)
+Convert image cords into tile coordinates
+Way to tell when game ends
+Way to tell if it won or lost
+Way to play again
