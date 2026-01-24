@@ -1,5 +1,14 @@
-class Troop:
-    def __init__(self, name, x_cord, y_cord):
+class Card:
+    def __init__(self, name, cost):
         self.name = name
-        self.x_cord = x_cord
-        self.y_cord = y_cord
+        self.cost = cost
+
+
+class Troop:
+    def __init__(self, name,color):
+        self.name = name
+        self.color = color
+
+class BlankSpace:
+    def __init__(self):
+        self.space = []
