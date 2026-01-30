@@ -1,7 +1,11 @@
 Use OCR or other text reading model to read tower health using text cords to tell what health is from what
-Count time and elixir (account for double triple elixir)
+get model accuracy up
+C̶o̶u̶n̶t̶ ̶t̶i̶m̶e̶ ̶a̶n̶d̶ ̶e̶l̶i̶x̶i̶r̶ ̶(̶a̶c̶c̶o̶u̶n̶t̶ ̶f̶o̶r̶ ̶d̶o̶u̶b̶l̶e̶ ̶t̶r̶i̶p̶l̶e̶ ̶e̶l̶i̶x̶i̶r̶)̶
+Refactor WindowCap and move the main while loop into main.py
 Defining playable area (we may have to give it base card type information)(account for towers taken)
-Convert image cords into tile coordinates
-Way to tell when game ends
+C̶o̶n̶v̶e̶r̶t̶ ̶i̶m̶a̶g̶e̶ ̶c̶o̶r̶d̶s̶ ̶i̶n̶t̶o̶ ̶t̶i̶l̶e̶ ̶c̶o̶o̶r̶d̶i̶n̶a̶t̶e̶s̶
+Way to tell when game ends (Visually)
+Way to tell a Game starts (Visually)
 Way to tell if it won or lost
 Way to play again
+

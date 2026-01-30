@@ -9,6 +9,7 @@ import os
 import pyautogui
 import time
 from gameBoard import GameBoard  # Import your GameBoard class
+from src.gameState import GameState
 
 load_dotenv()
 
@@ -25,6 +26,122 @@ API_KEY = os.getenv('API_KEY')
 # PyAutoGUI safety settings
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.1
+
+# --- MOUSE CONTROL FUNCTIONS ---
+
+def screen_to_global(x, y, monitor):
+    """
+    Convert screen coordinates to global mouse coordinates
+
+    Args:
+        x: X coordinate relative to monitor region
+        y: Y coordinate relative to monitor region
+        monitor: The monitor dict with window position
+
+    Returns:
+        Tuple of (global_x, global_y)
+    """
+    global_x = monitor["left"] + x
+    global_y = monitor["top"] + y
+    return global_x, global_y
+
+
+def click_position(x, y, monitor, duration=0.1):
+    """
+    Click at a specific position relative to the game window
+
+    Args:
+        x: X coordinate relative to the captured monitor region
+        y: Y coordinate relative to the captured monitor region
+        monitor: The monitor dict with window position
+        duration: Time to move mouse (0 for instant)
+    """
+    global_x, global_y = screen_to_global(x, y, monitor)
+
+    # Move and click
+    if duration > 0:
+        pyautogui.moveTo(global_x, global_y, duration=duration)
+    else:
+        pyautogui.moveTo(global_x, global_y)
+
+    pyautogui.click()
+    print(f"Clicked at screen ({x}, {y}) -> global ({global_x}, {global_y})")
+
+
+def drag_card_to_position(card_x, card_y, target_x, target_y, monitor, duration=0.3):
+    """
+    Drag a card from hand to arena position
+
+    Args:
+        card_x: Starting X position (card in hand)
+        card_y: Starting Y position (card in hand)
+        target_x: Target X position in arena
+        target_y: Target Y position in arena
+        monitor: The monitor dict with window position
+        duration: Drag duration
+    """
+    start_global_x, start_global_y = screen_to_global(card_x, card_y, monitor)
+    end_global_x, end_global_y = screen_to_global(target_x, target_y, monitor)
+
+    # Perform drag
+    pyautogui.moveTo(start_global_x, start_global_y)
+    time.sleep(0.05)
+    pyautogui.drag(
+        end_global_x - start_global_x,
+        end_global_y - start_global_y,
+        duration=duration,
+        button='left'
+    )
+
+    print(f"Dragged card from ({card_x}, {card_y}) to ({target_x}, {target_y})")
+
+
+def place_card(card_index, arena_x, arena_y, monitor):
+    """
+    Place a card at a specific arena position
+
+    Args:
+        card_index: Index of card in hand (0-3 typically)
+        arena_x: Arena X coordinate (pixels relative to monitor)
+        arena_y: Arena Y coordinate (pixels relative to monitor)
+        monitor: The monitor dict
+    """
+    # Calculate card position in hand
+    # Adjust these values based on your actual card positions
+    card_spacing = 100  # Horizontal spacing between cards
+    card_y_pos = monitor["height"] - 100  # Cards near bottom
+    card_x_pos = (monitor["width"] // 2) - 150 + (card_index * card_spacing)
+
+    # Drag card to arena position
+    drag_card_to_position(
+        card_x_pos, card_y_pos,
+        arena_x, arena_y,
+        monitor,
+        duration=0.2
+    )
+
+
+def get_arena_tile_position(tile_x, tile_y, monitor):
+    """
+    Convert arena tile coordinates to pixel coordinates
+
+    Args:
+        tile_x: Tile X position (0-17 typically)
+        tile_y: Tile Y position (0-31 typically)
+        monitor: The monitor dict
+
+    Returns:
+        Tuple of pixel coordinates (x, y)
+    """
+    # These values need calibration based on your screen resolution
+    tile_width = monitor["width"] / 18
+    tile_height = monitor["height"] / 32
+
+    pixel_x = int(tile_x * tile_width)
+    pixel_y = int(tile_y * tile_height)
+
+    return pixel_x, pixel_y
+
 
 
 def start_window_cap(window_name, enable_mouse_control=False, save_training_data=False):
@@ -70,6 +187,9 @@ def start_window_cap(window_name, enable_mouse_control=False, save_training_data
     training_data = []
     frame_count = 0
 
+    game_state = GameState()
+    game_state.start_match()
+
     with mss.mss() as sct:
         print("Press 'q' to quit.")
         print("Press 's' to save current board state for training")
@@ -91,6 +211,7 @@ def start_window_cap(window_name, enable_mouse_control=False, save_training_data
                 game_board = GameBoard(monitor["width"], monitor["height"])
                 print(f"GameBoard initialized: {monitor['width']}x{monitor['height']} pixels")
                 print(f"Tile size: {game_board.tile_width:.1f}x{game_board.tile_height:.1f} pixels")
+
 
             # Capture screen
             screenshot = sct.grab(monitor)
@@ -185,6 +306,9 @@ def start_window_cap(window_name, enable_mouse_control=False, save_training_data
 
             cv2.imshow("Window Capture", annotated_frame)
 
+            print(game_state.get_current_match_time())
+            print(game_state.get_current_elixir())
+
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
 
@@ -217,6 +341,20 @@ def start_window_cap(window_name, enable_mouse_control=False, save_training_data
                 print(game_board.get_board_state())
                 print("=" * 50 + "\n")
 
+            elif key == ord('p') and enable_mouse_control:
+                # Test: Place first card in center of arena
+                center_x = monitor["width"] // 2
+                center_y = monitor["height"] // 2
+                place_card(0, center_x, center_y, monitor)
+                time.sleep(1)  # Cooldown
+
+            elif key == ord('c') and enable_mouse_control:
+                # Test: Click center of screen
+                click_position(
+                    monitor["width"] // 2,
+                    monitor["height"] // 2,
+                    monitor
+                )
             frame_count += 1
 
     cv2.destroyAllWindows()
