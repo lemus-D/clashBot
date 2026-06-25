@@ -18,7 +18,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from .gameState import TOWER_KEYS
+from ..game.state import TOWER_KEYS
 
 try:
     import pytesseract  # type: ignore

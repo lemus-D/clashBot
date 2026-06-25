@@ -1,9 +1,6 @@
 """Debug overlay rendering for the captured frame.
 
-Capture, mouse control, and the main loop now live in
-``capture.ScreenCapture``, ``actions.ActionExecutor``, and
-``environment.ClashEnv``. This module only owns visualization helpers
-used by ``main.py`` when running in ``--debug`` mode.
+Only used by ``main.py`` when running in ``--debug`` mode.
 """
 
 from __future__ import annotations
@@ -11,7 +8,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .gameBoard import GameBoard, ARENA_COLS, ARENA_ROWS
+from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS
 
 
 def draw_tile_grid(frame: np.ndarray, game_board: GameBoard) -> np.ndarray:

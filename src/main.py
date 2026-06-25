@@ -25,10 +25,10 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 
-from .actions import Action, action_space_size
-from .environment import ClashEnv
-from .gameBoard import HAND_SIZE, ARENA_COLS, ARENA_ROWS
-from .windowCap import render_debug_overlay
+from .env.actions import Action, action_space_size
+from .env.environment import ClashEnv
+from .game.board import HAND_SIZE, ARENA_COLS, ARENA_ROWS
+from .debug.overlay import render_debug_overlay
 
 
 WINDOW_TITLE = "BlueStacks App Player 1"

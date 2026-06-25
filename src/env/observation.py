@@ -28,14 +28,14 @@ from typing import Optional
 
 import numpy as np
 
-from .gameBoard import (
+from ..game.board import (
     GameBoard,
     HAND_SIZE,
     ARENA_COLS,
     ARENA_ROWS,
     TROOP_CLASSES,
 )
-from .gameState import GameState, TOWER_KEYS
+from ..game.state import GameState, TOWER_KEYS
 
 PHASES = ("normal", "double", "overtime_double", "overtime_triple")
 PHASE_INDEX = {p: i for i, p in enumerate(PHASES)}

@@ -40,16 +40,16 @@ from .actions import (
     action_to_index,
     index_to_action,
 )
-from .capture import ScreenCapture
-from .gameBoard import GameBoard
-from .gameState import GameState
-from .matchLifecycle import (
+from ..vision.capture import ScreenCapture
+from ..game.board import GameBoard
+from ..game.state import GameState
+from ..vision.lifecycle import (
     MatchLifecycle,
     STATE_IN_MATCH,
     STATE_POSTMATCH,
 )
 from .observation import ObservationBuilder
-from .towerHealth import TowerHealthReader
+from ..vision.ocr import TowerHealthReader
 
 # Roboflow inference is heavy; import lazily inside ``_load_model`` so
 # tests / static checks can import this module without the SDK.
