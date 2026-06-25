@@ -12,7 +12,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-from .cardClasses import Card, Troop, BlankSpace, EMPTY_CARD, EMPTY_TILE, is_empty
+from .cards import Card, Troop, BlankSpace, EMPTY_CARD, EMPTY_TILE, is_empty
 
 
 ARENA_COLS = 9

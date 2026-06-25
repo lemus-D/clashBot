@@ -24,9 +24,9 @@ from typing import Optional
 
 import pyautogui
 
-from .cardClasses import Card
-from .gameBoard import GameBoard, ARENA_COLS, ARENA_ROWS, HAND_SIZE
-from .gameState import GameState
+from ..game.cards import Card
+from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS, HAND_SIZE
+from ..game.state import GameState
 
 
 # Fractional positions of each hand slot relative to the captured

@@ -1,21 +1,27 @@
-"""Static lookup of Clash Royale card elixir costs.
+"""Card data: elixir cost database and lightweight card / troop data classes.
 
-The Roboflow detector emits class names like "cardknight" or "cardfireball".
-After the "card" prefix is stripped in GameBoard.process_detections, the
-remaining suffix is the dictionary key here.
+The cost database and data classes live together because the database has
+no consumers outside this module, and collapsing the boundary keeps the
+import graph flat.
 
-Names are stored lowercase with no spaces or punctuation so callers can
-normalize input before lookup.
+``EMPTY_CARD`` and ``EMPTY_TILE`` are module-level singletons used by
+``GameBoard`` to fill empty hand slots and arena tiles. Reusing one object
+per kind keeps per-frame allocation flat instead of allocating
+``9 * 16 = 144`` ``BlankSpace`` instances every clear.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_UNKNOWN_COST = 4
+# ---------------------------------------------------------------------------
+# Cost database
+# ---------------------------------------------------------------------------
 
+DEFAULT_UNKNOWN_COST = 4
 
 CARD_COSTS: dict[str, int] = {
     # 1 elixir
@@ -156,3 +162,59 @@ def get_card_cost(name: str) -> int:
 
 def is_known_card(name: str) -> bool:
     return _normalize(name) in CARD_COSTS
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
+class Card:
+    __slots__ = ("name", "cost")
+
+    def __init__(self, name: str, cost: Optional[int] = None):
+        self.name = name
+        self.cost = cost if cost is not None else get_card_cost(name)
+
+    def __repr__(self) -> str:
+        return f"Card(name={self.name!r}, cost={self.cost})"
+
+
+class Troop:
+    __slots__ = ("name", "color", "tile_x", "tile_y")
+
+    def __init__(
+        self,
+        name: str,
+        color: str,
+        tile_x: Optional[int] = None,
+        tile_y: Optional[int] = None,
+    ):
+        self.name = name
+        self.color = color
+        self.tile_x = tile_x
+        self.tile_y = tile_y
+
+    def __repr__(self) -> str:
+        return f"Troop(name={self.name!r}, color={self.color!r}, tile=({self.tile_x},{self.tile_y}))"
+
+
+class BlankSpace:
+    """Sentinel for an empty hand slot or arena tile.
+
+    Prefer the module-level ``EMPTY_CARD`` / ``EMPTY_TILE`` singletons over
+    constructing new instances in hot paths.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "BlankSpace()"
+
+
+EMPTY_CARD: BlankSpace = BlankSpace()
+EMPTY_TILE: BlankSpace = BlankSpace()
+
+
+def is_empty(value: object) -> bool:
+    return isinstance(value, BlankSpace)

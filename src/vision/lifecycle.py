@@ -49,8 +49,9 @@ OK_BUTTON_FRAC = (0.50, 0.93)
 BATTLE_BUTTON_FRAC = (0.50, 0.62)
 
 # Template assets (relative to project root).
+# __file__ is src/vision/lifecycle.py, so three dirnames reach the project root.
 TEMPLATE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "assets",
     "templates",
 )
