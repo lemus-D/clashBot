@@ -78,12 +78,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--window", default=WINDOW_TITLE)
     p.add_argument("--model", default=MODEL_ID)
+    p.add_argument(
+        "--calibrate", action="store_true",
+        help="run the interactive calibration wizard and exit",
+    )
     return p.parse_args()
 
 
 def run() -> None:
     args = parse_args()
     load_dotenv()
+
+    if args.calibrate:
+        from .calibrate import calibrate
+        calibrate(args.window)
+        return
 
     policy: Policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
 
