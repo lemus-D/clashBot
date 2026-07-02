@@ -32,12 +32,12 @@ except Exception:
 # CALIBRATE FOR YOUR RESOLUTION: the values below are reasonable defaults
 # for a portrait BlueStacks crop and almost certainly need adjustment.
 TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
-    "friendly_left":  (0.05, 0.62, 0.12, 0.05),
-    "friendly_right": (0.83, 0.62, 0.12, 0.05),
-    "friendly_king":  (0.44, 0.78, 0.12, 0.05),
-    "enemy_left":     (0.05, 0.30, 0.12, 0.05),
-    "enemy_right":    (0.83, 0.30, 0.12, 0.05),
-    "enemy_king":     (0.44, 0.18, 0.12, 0.05),
+    "enemy_king":  (0.3974, 0.0120, 0.2102, 0.0444),
+    "enemy_left":  (0.1658, 0.1322, 0.1527, 0.0351),
+    "enemy_right":  (0.6864, 0.1331, 0.1527, 0.0333),
+    "friendly_king":  (0.3924, 0.7403, 0.2200, 0.0471),
+    "friendly_left":  (0.1626, 0.6118, 0.1576, 0.0582),
+    "friendly_right":  (0.6880, 0.6091, 0.1494, 0.0370),
 }
 
 

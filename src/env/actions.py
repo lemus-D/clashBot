@@ -33,10 +33,10 @@ from ..game.state import GameState
 # monitor. CALIBRATE: open the game, hover the mouse over the centre of
 # each card, note the (x_frac, y_frac), and update.
 HAND_CARD_POSITIONS: tuple[tuple[float, float], ...] = (
-    (0.30, 0.92),
-    (0.43, 0.92),
-    (0.57, 0.92),
-    (0.70, 0.92),
+    (0.3071, 0.8845),
+    (0.4992, 0.8845),
+    (0.6946, 0.8845),
+    (0.8719, 0.8891),
 )
 
 DRAG_DURATION_SEC = 0.20
