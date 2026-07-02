@@ -47,6 +47,7 @@ from ..vision.lifecycle import (
     MatchLifecycle,
     STATE_IN_MATCH,
     STATE_POSTMATCH,
+    TEMPLATE_MATCH_THRESHOLD,
 )
 from .observation import ObservationBuilder
 from ..vision.ocr import TowerHealthReader
@@ -174,13 +175,6 @@ class ClashEnv:
         if self.capture is None:
             self.capture = ScreenCapture(self.window_title).__enter__()
 
-        # If we're sitting on the postmatch screen, click through to a new battle.
-        frame = self.capture.grab()
-        signals = self.lifecycle.detect_state(frame)
-        if signals.state == STATE_POSTMATCH:
-            self.lifecycle.auto_rematch(self.capture.monitor)
-            time.sleep(2.0)
-
         self._wait_for_in_match(timeout_sec=wait_timeout_sec)
 
         monitor = self.capture.monitor
@@ -280,6 +274,10 @@ class ClashEnv:
         self._last_step_time = time.time()
 
     def _wait_for_in_match(self, timeout_sec: float) -> None:
+        """Drive the UI into a match: dismiss postmatch screens, press
+        Battle when the menu button is visible, then wait for the match
+        to start. Battle is only clicked on a confirmed template hit so
+        we never click blindly during loading or matchmaking."""
         assert self.capture is not None
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
@@ -287,7 +285,18 @@ class ClashEnv:
             signals = self.lifecycle.detect_state(frame)
             if signals.state == STATE_IN_MATCH:
                 return
-            time.sleep(0.5)
+            monitor = self.capture.monitor
+            if signals.state == STATE_POSTMATCH:
+                self.lifecycle.click_ok(monitor, frame)
+                time.sleep(2.0)
+            elif (
+                signals.template_hits.get("battle_button", 0.0)
+                >= TEMPLATE_MATCH_THRESHOLD
+            ):
+                self.lifecycle.click_battle(monitor, frame)
+                time.sleep(2.0)
+            else:
+                time.sleep(0.5)
         raise TimeoutError(
             f"Did not detect match start within {timeout_sec:.0f}s"
         )

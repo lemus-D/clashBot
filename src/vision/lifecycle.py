@@ -33,25 +33,36 @@ STATE_POSTMATCH = "POSTMATCH"
 # ----- calibration -----
 
 # Sample these (x_frac, y_frac) pixels in the captured frame. CALIBRATE.
-ELIXIR_BAR_SAMPLE = (0.50, 0.965)        # purple elixir bar in-match
 VICTORY_BANNER_SAMPLE = (0.50, 0.20)     # yellow/gold victory banner area
 DEFEAT_BANNER_SAMPLE = (0.50, 0.20)      # blue defeat banner area
 COUNTDOWN_SAMPLE = (0.50, 0.50)          # center "3 / 2 / 1" overlay
 
+# In-match detection: fraction of magenta pixels inside the left part of
+# the elixir bar. A patch is far more robust than a single pixel - the
+# bar is thin and crossed by white segment ticks. (x0, y0, x1, y1)
+# fractions of the frame. CALIBRATE.
+ELIXIR_BAR_PATCH = (0.20, 0.955, 0.40, 0.978)
+ELIXIR_MAGENTA_MIN_FRAC = 0.10
+
 # Reference colors in BGR; tolerance is per-channel L1 distance.
-COLOR_PURPLE_ELIXIR = (180, 60, 200)
 COLOR_VICTORY_GOLD = (60, 200, 235)
 COLOR_DEFEAT_BLUE = (200, 110, 60)
 COLOR_TOLERANCE = 60
 
-# Click targets for auto-rematch (fractions of monitor). CALIBRATE.
+# Fallback click targets when template matching fails (fractions of
+# monitor). CALIBRATE.
 OK_BUTTON_FRAC = (0.50, 0.93)
-BATTLE_BUTTON_FRAC = (0.50, 0.62)
+BATTLE_BUTTON_FRAC = (0.50, 0.78)
 
-# Template assets (relative to project root).
-# __file__ is src/vision/lifecycle.py, so three dirnames reach the project root.
+# Templates were captured at a larger window size than the current
+# capture; resize them at load so matchTemplate scores stay high.
+# CALIBRATE when the BlueStacks window size changes.
+TEMPLATE_SCALE = 0.74
+
+# Template assets live next to the source tree in src/assets/templates.
+# __file__ is src/vision/lifecycle.py, so two dirnames reach src/.
 TEMPLATE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "assets",
     "templates",
 )
@@ -99,16 +110,31 @@ class MatchLifecycle:
             if os.path.isfile(path):
                 img = cv2.imread(path, cv2.IMREAD_COLOR)
                 if img is not None:
+                    if TEMPLATE_SCALE != 1.0:
+                        img = cv2.resize(
+                            img, None, fx=TEMPLATE_SCALE, fy=TEMPLATE_SCALE
+                        )
                     self._templates[key] = img
 
     def _match_template(self, frame: np.ndarray, key: str) -> float:
+        score, _ = self._locate_template(frame, key)
+        return score
+
+    def _locate_template(
+        self, frame: np.ndarray, key: str
+    ) -> tuple[float, Optional[tuple[float, float]]]:
+        """Best match score and its centre as (x_frac, y_frac), or None."""
         tmpl = self._templates.get(key)
         if tmpl is None or frame is None or frame.size == 0:
-            return 0.0
+            return 0.0, None
         if tmpl.shape[0] > frame.shape[0] or tmpl.shape[1] > frame.shape[1]:
-            return 0.0
+            return 0.0, None
         result = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
-        return float(result.max())
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        h, w = frame.shape[:2]
+        cx = (max_loc[0] + tmpl.shape[1] / 2) / w
+        cy = (max_loc[1] + tmpl.shape[0] / 2) / h
+        return float(max_val), (cx, cy)
 
     # ----- detection -----
 
@@ -141,8 +167,7 @@ class MatchLifecycle:
     def _color_based_state(self, frame: np.ndarray) -> str:
         if frame is None or frame.size == 0:
             return self._last_state
-        elixir_px = _sample_pixel(frame, ELIXIR_BAR_SAMPLE)
-        if _color_distance(elixir_px, COLOR_PURPLE_ELIXIR) <= COLOR_TOLERANCE:
+        if self._elixir_bar_visible(frame):
             return STATE_IN_MATCH
 
         banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
@@ -158,6 +183,19 @@ class MatchLifecycle:
             return STATE_IN_MATCH
         return STATE_MENU
 
+    @staticmethod
+    def _elixir_bar_visible(frame: np.ndarray) -> bool:
+        h, w = frame.shape[:2]
+        x0, y0, x1, y1 = ELIXIR_BAR_PATCH
+        patch = frame[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)]
+        if patch.size == 0:
+            return False
+        b = patch[..., 0].astype(int)
+        g = patch[..., 1].astype(int)
+        r = patch[..., 2].astype(int)
+        magenta = (b > 180) & (r > 180) & (g < 140)
+        return float(magenta.mean()) >= ELIXIR_MAGENTA_MIN_FRAC
+
     def _color_based_result(self, frame: np.ndarray) -> Optional[str]:
         banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
         if _color_distance(banner_px, COLOR_VICTORY_GOLD) <= COLOR_TOLERANCE:
@@ -168,22 +206,31 @@ class MatchLifecycle:
 
     # ----- side effects -----
 
-    def auto_rematch(self, monitor: dict, between_clicks_sec: float = 1.5) -> None:
-        """Click ``OK`` then ``Battle`` to start a new match.
-
-        Coordinates are taken from ``OK_BUTTON_FRAC`` and
-        ``BATTLE_BUTTON_FRAC``. The caller passes the ``mss`` monitor
-        dict so we can convert to global screen coordinates.
-        """
-        import time
-
-        ok_x = monitor["left"] + int(OK_BUTTON_FRAC[0] * monitor["width"])
-        ok_y = monitor["top"] + int(OK_BUTTON_FRAC[1] * monitor["height"])
-        pyautogui.moveTo(ok_x, ok_y)
+    def _click_frac(self, monitor: dict, frac_xy: tuple[float, float]) -> None:
+        x = monitor["left"] + int(frac_xy[0] * monitor["width"])
+        y = monitor["top"] + int(frac_xy[1] * monitor["height"])
+        pyautogui.moveTo(x, y)
         pyautogui.click()
-        time.sleep(between_clicks_sec)
 
-        battle_x = monitor["left"] + int(BATTLE_BUTTON_FRAC[0] * monitor["width"])
-        battle_y = monitor["top"] + int(BATTLE_BUTTON_FRAC[1] * monitor["height"])
-        pyautogui.moveTo(battle_x, battle_y)
-        pyautogui.click()
+    def _click_template(
+        self,
+        monitor: dict,
+        frame: Optional[np.ndarray],
+        key: str,
+        fallback_frac: tuple[float, float],
+    ) -> None:
+        """Click the template's matched centre, or ``fallback_frac``."""
+        frac = fallback_frac
+        if frame is not None:
+            score, loc = self._locate_template(frame, key)
+            if loc is not None and score >= TEMPLATE_MATCH_THRESHOLD:
+                frac = loc
+        self._click_frac(monitor, frac)
+
+    def click_ok(self, monitor: dict, frame: Optional[np.ndarray] = None) -> None:
+        """Dismiss the postmatch screen."""
+        self._click_template(monitor, frame, "ok_button", OK_BUTTON_FRAC)
+
+    def click_battle(self, monitor: dict, frame: Optional[np.ndarray] = None) -> None:
+        """Start a match from the main menu."""
+        self._click_template(monitor, frame, "battle_button", BATTLE_BUTTON_FRAC)
