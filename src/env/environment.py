@@ -56,34 +56,32 @@ from ..vision.ocr import TowerHealthReader
 # tests / static checks can import this module without the SDK.
 
 
-RewardFn = Callable[[GameState, GameState, Optional[str], "ActionResult"], float]
+# prev_tower_hp is a copy of state.tower_hp taken before the step.
+RewardFn = Callable[
+    [dict[str, Optional[int]], GameState, Optional[str], "ActionResult"], float
+]
 
 
 def default_reward(
-    prev: GameState,
-    curr: GameState,
+    prev_tower_hp: dict[str, Optional[int]],
+    state: GameState,
     result: Optional[str],
     action_result: ActionResult,
 ) -> float:
-    """+1 per HP knocked off enemy towers, -1 per friendly HP lost.
+    """0.001 per HP knocked off enemy towers, -0.001 per friendly HP lost,
+    +/-10 on win/loss, -0.05 for a failed (non-no-op) action."""
 
-    Win/loss/draw are added to this dense signal rather than replacing
-    it so policies still see structure even on draws.
-    """
+    def total(side: str, tower_hp: dict[str, Optional[int]]) -> float:
+        return sum(
+            float(v)
+            for k, v in tower_hp.items()
+            if k.startswith(side) and v is not None
+        )
 
-    def total(side_keys, source: GameState) -> float:
-        s = 0.0
-        for k in side_keys:
-            v = source.tower_hp.get(k)
-            if v is not None:
-                s += float(v)
-        return s
-
-    enemy_keys = ("enemy_left", "enemy_right", "enemy_king")
-    friendly_keys = ("friendly_left", "friendly_right", "friendly_king")
-
-    delta_enemy = total(enemy_keys, prev) - total(enemy_keys, curr)
-    delta_friendly = total(friendly_keys, prev) - total(friendly_keys, curr)
+    delta_enemy = total("enemy", prev_tower_hp) - total("enemy", state.tower_hp)
+    delta_friendly = total("friendly", prev_tower_hp) - total(
+        "friendly", state.tower_hp
+    )
 
     reward = 0.001 * (delta_enemy - delta_friendly)
 
@@ -92,19 +90,10 @@ def default_reward(
     elif result == "loss":
         reward -= 10.0
 
-    if not action_result.success and action_result.reason not in ("no_op",):
+    if not action_result.success:
         reward -= 0.05
 
     return reward
-
-
-class _StateSnapshot:
-    """Cheap deep-ish copy of the HP fields used for reward computation."""
-
-    __slots__ = ("tower_hp",)
-
-    def __init__(self, source: GameState):
-        self.tower_hp = dict(source.tower_hp)
 
 
 class ClashEnv:
@@ -165,9 +154,6 @@ class ClashEnv:
     def action_space_size(self) -> int:
         return action_space_size()
 
-    def observation_shapes(self) -> dict[str, tuple]:
-        return self.observer.observation_shapes()
-
     # ----- public API -----
 
     def reset(self, wait_timeout_sec: float = 60.0) -> dict:
@@ -200,7 +186,7 @@ class ClashEnv:
 
         self._throttle()
 
-        prev_snapshot = _StateSnapshot(self.state)
+        prev_tower_hp = dict(self.state.tower_hp)
 
         # Execute action first so vision picks up the new troop next frame.
         assert self.capture is not None and self.board is not None
@@ -226,7 +212,7 @@ class ClashEnv:
             done = True
 
         reward = float(
-            self.reward_fn(prev_snapshot, self.state, signals.result, action_result)
+            self.reward_fn(prev_tower_hp, self.state, signals.result, action_result)
         )
 
         obs = self._build_observation()

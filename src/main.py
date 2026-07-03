@@ -1,17 +1,11 @@
-"""Entry point: drive ``ClashEnv`` with a pluggable policy.
-
-The default policy is ``RandomPolicy`` which picks any (affordable,
-placeable) action. Swap in your trained policy by replacing the
-``policy`` callable below; the contract is ``policy(obs) -> action``
-where ``action`` is either an ``Action`` instance, an integer index
-into the discrete action space, or a ``(hand, x, y)`` tuple.
+"""Entry point: drive ``ClashEnv`` with a policy (``policy(obs) -> Action``).
 
 Usage::
 
     python -m src.main
     python -m src.main --debug
-    python -m src.main --record logs/run.jsonl
     python -m src.main --episodes 5 --record logs/run.jsonl
+    python -m src.main --calibrate
 """
 
 from __future__ import annotations
@@ -19,7 +13,6 @@ from __future__ import annotations
 import argparse
 import random
 import time
-from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -35,9 +28,6 @@ WINDOW_TITLE = "BlueStacks App Player 1"
 MODEL_ID = "troop-counter/7"
 
 
-Policy = Callable[[dict], object]
-
-
 class RandomPolicy:
     """Picks a uniformly random valid action, or NO_OP if none exist.
 
@@ -46,7 +36,7 @@ class RandomPolicy:
     drag attempts.
     """
 
-    def __init__(self, no_op_prob: float = 0.5, seed: Optional[int] = None):
+    def __init__(self, no_op_prob: float = 0.5, seed: int | None = None):
         self.no_op_prob = no_op_prob
         self.rng = random.Random(seed)
 
@@ -85,6 +75,34 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def run_episode(env: ClashEnv, policy: RandomPolicy, debug: bool) -> None:
+    """Play one episode to completion and print its summary."""
+    obs = env.reset()
+    done = False
+    total_reward = 0.0
+
+    while not done:
+        obs, reward, done, info = env.step(policy(obs))
+        total_reward += reward
+
+        if debug and env._frame is not None and env.board is not None:
+            overlay = render_debug_overlay(
+                env._frame,
+                env.board,
+                env.state,
+                lifecycle_state=info.get("lifecycle_state"),
+            )
+            cv2.imshow("clashBot debug", overlay)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                done = True
+
+    print(
+        f"Episode complete: reward={total_reward:.2f} | "
+        f"result={env.state.match_result} | "
+        f"steps={info.get('step', '?')}"
+    )
+
+
 def run() -> None:
     args = parse_args()
     load_dotenv()
@@ -94,8 +112,7 @@ def run() -> None:
         calibrate(args.window)
         return
 
-    policy: Policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
-
+    policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
     env = ClashEnv(
         window_title=args.window,
         model_id=args.model,
@@ -111,32 +128,7 @@ def run() -> None:
     try:
         for episode in range(args.episodes):
             print(f"\n=== Episode {episode + 1}/{args.episodes} ===")
-            obs = env.reset()
-            done = False
-            total_reward = 0.0
-
-            while not done:
-                action = policy(obs)
-                obs, reward, done, info = env.step(action)
-                total_reward += reward
-
-                if args.debug and env._frame is not None and env.board is not None:
-                    overlay = render_debug_overlay(
-                        env._frame,
-                        env.board,
-                        env.state,
-                        lifecycle_state=info.get("lifecycle_state"),
-                    )
-                    cv2.imshow("clashBot debug", overlay)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        done = True
-
-            print(
-                f"Episode complete: reward={total_reward:.2f} | "
-                f"result={env.state.match_result} | "
-                f"steps={info.get('step', '?')}"
-            )
-
+            run_episode(env, policy, debug=args.debug)
             time.sleep(2.0)
     finally:
         if args.debug:

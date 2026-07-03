@@ -44,29 +44,15 @@ def render_debug_overlay(
     frame: np.ndarray,
     board: GameBoard,
     state,
-    detection_summary: dict | None = None,
     lifecycle_state: str | None = None,
 ) -> np.ndarray:
-    """Annotate a captured frame with grid + status text.
-
-    Detector boxes/labels are intentionally NOT drawn here so this is
-    cheap to call without a Supervision dependency. ``main.py`` mixes
-    in the annotated detection frame separately when desired.
-    """
+    """Annotate a captured frame with the tile grid and status text."""
     out = frame.copy()
     out = draw_tile_grid(out, board)
 
-    lines: list[str] = []
-    if state is not None:
-        try:
-            lines.append(state.get_status_string())
-        except Exception:
-            pass
+    lines = [state.get_status_string()]
     if lifecycle_state is not None:
         lines.append(f"Lifecycle: {lifecycle_state}")
-    if detection_summary is not None:
-        lines.append(f"Cards: {len(detection_summary.get('cards_in_hand', []))}")
-        lines.append(f"Troops: {len(detection_summary.get('troops_on_board', []))}")
 
     y_off = 30
     for line in lines:

@@ -24,7 +24,6 @@ from typing import Optional
 
 import pyautogui
 
-from ..game.cards import Card
 from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS, HAND_SIZE
 from ..game.state import GameState
 
@@ -135,7 +134,7 @@ class ActionExecutor:
             return ActionResult(success=False, reason=f"bad hand_index {action.hand_index}")
 
         card = board.cards_in_hand[action.hand_index]
-        if not isinstance(card, Card):
+        if card is None:
             return ActionResult(success=False, reason="hand slot empty")
 
         if not (0 <= action.tile_x < ARENA_COLS and 0 <= action.tile_y < ARENA_ROWS):

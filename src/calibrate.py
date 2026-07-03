@@ -6,10 +6,11 @@ Usage::
     # or directly:
     python -m src.calibrate
 
-Three phases (follow the on-screen prompts):
-  1. Crop    — drag a rectangle around the game viewport on the raw window.
+Three phases (follow the on-screen prompts; rectangles are two clicks,
+top-left then bottom-right):
+  1. Crop    — mark the game viewport rectangle on the raw window.
   2. Cards   — click the centre of each of the four hand-card slots.
-  3. Towers  — drag a rectangle around each tower's HP number (6 total).
+  3. Towers  — mark each tower's HP-number rectangle (6 total).
 
 At the end the new constants are printed; paste them into the source files shown.
 """

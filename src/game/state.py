@@ -6,29 +6,30 @@ normal/double/triple phases) and is corrected by ``spend_elixir`` when
 the action layer commits a placement.
 
 Tower HP and match result are externally driven: ``TowerHealthReader``
-and ``MatchLifecycle`` push values in via ``set_tower_hp`` and
-``set_match_result``. Callbacks fire on ``start_match`` / ``end_match``
-so ``ClashEnv`` can subscribe without subclassing.
+and ``MatchLifecycle`` push values in via ``update_tower_hp`` and
+``set_match_result``.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Callable, Literal, Optional
+from typing import Literal, Optional
 
 MatchResult = Literal["win", "loss", "draw"]
 
 DEFAULT_PRINCESS_HP = 2534
 DEFAULT_KING_HP = 4824
 
-TOWER_KEYS = (
-    "friendly_left",
-    "friendly_right",
-    "friendly_king",
-    "enemy_left",
-    "enemy_right",
-    "enemy_king",
-)
+DEFAULT_TOWER_HP: dict[str, int] = {
+    "friendly_left": DEFAULT_PRINCESS_HP,
+    "friendly_right": DEFAULT_PRINCESS_HP,
+    "friendly_king": DEFAULT_KING_HP,
+    "enemy_left": DEFAULT_PRINCESS_HP,
+    "enemy_right": DEFAULT_PRINCESS_HP,
+    "enemy_king": DEFAULT_KING_HP,
+}
+
+TOWER_KEYS: tuple[str, ...] = tuple(DEFAULT_TOWER_HP)
 
 
 class GameState:
@@ -56,38 +57,13 @@ class GameState:
         self.last_elixir_update: Optional[float] = None
         self.is_match_active: bool = False
 
-        self.tower_hp: dict[str, Optional[int]] = {
-            "friendly_left": DEFAULT_PRINCESS_HP,
-            "friendly_right": DEFAULT_PRINCESS_HP,
-            "friendly_king": DEFAULT_KING_HP,
-            "enemy_left": DEFAULT_PRINCESS_HP,
-            "enemy_right": DEFAULT_PRINCESS_HP,
-            "enemy_king": DEFAULT_KING_HP,
-        }
-        self.tower_max_hp: dict[str, int] = {
-            "friendly_left": DEFAULT_PRINCESS_HP,
-            "friendly_right": DEFAULT_PRINCESS_HP,
-            "friendly_king": DEFAULT_KING_HP,
-            "enemy_left": DEFAULT_PRINCESS_HP,
-            "enemy_right": DEFAULT_PRINCESS_HP,
-            "enemy_king": DEFAULT_KING_HP,
-        }
+        self.tower_hp: dict[str, Optional[int]] = dict(DEFAULT_TOWER_HP)
+        self.tower_max_hp: dict[str, int] = dict(DEFAULT_TOWER_HP)
 
         self.crowns_friendly: int = 0
         self.crowns_enemy: int = 0
         self.match_result: Optional[MatchResult] = None
         self._destroyed_towers: set[str] = set()
-
-        self._on_start: list[Callable[["GameState"], None]] = []
-        self._on_end: list[Callable[["GameState"], None]] = []
-
-    # ----- callbacks -----
-
-    def on_match_start(self, callback: Callable[["GameState"], None]) -> None:
-        self._on_start.append(callback)
-
-    def on_match_end(self, callback: Callable[["GameState"], None]) -> None:
-        self._on_end.append(callback)
 
     # ----- lifecycle -----
 
@@ -103,16 +79,12 @@ class GameState:
         for k in TOWER_KEYS:
             self.tower_hp[k] = self.tower_max_hp[k]
         self._destroyed_towers.clear()
-        for cb in self._on_start:
-            cb(self)
         print("Match started!")
 
     def end_match(self, result: Optional[MatchResult] = None) -> None:
         if result is not None:
             self.match_result = result
         self.is_match_active = False
-        for cb in self._on_end:
-            cb(self)
         print(f"Match ended! result={self.match_result}")
 
     # ----- timing -----
@@ -122,11 +94,6 @@ class GameState:
             return 0
         elapsed = time.time() - self.match_start_time
         return min(elapsed, self.MATCH_MAX_DURATION)
-
-    def get_time_remaining(self) -> float:
-        if not self.is_match_active:
-            return 0.0
-        return max(0.0, self.MATCH_MAX_DURATION - self.get_current_match_time())
 
     def get_match_phase(self) -> str:
         if not self.is_match_active:
@@ -139,9 +106,6 @@ class GameState:
         if elapsed < self.TRIPLE_ELIXIR_START:
             return "overtime_double"
         return "overtime_triple"
-
-    def is_overtime(self) -> bool:
-        return self.get_current_match_time() >= self.REGULAR_TIME_END
 
     # ----- elixir -----
 
@@ -173,19 +137,14 @@ class GameState:
         self.update_elixir()
         if self.current_elixir + 1e-6 >= amount:
             self.current_elixir -= amount
-            print(f"Spent {amount} elixir. Remaining: {self.current_elixir:.1f}")
             return True
-        print(
-            f"Not enough elixir! Have {self.current_elixir:.1f}, need {amount}"
-        )
         return False
 
     # ----- towers -----
 
     def set_tower_hp(self, key: str, value: Optional[int]) -> None:
         if key not in self.tower_hp:
-            print(f"Unknown tower key: {key}")
-            return
+            raise KeyError(f"Unknown tower key {key!r}; expected one of {TOWER_KEYS}")
         self.tower_hp[key] = value
         if value is not None and value <= 0:
             self._register_tower_destroyed(key)
@@ -202,22 +161,22 @@ class GameState:
             self.crowns_friendly = min(3, self.crowns_friendly + 1)
             if key == "enemy_king":
                 self.set_match_result("win")
-        elif key.startswith("friendly"):
+        else:
             self.crowns_enemy = min(3, self.crowns_enemy + 1)
             if key == "friendly_king":
                 self.set_match_result("loss")
 
     def is_enemy_left_alive(self) -> bool:
-        v = self.tower_hp.get("enemy_left")
+        v = self.tower_hp["enemy_left"]
         return v is None or v > 0
 
     def is_enemy_right_alive(self) -> bool:
-        v = self.tower_hp.get("enemy_right")
+        v = self.tower_hp["enemy_right"]
         return v is None or v > 0
 
     def is_enemy_king_active(self) -> bool:
-        v = self.tower_hp.get("enemy_king")
-        return v is not None and v < self.tower_max_hp.get("enemy_king", DEFAULT_KING_HP)
+        v = self.tower_hp["enemy_king"]
+        return v is not None and v < self.tower_max_hp["enemy_king"]
 
     # ----- result -----
 
@@ -228,15 +187,7 @@ class GameState:
 
     def get_formatted_time(self) -> str:
         elapsed = self.get_current_match_time()
-        minutes = int(elapsed // 60)
-        seconds = int(elapsed % 60)
-        return f"{minutes}:{seconds:02d}"
-
-    def get_formatted_time_remaining(self) -> str:
-        remaining = self.get_time_remaining()
-        minutes = int(remaining // 60)
-        seconds = int(remaining % 60)
-        return f"{minutes}:{seconds:02d}"
+        return f"{int(elapsed // 60)}:{int(elapsed % 60):02d}"
 
     def get_status_string(self) -> str:
         if not self.is_match_active:

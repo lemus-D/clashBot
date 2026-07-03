@@ -1,22 +1,20 @@
 """Visual detection of match lifecycle: menu -> in-match -> postmatch.
 
-Two layered signals are used:
+Two layered signals:
 
-1. Pixel-color sampling at calibrated coordinates (cheap, always on).
-2. Optional template matching against PNGs in ``assets/templates/``
-   (more reliable when calibrated, silently skipped when missing).
+1. Template matching against PNGs in ``src/assets/templates/``
+   (battle button, OK button, victory/defeat banners).
+2. Color heuristics as fallback: a magenta-pixel fraction inside the
+   elixir bar means in-match; banner colors suggest postmatch.
 
-All coordinates and color thresholds are exposed as module-level
-constants. They are guesses tuned to a portrait BlueStacks crop and
-almost certainly need adjustment for your machine - search for
-``CALIBRATE`` to find them.
+Per-machine coordinates and thresholds are module-level constants
+marked ``CALIBRATE``.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -26,16 +24,13 @@ import pyautogui
 # ----- lifecycle states -----
 
 STATE_MENU = "MENU"
-STATE_COUNTDOWN = "COUNTDOWN"
 STATE_IN_MATCH = "IN_MATCH"
 STATE_POSTMATCH = "POSTMATCH"
 
 # ----- calibration -----
 
-# Sample these (x_frac, y_frac) pixels in the captured frame. CALIBRATE.
-VICTORY_BANNER_SAMPLE = (0.50, 0.20)     # yellow/gold victory banner area
-DEFEAT_BANNER_SAMPLE = (0.50, 0.20)      # blue defeat banner area
-COUNTDOWN_SAMPLE = (0.50, 0.50)          # center "3 / 2 / 1" overlay
+# (x_frac, y_frac) pixel sampled for the postmatch banner color. CALIBRATE.
+VICTORY_BANNER_SAMPLE = (0.50, 0.20)
 
 # In-match detection: fraction of magenta pixels inside the left part of
 # the elixir bar. A patch is far more robust than a single pixel - the
@@ -78,8 +73,8 @@ TEMPLATE_MATCH_THRESHOLD = 0.80
 @dataclass
 class LifecycleSignals:
     state: str
-    result: Optional[str] = None
-    template_hits: dict[str, float] = None  # type: ignore[assignment]
+    result: str | None = None
+    template_hits: dict[str, float] = field(default_factory=dict)
 
 
 def _color_distance(a, b) -> float:
@@ -96,7 +91,7 @@ def _sample_pixel(frame: np.ndarray, frac_xy) -> np.ndarray:
 class MatchLifecycle:
     """Detects which lifecycle state the game is in and drives rematches."""
 
-    def __init__(self, template_dir: Optional[str] = None):
+    def __init__(self, template_dir: str | None = None):
         self.template_dir = template_dir or TEMPLATE_DIR
         self._templates: dict[str, np.ndarray] = {}
         self._load_templates()
@@ -116,13 +111,9 @@ class MatchLifecycle:
                         )
                     self._templates[key] = img
 
-    def _match_template(self, frame: np.ndarray, key: str) -> float:
-        score, _ = self._locate_template(frame, key)
-        return score
-
     def _locate_template(
         self, frame: np.ndarray, key: str
-    ) -> tuple[float, Optional[tuple[float, float]]]:
+    ) -> tuple[float, tuple[float, float] | None]:
         """Best match score and its centre as (x_frac, y_frac), or None."""
         tmpl = self._templates.get(key)
         if tmpl is None or frame is None or frame.size == 0:
@@ -139,14 +130,14 @@ class MatchLifecycle:
     # ----- detection -----
 
     def detect_state(self, frame: np.ndarray) -> LifecycleSignals:
-        hits = {k: self._match_template(frame, k) for k in TEMPLATE_FILES}
+        hits = {k: self._locate_template(frame, k)[0] for k in TEMPLATE_FILES}
 
-        victory_hit = hits.get("victory", 0.0) >= TEMPLATE_MATCH_THRESHOLD
-        defeat_hit = hits.get("defeat", 0.0) >= TEMPLATE_MATCH_THRESHOLD
-        ok_hit = hits.get("ok_button", 0.0) >= TEMPLATE_MATCH_THRESHOLD
-        battle_hit = hits.get("battle_button", 0.0) >= TEMPLATE_MATCH_THRESHOLD
+        victory_hit = hits["victory"] >= TEMPLATE_MATCH_THRESHOLD
+        defeat_hit = hits["defeat"] >= TEMPLATE_MATCH_THRESHOLD
+        ok_hit = hits["ok_button"] >= TEMPLATE_MATCH_THRESHOLD
+        battle_hit = hits["battle_button"] >= TEMPLATE_MATCH_THRESHOLD
 
-        result: Optional[str] = None
+        result: str | None = None
         if victory_hit:
             result = "win"
         elif defeat_hit:
@@ -196,7 +187,7 @@ class MatchLifecycle:
         magenta = (b > 180) & (r > 180) & (g < 140)
         return float(magenta.mean()) >= ELIXIR_MAGENTA_MIN_FRAC
 
-    def _color_based_result(self, frame: np.ndarray) -> Optional[str]:
+    def _color_based_result(self, frame: np.ndarray) -> str | None:
         banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
         if _color_distance(banner_px, COLOR_VICTORY_GOLD) <= COLOR_TOLERANCE:
             return "win"
@@ -215,7 +206,7 @@ class MatchLifecycle:
     def _click_template(
         self,
         monitor: dict,
-        frame: Optional[np.ndarray],
+        frame: np.ndarray | None,
         key: str,
         fallback_frac: tuple[float, float],
     ) -> None:
@@ -227,10 +218,10 @@ class MatchLifecycle:
                 frac = loc
         self._click_frac(monitor, frac)
 
-    def click_ok(self, monitor: dict, frame: Optional[np.ndarray] = None) -> None:
+    def click_ok(self, monitor: dict, frame: np.ndarray | None = None) -> None:
         """Dismiss the postmatch screen."""
         self._click_template(monitor, frame, "ok_button", OK_BUTTON_FRAC)
 
-    def click_battle(self, monitor: dict, frame: Optional[np.ndarray] = None) -> None:
+    def click_battle(self, monitor: dict, frame: np.ndarray | None = None) -> None:
         """Start a match from the main menu."""
         self._click_template(monitor, frame, "battle_button", BATTLE_BUTTON_FRAC)
