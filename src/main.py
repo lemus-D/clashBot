@@ -25,7 +25,7 @@ from .debug.overlay import render_debug_overlay
 
 
 WINDOW_TITLE = "BlueStacks App Player 1"
-MODEL_ID = "troop-counter/7"
+MODEL_ID = "troop-counter/8"
 
 
 class RandomPolicy:
