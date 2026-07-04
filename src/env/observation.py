@@ -24,6 +24,9 @@ policies.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import numpy as np
 
 from ..game.board import (
@@ -53,6 +56,27 @@ OBSERVATION_SHAPES: dict[str, tuple[int, ...]] = {
     "crowns": (2,),
     "playable_mask": (ARENA_ROWS, ARENA_COLS),
 }
+
+
+def schema_descriptor() -> dict:
+    """Everything needed to interpret — or later migrate — a flattened
+    observation: the troop class list (one-hot channel meanings) and the
+    field shapes in flatten order."""
+    return {
+        "obs_flat_size": sum(
+            int(np.prod(shape)) for shape in OBSERVATION_SHAPES.values()
+        ),
+        "troop_classes": list(TROOP_CLASSES),
+        "observation_shapes": {
+            k: list(v) for k, v in OBSERVATION_SHAPES.items()
+        },
+    }
+
+
+def schema_hash() -> str:
+    """Short stable fingerprint of the observation schema."""
+    blob = json.dumps(schema_descriptor(), sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
 class ObservationBuilder:

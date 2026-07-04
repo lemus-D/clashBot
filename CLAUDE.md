@@ -26,19 +26,36 @@ See ./README.md for the full module map, observation schema, and action space.
 (Current state — under active revision. Describe and improve it as it is; don't
 speculatively generalize for cases that don't exist yet.)
 
-- Core loop: `ClashEnv` in `src/environment.py` — reset / step / close, reward
-  shaping, JSONL recording. This is the contract everything else serves.
-- Vision: Roboflow model (`troop-counter/7`) + screen capture via `mss` /
-  `pywinctl` in `src/capture.py`.
-- Observation: built in `src/observation.py` as a structured dict; `flatten()`
-  gives a 1-D float32 array for MLP policies.
-- Actions: `src/actions.py` — 577 discrete choices (NO_OP + hand x tile);
+- Core loop: `ClashEnv` in `src/env/environment.py` — reset / step / observe /
+  close, reward shaping, JSONL recording. This is the contract everything else
+  serves. `observe()` is the passive perceive-only cycle (used by `step` and
+  the demo recorder).
+- Observation: `src/env/observation.py` — structured dict; `flatten()` gives a
+  1-D float32 array for MLP policies.
+- Actions: `src/env/actions.py` — 577 discrete choices (NO_OP + hand x tile);
   `index_to_action` / `action_to_index` convert.
-- Game model: `gameBoard.py` (9x16 arena, hand, placement), `gameState.py`
-  (time, elixir, tower HP, crowns), `cardDatabase.py`, `cardClasses.py`.
-- Lifecycle: `matchLifecycle.py` — menu / in-match / postmatch + auto-rematch.
-- Tower HP: `towerHealth.py` via optional Tesseract OCR (degrades gracefully).
-- Entry point: `src/main.py` — CLI driver with `RandomPolicy`, `--debug`, `--record`.
+- Vision (`src/vision/`): Roboflow model (`troop-counter/8`); screen capture
+  via `mss` / `pywinctl` in `capture.py`; match lifecycle (menu / in-match /
+  postmatch + auto-rematch) in `lifecycle.py`; tower-HP OCR via Tesseract in
+  `ocr.py` (required; raises on missing install or a failed read).
+- Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
+  `state.py` (time, elixir simulation, tower HP, crowns), `cards.py`.
+- Imitation learning (`src/imitation/`): `recorder.py` records human play —
+  pynput mouse watcher maps hand→arena drags to actions while `env.observe()`
+  runs passively; writes the env's JSONL schema plus `"source": "human"`, with
+  each observation paired to the action taken *after* it (the BC pairing).
+  Recording files start with a `{"type": "meta", ...}` schema-version header
+  (hash + troop class list, via `observation.schema_descriptor()`); recorder,
+  loader, and checkpoints all refuse cross-schema data.
+  `dataset.py` loads demos with no-op downsampling; `model.py` is a
+  factored-head net (shared MLP trunk → play/slot/tile heads, NOT one 577-way
+  softmax); `train.py` trains it; `policy.py` runs a checkpoint with
+  inference-time masking of unaffordable slots and unplaceable tiles.
+  PyTorch; this machine has an RTX 4070 — use the cu128 CUDA build, at the
+  torch version torchvision pins (see requirements.txt for the command).
+- Entry point: `src/main.py` — CLI driver: `RandomPolicy`, `--debug`,
+  `--record`, `--record-human`, `--calibrate`.
+- Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
 - Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
   positions, tower HP regions, lifecycle samples). Keep them centralized there.
 
@@ -49,6 +66,11 @@ speculatively generalize for cases that don't exist yet.)
 - Config: copy `.env.example` to `.env`, set Roboflow `API_KEY`.
 - Run: `python -m src.main` (add `--debug` for overlay, `--record logs/run.jsonl
   --episodes N` to record).
+- Record human demos: `python -m src.main --record-human demos/run.jsonl
+  --episodes N` — human plays in BlueStacks (drag-style placement only).
+- Train imitation policy: `python -m src.imitation.train demos/run.jsonl
+  --out models/imitation.pt`; run it:
+  `python -m src.main --policy imitation --weights models/imitation.pt`.
 - Build: none yet. Tests: none yet. (Flag if you think one is needed.)
 
 ## Coding Practices

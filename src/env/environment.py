@@ -44,12 +44,13 @@ from ..vision.capture import ScreenCapture
 from ..game.board import GameBoard
 from ..game.state import GameState
 from ..vision.lifecycle import (
+    LifecycleSignals,
     MatchLifecycle,
     STATE_IN_MATCH,
     STATE_POSTMATCH,
     TEMPLATE_MATCH_THRESHOLD,
 )
-from .observation import ObservationBuilder
+from .observation import ObservationBuilder, schema_descriptor, schema_hash
 from ..vision.ocr import TowerHealthReader
 
 # Roboflow inference is heavy; import lazily inside ``_load_model`` so
@@ -94,6 +95,51 @@ def default_reward(
         reward -= 0.05
 
     return reward
+
+
+def open_record_jsonl(path: str):
+    """Open a JSONL recording for append, enforcing schema consistency.
+
+    A new (or empty) file gets a ``{"type": "meta", ...}`` header line
+    carrying the observation schema hash and full descriptor (troop
+    class list + field shapes), so future readers can detect layout
+    changes and migrate old data. Appending to a file recorded under a
+    different schema raises instead of silently mixing layouts.
+    """
+    os.makedirs(
+        os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True
+    )
+    current = schema_hash()
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, encoding="utf-8") as f:
+            first = json.loads(f.readline())
+        if first.get("type") != "meta":
+            raise ValueError(
+                f"{path} has no schema header (recorded before schema "
+                f"versioning). Record to a new file instead of appending."
+            )
+        if first.get("schema_hash") != current:
+            raise ValueError(
+                f"{path} was recorded under observation schema "
+                f"{first['schema_hash']} but the current schema is "
+                f"{current}. Record to a new file; the old file's meta "
+                f"header retains its troop class list for migration."
+            )
+        return open(path, "a", encoding="utf-8")
+
+    f = open(path, "a", encoding="utf-8")
+    f.write(
+        json.dumps(
+            {
+                "type": "meta",
+                "schema_hash": current,
+                "schema": schema_descriptor(),
+            }
+        )
+        + "\n"
+    )
+    f.flush()
+    return f
 
 
 class ClashEnv:
@@ -195,10 +241,7 @@ class ClashEnv:
         )
 
         # Capture + perceive after the action lands.
-        frame = self.capture.grab()
-        self._frame = frame
-        self._refresh_perception(frame)
-        signals = self.lifecycle.detect_state(frame)
+        obs, signals = self.observe()
 
         # Determine done.
         done = False
@@ -214,8 +257,6 @@ class ClashEnv:
         reward = float(
             self.reward_fn(prev_tower_hp, self.state, signals.result, action_result)
         )
-
-        obs = self._build_observation()
 
         info: dict[str, Any] = {
             "action_index": action_to_index(action_obj),
@@ -240,6 +281,18 @@ class ClashEnv:
 
         self._step_count += 1
         return obs, reward, done, info
+
+    def observe(self) -> tuple[dict, LifecycleSignals]:
+        """One perception cycle without acting: grab a frame, refresh
+        board / tower HP, detect the lifecycle state, build an
+        observation. Used by ``step`` and by passive consumers like the
+        human demo recorder."""
+        assert self.capture is not None and self.board is not None
+        frame = self.capture.grab()
+        self._frame = frame
+        self._refresh_perception(frame)
+        signals = self.lifecycle.detect_state(frame)
+        return self._build_observation(), signals
 
     def close(self) -> None:
         if self._record_file is not None:
@@ -306,8 +359,7 @@ class ClashEnv:
     def _open_record_file(self) -> None:
         if self._record_file is not None:
             return
-        os.makedirs(os.path.dirname(os.path.abspath(self.record_path)) or ".", exist_ok=True)
-        self._record_file = open(self.record_path, "a", encoding="utf-8")
+        self._record_file = open_record_jsonl(self.record_path)
 
     def _write_record(self, obs: dict, action: Action, reward: float, info: dict) -> None:
         if self._record_file is None:

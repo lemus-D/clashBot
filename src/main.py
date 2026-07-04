@@ -5,6 +5,8 @@ Usage::
     python -m src.main
     python -m src.main --debug
     python -m src.main --episodes 5 --record logs/run.jsonl
+    python -m src.main --record-human demos/run.jsonl --episodes 5
+    python -m src.main --policy imitation --weights models/imitation.pt
     python -m src.main --calibrate
 """
 
@@ -13,6 +15,7 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -63,6 +66,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="clashBot main loop")
     p.add_argument("--debug", action="store_true", help="show OpenCV debug overlay")
     p.add_argument("--record", default=None, help="JSONL path for imitation logs")
+    p.add_argument(
+        "--record-human", default=None, metavar="PATH",
+        help="record human play to this JSONL instead of running a policy",
+    )
+    p.add_argument(
+        "--policy", choices=("random", "imitation"), default="random",
+    )
+    p.add_argument(
+        "--weights", default=None, metavar="PATH",
+        help="checkpoint for --policy imitation",
+    )
     p.add_argument("--episodes", type=int, default=1, help="matches to play")
     p.add_argument("--no-op-prob", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=None)
@@ -72,10 +86,13 @@ def parse_args() -> argparse.Namespace:
         "--calibrate", action="store_true",
         help="run the interactive calibration wizard and exit",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.policy == "imitation" and not args.weights:
+        p.error("--policy imitation requires --weights")
+    return args
 
 
-def run_episode(env: ClashEnv, policy: RandomPolicy, debug: bool) -> None:
+def run_episode(env: ClashEnv, policy: Callable[[dict], Action], debug: bool) -> None:
     """Play one episode to completion and print its summary."""
     obs = env.reset()
     done = False
@@ -112,7 +129,21 @@ def run() -> None:
         calibrate(args.window)
         return
 
-    policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
+    if args.record_human:
+        from .imitation.recorder import record_demos
+        record_demos(
+            window_title=args.window,
+            model_id=args.model,
+            record_path=args.record_human,
+            episodes=args.episodes,
+        )
+        return
+
+    if args.policy == "imitation":
+        from .imitation.policy import ImitationPolicy
+        policy: Callable[[dict], Action] = ImitationPolicy(args.weights)
+    else:
+        policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
     env = ClashEnv(
         window_title=args.window,
         model_id=args.model,
