@@ -4,22 +4,17 @@ Crops a small region around each of the six towers and runs Tesseract
 on the digits. Regions are fractions of the captured frame (0-1);
 CALIBRATE ``TOWER_HP_REGIONS`` for your BlueStacks crop.
 
-Documented exception to fail-loud: pytesseract is optional. When it is
-missing (or an individual OCR call flakes out), ``read`` returns
-``None`` for the affected towers instead of raising.
+Tesseract is a hard requirement: a missing install, a malformed crop,
+or an OCR call failure all raise rather than degrading silently.
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
+import pytesseract
 
 from ..game.state import TOWER_KEYS
-
-try:
-    import pytesseract  # type: ignore
-except Exception:
-    pytesseract = None  # type: ignore
 
 
 # Each entry is (x_frac, y_frac, w_frac, h_frac) within the captured frame.
@@ -48,9 +43,6 @@ class TowerHealthReader:
 
     def read(self, frame: np.ndarray) -> dict[str, int | None]:
         out: dict[str, int | None] = {k: None for k in TOWER_KEYS}
-        if pytesseract is None or frame is None or frame.size == 0:
-            return out
-
         h, w = frame.shape[:2]
         for key, (xf, yf, wf, hf) in TOWER_HP_REGIONS.items():
             x0 = max(0, int(xf * w))
@@ -59,15 +51,16 @@ class TowerHealthReader:
             y1 = min(h, y0 + max(1, int(hf * h)))
             crop = frame[y0:y1, x0:x1]
             if crop.size == 0:
-                continue
+                raise ValueError(
+                    f"Tower HP region for {key!r} produced an empty crop "
+                    f"({x0},{y0})-({x1},{y1}) from a {w}x{h} frame; "
+                    "check TOWER_HP_REGIONS calibration"
+                )
             processed = _preprocess_for_ocr(crop)
-            try:
-                text = pytesseract.image_to_string(
-                    processed,
-                    config="--psm 7 -c tessedit_char_whitelist=0123456789",
-                ).strip()
-            except Exception:
-                continue  # documented exception: OCR flakiness degrades to None
+            text = pytesseract.image_to_string(
+                processed,
+                config="--psm 7 -c tessedit_char_whitelist=0123456789",
+            ).strip()
             if text.isdigit():
                 out[key] = int(text)
         return out

@@ -84,8 +84,8 @@ speculatively generalize for cases that don't exist yet.)
   should stay decoupled; don't let them bleed into each other.
 - Fail loud, not silent: raise specific, descriptive exceptions rather than
   swallowing errors or quietly degrading. Messages should say what failed and
-  what was expected. (Optional Tesseract OCR is the one documented exception —
-  it may fall back to "full" tower HP when unavailable.)
+  what was expected. Tesseract OCR is a hard requirement, not an exception to
+  this rule.
 
 ### Conciseness & Scope
 

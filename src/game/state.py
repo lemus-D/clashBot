@@ -145,8 +145,10 @@ class GameState:
     def set_tower_hp(self, key: str, value: Optional[int]) -> None:
         if key not in self.tower_hp:
             raise KeyError(f"Unknown tower key {key!r}; expected one of {TOWER_KEYS}")
+        if value is None:
+            return  # OCR couldn't read this frame; keep the last known HP
         self.tower_hp[key] = value
-        if value is not None and value <= 0:
+        if value <= 0:
             self._register_tower_destroyed(key)
 
     def update_tower_hp(self, readings: dict[str, Optional[int]]) -> None:

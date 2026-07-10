@@ -15,7 +15,7 @@ and match lifecycle.
 | [`src/cardClasses.py`](src/cardClasses.py)   | `Card` / `Troop` / `BlankSpace` data classes                |
 | [`src/gameBoard.py`](src/gameBoard.py)       | 4-card hand, 9x16 arena, placement rules, tensor encoding   |
 | [`src/gameState.py`](src/gameState.py)       | Match time, elixir, tower HP, crowns, win/loss              |
-| [`src/towerHealth.py`](src/towerHealth.py)   | OCR tower HP reader (Tesseract, optional)                   |
+| [`src/towerHealth.py`](src/towerHealth.py)   | OCR tower HP reader (Tesseract, required)                   |
 | [`src/matchLifecycle.py`](src/matchLifecycle.py) | Menu / in-match / postmatch detection + auto-rematch    |
 | [`src/observation.py`](src/observation.py)   | Builds the structured observation dict                      |
 | [`src/actions.py`](src/actions.py)           | Discrete action space + mouse executor                      |
@@ -34,9 +34,9 @@ and match lifecycle.
    pip install -r requirements.txt
    ```
 
-3. (Optional) Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
-   for tower-HP reading. If unavailable, tower HP defaults to "full" and
-   reward shaping degrades but the bot still runs.
+3. Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and
+   make sure it's on your `PATH`. It's required for tower-HP reading; the bot
+   raises if a read fails or the binary is missing.
 4. Copy `.env.example` to `.env` and set your Roboflow `API_KEY`.
 
 ## Run
