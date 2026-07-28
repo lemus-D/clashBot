@@ -2,10 +2,13 @@
 
 Two layered signals:
 
-1. Template matching against PNGs in ``src/assets/templates/``
-   (battle button, OK button, victory/defeat banners).
-2. Color heuristics as fallback: a magenta-pixel fraction inside the
-   elixir bar means in-match; banner colors suggest postmatch.
+1. A magenta-pixel fraction inside the elixir bar means in-match. This
+   is checked first and short-circuits: it costs microseconds, whereas
+   the template sweep below is four full-frame passes.
+2. Template matching against PNGs in ``src/assets/templates/``
+   (battle button, OK button, victory/defeat banners), for the frames
+   where the elixir bar is absent. Banner colors are the fallback when
+   no template hits.
 
 Per-machine coordinates and thresholds are module-level constants
 marked ``CALIBRATE``.
@@ -130,6 +133,16 @@ class MatchLifecycle:
     # ----- detection -----
 
     def detect_state(self, frame: np.ndarray) -> LifecycleSignals:
+        # Cheap gate first: the elixir bar is on screen only while a match is
+        # running, and none of the four templates (battle / ok / victory /
+        # defeat) can be on screen at the same time as it. So a frame with the
+        # bar visible is IN_MATCH regardless of what matchTemplate would say,
+        # and the four full-frame sweeps can be skipped. The frame a match ends
+        # on loses the bar, so the postmatch transition is still seen at once.
+        if frame is not None and frame.size and self._elixir_bar_visible(frame):
+            self._last_state = STATE_IN_MATCH
+            return LifecycleSignals(state=STATE_IN_MATCH)
+
         hits = {k: self._locate_template(frame, k)[0] for k in TEMPLATE_FILES}
 
         victory_hit = hits["victory"] >= TEMPLATE_MATCH_THRESHOLD

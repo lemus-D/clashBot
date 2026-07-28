@@ -18,9 +18,15 @@ The default reward is ``delta_enemy_hp - delta_friendly_hp`` per step
 plus ``+10/-10`` on win/loss. Pass a custom ``reward_fn`` if you want
 shaped rewards.
 
-Optional ``record_path`` writes a JSONL line per step suitable for
-imitation learning. Each line contains the flat observation, action
-index, raw reward, and lifecycle metadata.
+Optional ``record_path`` writes a JSONL recording suitable for
+imitation learning. Observations and actions are two *separate*
+timestamped streams (``{"type": "obs"}`` / ``{"type": "act"}`` lines)
+rather than one line per step, because a human can place several cards
+inside a single ~0.3s perception cycle and a one-action-per-step record
+silently mis-pairs them. Readers pair offline: every action attaches to
+the nearest observation preceding its timestamp. See
+``open_record_jsonl`` for the schema header and
+``src/imitation/dataset.py`` for the pairing.
 """
 
 from __future__ import annotations
@@ -97,14 +103,49 @@ def default_reward(
     return reward
 
 
+# On-disk record framing version. 1 = one flat line per step with the
+# action embedded (pre-2026-07; mis-pairs multi-placement cycles).
+# 2 = separate timestamped "obs" and "act" lines, paired offline.
+# Bumped independently of the observation schema hash: the observation
+# *layout* is unchanged, only how records are framed, so trained
+# checkpoints stay valid while old recordings are refused.
+RECORD_FORMAT = 2
+
+
+def check_record_meta(meta: dict, path: str) -> None:
+    """Raise unless ``meta`` declares the current record framing version.
+
+    Format-1 files have no ``record_format`` key at all; they store the
+    action inline on each step line, so a format-2 reader would see zero
+    actions rather than an error. Refuse them explicitly.
+    """
+    found = meta.get("record_format")
+    if found != RECORD_FORMAT:
+        raise ValueError(
+            f"{path} uses record format {found!r} but this code writes and "
+            f"reads format {RECORD_FORMAT}. Format 1 packed the action into "
+            f"each step line and mis-paired cycles with multiple "
+            f"placements; format 2 writes separate timestamped 'obs' and "
+            f"'act' lines. Re-record; format-1 files cannot be paired "
+            f"reliably after the fact (their actions carry no timestamp)."
+        )
+
+
+def write_record(f, record: dict) -> None:
+    """Append one JSON line and flush (recordings must survive a crash)."""
+    f.write(json.dumps(record) + "\n")
+    f.flush()
+
+
 def open_record_jsonl(path: str):
     """Open a JSONL recording for append, enforcing schema consistency.
 
     A new (or empty) file gets a ``{"type": "meta", ...}`` header line
-    carrying the observation schema hash and full descriptor (troop
-    class list + field shapes), so future readers can detect layout
-    changes and migrate old data. Appending to a file recorded under a
-    different schema raises instead of silently mixing layouts.
+    carrying the record framing version, the observation schema hash and
+    the full descriptor (troop class list + field shapes), so future
+    readers can detect layout changes and migrate old data. Appending to
+    a file recorded under a different observation schema or a different
+    record format raises instead of silently mixing layouts.
     """
     os.makedirs(
         os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True
@@ -118,6 +159,7 @@ def open_record_jsonl(path: str):
                 f"{path} has no schema header (recorded before schema "
                 f"versioning). Record to a new file instead of appending."
             )
+        check_record_meta(first, path)
         if first.get("schema_hash") != current:
             raise ValueError(
                 f"{path} was recorded under observation schema "
@@ -128,18 +170,70 @@ def open_record_jsonl(path: str):
         return open(path, "a", encoding="utf-8")
 
     f = open(path, "a", encoding="utf-8")
-    f.write(
-        json.dumps(
-            {
-                "type": "meta",
-                "schema_hash": current,
-                "schema": schema_descriptor(),
-            }
-        )
-        + "\n"
+    write_record(
+        f,
+        {
+            "type": "meta",
+            "record_format": RECORD_FORMAT,
+            "schema_hash": current,
+            "schema": schema_descriptor(),
+        },
     )
-    f.flush()
     return f
+
+
+def obs_record(
+    *,
+    t: float,
+    step: int,
+    obs_flat: list[float],
+    reward: float,
+    signals: LifecycleSignals,
+    state: GameState,
+    source: str,
+) -> dict:
+    """One observation line. ``t`` is the frame *capture* time — the
+    moment the recorded screen state actually existed, which is what
+    action pairing keys off."""
+    return {
+        "type": "obs",
+        "t": t,
+        "step": step,
+        "obs_flat": obs_flat,
+        "reward": reward,
+        "lifecycle_state": signals.state,
+        "lifecycle_result": signals.result,
+        "match_time": state.get_current_match_time(),
+        "elixir": state.get_current_elixir(),
+        "match_result": state.match_result,
+        "source": source,
+    }
+
+
+def act_record(
+    *,
+    t: float,
+    action: Action,
+    success: bool,
+    reason: str,
+    source: str,
+) -> dict:
+    """One action line. ``t`` is when the action was issued (bot) or when
+    the drag was released (human). No-ops are never written — an
+    observation with no action attached *is* the no-op sample."""
+    if action.is_no_op:
+        raise ValueError("no-op actions are not recorded; skip the write")
+    return {
+        "type": "act",
+        "t": t,
+        "action_index": action_to_index(action),
+        "hand_index": action.hand_index,
+        "tile_x": action.tile_x,
+        "tile_y": action.tile_y,
+        "success": success,
+        "reason": reason,
+        "source": source,
+    }
 
 
 class ClashEnv:
@@ -172,6 +266,9 @@ class ClashEnv:
         self._model = None
         self._supervision = None
         self._frame: Optional[np.ndarray] = None
+        # Wall-clock time the last frame was grabbed. Recordings stamp
+        # observations with this, not with the (much later) write time.
+        self.frame_time: float = 0.0
         self._last_step_time: float = 0.0
         self._record_file = None
         self._step_count: int = 0
@@ -218,7 +315,13 @@ class ClashEnv:
             self._open_record_file()
 
         self._step_count = 0
-        return self._build_observation()
+
+        # Perceive before returning: without this the first observation
+        # of every episode is a blank arena with an empty hand, and the
+        # first action is chosen from it.
+        obs, signals = self.observe()
+        self._write_obs_record(obs, reward=0.0, step=0, signals=signals)
+        return obs
 
     def step(self, action: Any) -> tuple[dict, float, bool, dict]:
         if isinstance(action, (int, np.integer)):
@@ -230,29 +333,28 @@ class ClashEnv:
         else:
             raise TypeError(f"Unsupported action type: {type(action)!r}")
 
-        self._throttle()
+        self.throttle()
 
         prev_tower_hp = dict(self.state.tower_hp)
 
-        # Execute action first so vision picks up the new troop next frame.
+        # Execute action first so vision picks up the new troop next
+        # frame. The action is stamped with its *issue* time, which falls
+        # between the previous observation's frame time and this step's,
+        # so the offline nearest-preceding-observation pairing recovers
+        # (s_t, a_t) — the state the policy actually acted on — even
+        # though the observation returned below is s_{t+1}.
         assert self.capture is not None and self.board is not None
+        action_time = time.time()
         action_result = self.executor.execute(
             action_obj, self.board, self.state, self.capture.monitor
         )
+        if not action_obj.is_no_op:
+            self._write_act_record(action_time, action_obj, action_result)
 
         # Capture + perceive after the action lands.
         obs, signals = self.observe()
 
-        # Determine done.
-        done = False
-        if signals.state == STATE_POSTMATCH:
-            done = True
-            if signals.result and self.state.match_result is None:
-                self.state.set_match_result(signals.result)
-        elif self.state.match_result is not None:
-            done = True
-        elif self.state.get_current_match_time() >= self.max_match_duration_sec:
-            done = True
+        done = self.resolve_done(signals)
 
         reward = float(
             self.reward_fn(prev_tower_hp, self.state, signals.result, action_result)
@@ -273,8 +375,11 @@ class ClashEnv:
             "step": self._step_count,
         }
 
-        if self.record_path:
-            self._write_record(obs, action_obj, reward, info)
+        # reset() wrote observation 0, so this step's observation is
+        # index _step_count + 1.
+        self._write_obs_record(
+            obs, reward=reward, step=self._step_count + 1, signals=signals
+        )
 
         if done:
             self.state.end_match(self.state.match_result)
@@ -288,11 +393,26 @@ class ClashEnv:
         observation. Used by ``step`` and by passive consumers like the
         human demo recorder."""
         assert self.capture is not None and self.board is not None
+        self.frame_time = time.time()
         frame = self.capture.grab()
         self._frame = frame
         self._refresh_perception(frame)
         signals = self.lifecycle.detect_state(frame)
         return self._build_observation(), signals
+
+    def resolve_done(self, signals: LifecycleSignals) -> bool:
+        """Adopt a lifecycle-reported result and report whether the
+        episode is over. Shared by ``step`` and the human demo recorder
+        so both agree on when a match ends."""
+        if signals.state == STATE_POSTMATCH:
+            if signals.result and self.state.match_result is None:
+                self.state.set_match_result(signals.result)
+            return True
+        if self.state.match_result is not None:
+            return True
+        return (
+            self.state.get_current_match_time() >= self.max_match_duration_sec
+        )
 
     def close(self) -> None:
         if self._record_file is not None:
@@ -302,15 +422,19 @@ class ClashEnv:
             self.capture.__exit__(None, None, None)
             self.capture = None
 
-    # ----- internals -----
-
-    def _throttle(self) -> None:
+    def throttle(self) -> None:
+        """Sleep just long enough that consecutive calls are
+        ``step_period_sec`` apart. Subtractive, not additive: perception
+        already eats most of the period. Public so the human demo
+        recorder paces itself exactly like the bot does."""
         now = time.time()
         if self._last_step_time:
             wait = self.step_period_sec - (now - self._last_step_time)
             if wait > 0:
                 time.sleep(wait)
         self._last_step_time = time.time()
+
+    # ----- internals -----
 
     def _wait_for_in_match(self, timeout_sec: float) -> None:
         """Drive the UI into a match: dismiss postmatch screens, press
@@ -361,26 +485,36 @@ class ClashEnv:
             return
         self._record_file = open_record_jsonl(self.record_path)
 
-    def _write_record(self, obs: dict, action: Action, reward: float, info: dict) -> None:
+    def _write_obs_record(
+        self, obs: dict, reward: float, step: int, signals: LifecycleSignals
+    ) -> None:
         if self._record_file is None:
             return
-        flat = self.observer.flatten(obs)
-        record = {
-            "t": time.time(),
-            "step": info["step"],
-            "obs_flat": flat.tolist(),
-            "action_index": info["action_index"],
-            "hand_index": action.hand_index,
-            "tile_x": action.tile_x,
-            "tile_y": action.tile_y,
-            "reward": reward,
-            "lifecycle_state": info["lifecycle_state"],
-            "lifecycle_result": info["lifecycle_result"],
-            "match_time": info["match_time"],
-            "elixir": info["elixir"],
-            "match_result": info["match_result"],
-            "action_success": info["action_result"]["success"],
-            "action_reason": info["action_result"]["reason"],
-        }
-        self._record_file.write(json.dumps(record) + "\n")
-        self._record_file.flush()
+        write_record(
+            self._record_file,
+            obs_record(
+                t=self.frame_time,
+                step=step,
+                obs_flat=self.observer.flatten(obs).tolist(),
+                reward=reward,
+                signals=signals,
+                state=self.state,
+                source="bot",
+            ),
+        )
+
+    def _write_act_record(
+        self, t: float, action: Action, result: ActionResult
+    ) -> None:
+        if self._record_file is None:
+            return
+        write_record(
+            self._record_file,
+            act_record(
+                t=t,
+                action=action,
+                success=result.success,
+                reason=result.reason,
+                source="bot",
+            ),
+        )

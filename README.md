@@ -88,10 +88,8 @@ while not done:
 env.close()
 ```
 
-For imitation learning, set ``record_path="logs/run.jsonl"`` and play
-the game manually while the bot watches: every step writes a JSON line
-with the observation, the chosen action, the reward, and the lifecycle
-state.
+For imitation learning, record with `--record` (bot play) or
+`--record-human` (your own play); both write the format below.
 
 ## Observation schema
 
@@ -113,6 +111,37 @@ state.
 
 `ObservationBuilder.flatten(obs)` produces a single 1-D `float32` array
 for MLP-style policies.
+
+## Recording format (JSONL, `record_format: 2`)
+
+Observations and actions are **two independent timestamped streams**,
+not one line per step. A perception cycle takes ~0.3 s — far longer than
+the gap between two quick card placements — so any format that carries
+one action per step silently drops or mis-attributes the extras.
+
+```jsonc
+{"type":"meta","record_format":2,"schema_hash":"…","schema":{…}}
+{"type":"obs","t":1712.104,"step":0,"obs_flat":[…],"reward":0.0,
+ "lifecycle_state":"in_match","lifecycle_result":null,"match_time":0.4,
+ "elixir":5.0,"match_result":null,"source":"human"}
+{"type":"act","t":1712.310,"action_index":416,"hand_index":2,"tile_x":4,
+ "tile_y":11,"success":true,"reason":"human","source":"human"}
+{"type":"act","t":1712.480,"action_index":100,"hand_index":0,"tile_x":5,
+ "tile_y":11,"success":true,"reason":"human","source":"human"}
+{"type":"obs","t":1713.720,"step":1,…}
+```
+
+- `obs.t` is the frame **capture** time; `act.t` is the moment the action
+  was issued (bot) or the drag released (human). Same `time.time()` clock.
+- No-op actions are never written — an observation with nothing attached
+  *is* the no-op sample.
+- Pairing happens offline in `src/imitation/dataset.py`: each action binds
+  to the nearest observation captured **strictly before** it. One
+  observation may take several actions (→ several training rows); ties on
+  the coarse 15.6 ms Windows clock resolve backwards.
+- `record_format` is checked on both append and load. Format-1 files (one
+  flat line per step, action inline) are refused — their actions carry no
+  timestamp, so they cannot be re-paired.
 
 ## Action space
 

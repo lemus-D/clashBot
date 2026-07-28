@@ -7,11 +7,15 @@ play in BlueStacks. Drags are reverse-mapped to ``Action`` objects:
 - press near a hand slot centre (``HAND_CARD_POSITIONS``) -> hand_index
 - release inside the arena -> (tile_x, tile_y)
 
-Steps with no drag are recorded as NO_OP. Each record uses the same
-JSONL schema as ``ClashEnv``'s ``record_path`` plus ``"source":
-"human"``, so dataset code can consume bot and human logs alike. Unlike
-``ClashEnv`` recording, the observation in each record is the one *seen
-before* the action was taken — the pairing behaviour cloning needs.
+Output uses the env's two-stream JSONL format (see
+``src/env/environment.py``): timestamped ``{"type": "obs"}`` lines from
+the perception loop and timestamped ``{"type": "act"}`` lines from the
+mouse listener, plus ``"source": "human"``. The two streams are *not*
+paired here. A perception cycle takes ~0.3s, far longer than the gap
+between two quick placements, so pairing at record time would drop or
+skew actions; ``src/imitation/dataset.py`` pairs them offline by
+timestamp instead. Cycles with no action attached become the NO_OP
+training samples.
 
 Limitation: only drag-style placement is detected. Tap-the-card then
 tap-the-tile placements are ignored, so play by dragging.
@@ -19,22 +23,24 @@ tap-the-tile placements are ignored, so play by dragging.
 
 from __future__ import annotations
 
-import json
 import queue
 import time
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from pynput import mouse
 
-from ..env.actions import (
-    Action,
-    ActionResult,
-    action_to_index,
-    HAND_CARD_POSITIONS,
+from ..env.actions import Action, ActionResult, HAND_CARD_POSITIONS
+from ..env.environment import (
+    ClashEnv,
+    act_record,
+    default_reward,
+    obs_record,
+    open_record_jsonl,
+    write_record,
 )
-from ..env.environment import ClashEnv, default_reward, open_record_jsonl
 from ..game.board import GameBoard
-from ..vision.lifecycle import STATE_POSTMATCH
+from ..vision.lifecycle import LifecycleSignals
 
 # How close (in monitor fractions) a press must be to a hand-slot centre
 # to count as picking up that card. X bound is just under half the
@@ -45,6 +51,20 @@ HAND_SLOT_TOLERANCE_Y = 0.05
 # Releases below this y-fraction are still in the hand area (cards sit
 # at ~0.885), not an arena placement.
 ARENA_MAX_Y_FRAC = 0.84
+
+
+@dataclass(frozen=True)
+class TimedAction:
+    """An ``Action`` plus the wall-clock time it happened.
+
+    Kept here rather than as a field on ``Action`` on purpose: ``Action``
+    is the env/policy contract (constructed by policies, compared,
+    hashed, converted to and from indices) and a capture timestamp is
+    purely a recording concern. Wrapping keeps the contract clean.
+    """
+
+    t: float
+    action: Action
 
 
 class MouseWatcher:
@@ -64,7 +84,7 @@ class MouseWatcher:
         self._get_monitor = get_monitor
         self._get_board = get_board
         self._press_frac: Optional[tuple[float, float]] = None
-        self._actions: "queue.Queue[Action]" = queue.Queue()
+        self._actions: "queue.Queue[TimedAction]" = queue.Queue()
         self._listener = mouse.Listener(on_click=self._on_click)
 
     def start(self) -> None:
@@ -75,18 +95,22 @@ class MouseWatcher:
 
     def clear(self) -> None:
         """Drop actions queued outside an episode (menu clicks etc.)."""
+        self.drain()
+
+    def drain(self) -> list[TimedAction]:
+        """Every placement queued since the last drain, oldest first.
+
+        Returns all of them — a slow perception cycle routinely spans
+        several placements and dropping the extras (or deferring them to
+        a later cycle) is exactly the mis-pairing this format exists to
+        avoid.
+        """
+        out: list[TimedAction] = []
         while True:
             try:
-                self._actions.get_nowait()
+                out.append(self._actions.get_nowait())
             except queue.Empty:
-                return
-
-    def pop(self) -> Action:
-        """The oldest placement since the last pop, or NO_OP."""
-        try:
-            return self._actions.get_nowait()
-        except queue.Empty:
-            return Action.no_op()
+                return out
 
     # ----- listener internals (run on the pynput thread) -----
 
@@ -116,6 +140,11 @@ class MouseWatcher:
             self._press_frac = self._to_frac(x, y)
             return
 
+        # Stamp the release immediately: this is the moment the placement
+        # completed, and it must come from the same clock as the "t" on
+        # observation records for offline pairing to work.
+        released_at = time.time()
+
         press, self._press_frac = self._press_frac, None
         if press is None:
             return
@@ -135,7 +164,12 @@ class MouseWatcher:
         )
         if tile is None:
             return
-        self._actions.put(Action(hand_index=slot, tile_x=tile[0], tile_y=tile[1]))
+        self._actions.put(
+            TimedAction(
+                t=released_at,
+                action=Action(hand_index=slot, tile_x=tile[0], tile_y=tile[1]),
+            )
+        )
 
 
 def record_demos(
@@ -164,7 +198,7 @@ def record_demos(
                 f"\n=== Recording episode {episode + 1}/{episodes} — "
                 f"play in BlueStacks (drag cards from hand to arena) ==="
             )
-            obs = env.reset()
+            env.reset()
             watcher.clear()
             _record_episode(env, watcher, out)
     finally:
@@ -173,37 +207,70 @@ def record_demos(
         env.close()
 
 
+def _write_obs(
+    out,
+    env: ClashEnv,
+    obs: dict,
+    signals: LifecycleSignals,
+    step: int,
+    reward: float,
+) -> None:
+    write_record(
+        out,
+        obs_record(
+            t=env.frame_time,
+            step=step,
+            obs_flat=env.observer.flatten(obs).tolist(),
+            reward=reward,
+            signals=signals,
+            state=env.state,
+            source="human",
+        ),
+    )
+
+
 def _record_episode(env: ClashEnv, watcher: MouseWatcher, out) -> None:
+    """Perceive in a loop, writing an obs line per cycle and an act line
+    per detected drag, until the match ends.
+
+    ``env.reset`` already perceived once but its record went to the env's
+    own file (unused here), so the episode's first observation is taken
+    fresh below.
+    """
     step = 0
     placements = 0
-    done = False
+
+    obs, signals = env.observe()
+    _write_obs(out, env, obs, signals, step=step, reward=0.0)
+    done = env.resolve_done(signals)
 
     while not done:
-        time.sleep(env.step_period_sec)
-        action = watcher.pop()
+        env.throttle()
 
-        if not action.is_no_op:
+        for timed in watcher.drain():
             placements += 1
-            card = env.board.cards_in_hand[action.hand_index]
+            card = env.board.cards_in_hand[timed.action.hand_index]
             if card is not None:
                 env.state.spend_elixir(card.cost)
             else:
                 print(
-                    f"WARNING: placement from slot {action.hand_index} but "
-                    f"vision sees no card there; elixir not deducted"
+                    f"WARNING: placement from slot {timed.action.hand_index} "
+                    f"but vision sees no card there; elixir not deducted"
                 )
+            write_record(
+                out,
+                act_record(
+                    t=timed.t,
+                    action=timed.action,
+                    success=True,
+                    reason="human",
+                    source="human",
+                ),
+            )
 
         prev_tower_hp = dict(env.state.tower_hp)
-        next_obs, signals = env.observe()
-
-        if signals.state == STATE_POSTMATCH:
-            done = True
-            if signals.result and env.state.match_result is None:
-                env.state.set_match_result(signals.result)
-        elif env.state.match_result is not None:
-            done = True
-        elif env.state.get_current_match_time() >= env.max_match_duration_sec:
-            done = True
+        obs, signals = env.observe()
+        done = env.resolve_done(signals)
 
         reward = default_reward(
             prev_tower_hp,
@@ -212,32 +279,11 @@ def _record_episode(env: ClashEnv, watcher: MouseWatcher, out) -> None:
             ActionResult(success=True, reason="human"),
         )
 
-        record = {
-            "t": time.time(),
-            "step": step,
-            "obs_flat": env.observer.flatten(obs).tolist(),
-            "action_index": action_to_index(action),
-            "hand_index": action.hand_index,
-            "tile_x": action.tile_x,
-            "tile_y": action.tile_y,
-            "reward": reward,
-            "lifecycle_state": signals.state,
-            "lifecycle_result": signals.result,
-            "match_time": env.state.get_current_match_time(),
-            "elixir": env.state.get_current_elixir(),
-            "match_result": env.state.match_result,
-            "action_success": True,
-            "action_reason": "human",
-            "source": "human",
-        }
-        out.write(json.dumps(record) + "\n")
-        out.flush()
-
-        obs = next_obs
         step += 1
+        _write_obs(out, env, obs, signals, step=step, reward=reward)
 
     env.state.end_match(env.state.match_result)
     print(
-        f"Episode recorded: steps={step} placements={placements} "
+        f"Episode recorded: observations={step + 1} placements={placements} "
         f"result={env.state.match_result}"
     )

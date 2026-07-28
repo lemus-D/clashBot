@@ -6,7 +6,18 @@ inference>=0.10
 supervision>=0.18
 python-dotenv>=1.0,<2
 pyautogui>=0.9.54,<1
-pytesseract>=0.3.10,<1
+# Tower-HP OCR. tesserocr binds libtesseract in-process, so the persistent
+# handle in src/vision/ocr.py loads tessdata once instead of spawning a
+# tesseract.exe every cycle (~200 ms -> ~0). It replaced pytesseract entirely.
+#
+# WINDOWS: PyPI ships NO Windows wheels for tesserocr and the sdist needs a
+# full C++ toolchain, so install the prebuilt wheel below. It bundles
+# libtesseract 5.5.2 + leptonica 1.87.0; only the language data comes from the
+# local Tesseract-OCR install (found via PATH, or TESSDATA_PREFIX). Pick the
+# cpXXX matching your Python from
+# https://github.com/simonflueckiger/tesserocr-windows_build/releases
+# On Linux/macOS plain `pip install tesserocr==2.10.0` gets a PyPI wheel.
+tesserocr @ https://github.com/simonflueckiger/tesserocr-windows_build/releases/download/tesserocr-v2.10.0-tesseract-5.5.2/tesserocr-2.10.0-cp312-cp312-win_amd64.whl
 pynput>=1.7,<2
 # inference already pulls in torch as a CPU wheel. For CUDA on the RTX 4070,
 # swap it for the cu128 build, keeping the version torchvision pins:

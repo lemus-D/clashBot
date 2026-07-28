@@ -40,14 +40,21 @@ speculatively generalize for cases that don't exist yet.)
   `ocr.py` (required; raises on missing install or a failed read).
 - Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
   `state.py` (time, elixir simulation, tower HP, crowns), `cards.py`.
+- Recording format (`record_format: 2`, defined in `env/environment.py`, used
+  by BOTH `--record` and `--record-human`): a `{"type": "meta", ...}` header
+  (record_format + observation `schema_hash` + `schema_descriptor()`), then two
+  independent timestamped streams — `{"type": "obs", "t": ...}` per perception
+  cycle and `{"type": "act", "t": ...}` per placement. NOT one line per step: a
+  cycle is ~0.3s and a human can place several cards inside one. No-ops are not
+  written. Pairing is offline (`dataset.py`): each action binds to the nearest
+  observation captured strictly before it; an obs may take N actions (N rows)
+  or none (a no-op row). `obs.t` is frame-capture time, `act.t` is issue /
+  drag-release time. Format-1 files and cross-schema data are refused on both
+  append and load; checkpoints also carry the schema hash.
 - Imitation learning (`src/imitation/`): `recorder.py` records human play —
-  pynput mouse watcher maps hand→arena drags to actions while `env.observe()`
-  runs passively; writes the env's JSONL schema plus `"source": "human"`, with
-  each observation paired to the action taken *after* it (the BC pairing).
-  Recording files start with a `{"type": "meta", ...}` schema-version header
-  (hash + troop class list, via `observation.schema_descriptor()`); recorder,
-  loader, and checkpoints all refuse cross-schema data.
-  `dataset.py` loads demos with no-op downsampling; `model.py` is a
+  pynput mouse watcher maps hand→arena drags to timestamped actions while
+  `env.observe()` runs passively; adds `"source": "human"`.
+  `dataset.py` loads and pairs demos with no-op downsampling; `model.py` is a
   factored-head net (shared MLP trunk → play/slot/tile heads, NOT one 577-way
   softmax); `train.py` trains it; `policy.py` runs a checkpoint with
   inference-time masking of unaffordable slots and unplaceable tiles.
@@ -96,6 +103,7 @@ speculatively generalize for cases that don't exist yet.)
 - Don't add config options, layers, or generality "just in case."
 - Fewer moving parts is better. Reach for a new abstraction only when real
   duplication or complexity justifies it.
+- When responding in terminal, brevity and conciseness is important if followups are needed for further clarification they will be asked
 
 ## Machine Learning Notes
 
