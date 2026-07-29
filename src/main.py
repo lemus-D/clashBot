@@ -1,17 +1,14 @@
-"""Entry point: drive ``ClashEnv`` with a pluggable policy.
-
-The default policy is ``RandomPolicy`` which picks any (affordable,
-placeable) action. Swap in your trained policy by replacing the
-``policy`` callable below; the contract is ``policy(obs) -> action``
-where ``action`` is either an ``Action`` instance, an integer index
-into the discrete action space, or a ``(hand, x, y)`` tuple.
+"""Entry point: drive ``ClashEnv`` with a policy (``policy(obs) -> Action``).
 
 Usage::
 
     python -m src.main
     python -m src.main --debug
-    python -m src.main --record logs/run.jsonl
     python -m src.main --episodes 5 --record logs/run.jsonl
+    python -m src.main --record-human demos/run.jsonl --episodes 5
+    python -m src.main --policy imitation --weights models/imitation.pt
+    python -m src.main --calibrate
+    python -m src.main --calibrate timer
 """
 
 from __future__ import annotations
@@ -19,12 +16,15 @@ from __future__ import annotations
 import argparse
 import random
 import time
-from typing import Callable, Optional
+from datetime import datetime
+from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
 
+from .calibrate import ALL_PHASES, PHASE_NAMES, resolve_phases
 from .env.actions import Action, action_space_size
 from .env.environment import ClashEnv
 from .game.board import HAND_SIZE, ARENA_COLS, ARENA_ROWS
@@ -32,10 +32,8 @@ from .debug.overlay import render_debug_overlay
 
 
 WINDOW_TITLE = "BlueStacks App Player 1"
-MODEL_ID = "troop-counter/7"
-
-
-Policy = Callable[[dict], object]
+MODEL_ID = "troop-counter/8"
+DEBUG_RECORD_DIR = "logs"
 
 
 class RandomPolicy:
@@ -46,7 +44,7 @@ class RandomPolicy:
     drag attempts.
     """
 
-    def __init__(self, no_op_prob: float = 0.5, seed: Optional[int] = None):
+    def __init__(self, no_op_prob: float = 0.5, seed: int | None = None):
         self.no_op_prob = no_op_prob
         self.rng = random.Random(seed)
 
@@ -71,35 +69,120 @@ class RandomPolicy:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="clashBot main loop")
-    p.add_argument("--debug", action="store_true", help="show OpenCV debug overlay")
+    p.add_argument(
+        "--debug", action="store_true",
+        help=f"show OpenCV debug overlay; also records to {DEBUG_RECORD_DIR}/ "
+             f"unless --record gives an explicit path",
+    )
     p.add_argument("--record", default=None, help="JSONL path for imitation logs")
+    p.add_argument(
+        "--record-human", default=None, metavar="PATH",
+        help="record human play to this JSONL instead of running a policy",
+    )
+    p.add_argument(
+        "--policy", choices=("random", "imitation"), default="random",
+    )
+    p.add_argument(
+        "--weights", default=None, metavar="PATH",
+        help="checkpoint for --policy imitation",
+    )
     p.add_argument("--episodes", type=int, default=1, help="matches to play")
     p.add_argument("--no-op-prob", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--window", default=WINDOW_TITLE)
     p.add_argument("--model", default=MODEL_ID)
     p.add_argument(
-        "--calibrate", action="store_true",
-        help="run the interactive calibration wizard and exit",
+        "--calibrate", nargs="?", const=ALL_PHASES, default=None, metavar="PHASE",
+        help="run the interactive calibration wizard and exit; with no value "
+             f"runs every phase, or name one of: {', '.join(PHASE_NAMES)}",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if args.policy == "imitation" and not args.weights:
+        p.error("--policy imitation requires --weights")
+    if args.calibrate is not None:
+        try:
+            resolve_phases(args.calibrate)
+        except ValueError as exc:
+            p.error(str(exc))
+    return args
+
+
+def resolve_record_path(record: str | None, debug: bool) -> str | None:
+    """Decide where this run records, creating the parent directory.
+
+    An explicit ``--record`` always wins. ``--debug`` on its own records to
+    a timestamped default so a misbehaving debug run can be reviewed after
+    the fact and consecutive runs never overwrite each other. Returns None
+    when neither flag asks for a recording.
+    """
+    if not record:
+        if not debug:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        record = str(Path(DEBUG_RECORD_DIR) / f"debug-{stamp}.jsonl")
+    Path(record).parent.mkdir(parents=True, exist_ok=True)
+    return record
+
+
+def run_episode(env: ClashEnv, policy: Callable[[dict], Action], debug: bool) -> None:
+    """Play one episode to completion and print its summary."""
+    obs = env.reset()
+    done = False
+    total_reward = 0.0
+
+    while not done:
+        obs, reward, done, info = env.step(policy(obs))
+        total_reward += reward
+
+        if debug and env._frame is not None and env.board is not None:
+            overlay = render_debug_overlay(
+                env._frame,
+                env.board,
+                env.state,
+                lifecycle_state=info.get("lifecycle_state"),
+            )
+            cv2.imshow("clashBot debug", overlay)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                done = True
+
+    print(
+        f"Episode complete: reward={total_reward:.2f} | "
+        f"result={env.state.match_result} | "
+        f"steps={info.get('step', '?')}"
+    )
 
 
 def run() -> None:
     args = parse_args()
     load_dotenv()
 
-    if args.calibrate:
+    if args.calibrate is not None:
         from .calibrate import calibrate
-        calibrate(args.window)
+        calibrate(args.window, args.calibrate)
         return
 
-    policy: Policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
+    if args.record_human:
+        from .imitation.recorder import record_demos
+        record_demos(
+            window_title=args.window,
+            model_id=args.model,
+            record_path=args.record_human,
+            episodes=args.episodes,
+        )
+        return
 
+    if args.policy == "imitation":
+        from .imitation.policy import ImitationPolicy
+        policy: Callable[[dict], Action] = ImitationPolicy(args.weights)
+    else:
+        policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
+    record_path = resolve_record_path(args.record, args.debug)
+    if record_path:
+        print(f"Recording to: {record_path}")
     env = ClashEnv(
         window_title=args.window,
         model_id=args.model,
-        record_path=args.record,
+        record_path=record_path,
     )
 
     print(f"Action space size: {action_space_size()}")
@@ -111,32 +194,7 @@ def run() -> None:
     try:
         for episode in range(args.episodes):
             print(f"\n=== Episode {episode + 1}/{args.episodes} ===")
-            obs = env.reset()
-            done = False
-            total_reward = 0.0
-
-            while not done:
-                action = policy(obs)
-                obs, reward, done, info = env.step(action)
-                total_reward += reward
-
-                if args.debug and env._frame is not None and env.board is not None:
-                    overlay = render_debug_overlay(
-                        env._frame,
-                        env.board,
-                        env.state,
-                        lifecycle_state=info.get("lifecycle_state"),
-                    )
-                    cv2.imshow("clashBot debug", overlay)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        done = True
-
-            print(
-                f"Episode complete: reward={total_reward:.2f} | "
-                f"result={env.state.match_result} | "
-                f"steps={info.get('step', '?')}"
-            )
-
+            run_episode(env, policy, debug=args.debug)
             time.sleep(2.0)
     finally:
         if args.debug:
