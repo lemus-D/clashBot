@@ -1,37 +1,43 @@
 """OCR readers for the two numeric HUD elements: tower HP and the match timer.
 
-``TowerHealthReader`` crops a small region around each of the six towers
-and runs Tesseract on the digits. ``MatchTimerReader`` does the same for
-the single ``m:ss`` countdown in the arena's upper right, which is the
-only ground truth for match time (everything else about the clock is
-simulated). Regions are fractions of the captured frame (0-1); CALIBRATE
+The two use different recognisers, for measured reasons.
+
+``TowerHealthReader`` reads the six tower HP numbers with EasyOCR on the
+GPU. It used Tesseract, which could not do it: the HP digits are a heavy
+stylised game font about 14 px tall, and across ~400 combinations of
+threshold, mask, upscale (3-8x), interpolation, morphology, PSM and engine
+mode it plateaued at 9 of 12 known readings - while emitting confident
+wrong values like 112 or 1812 for 1512. Those flow straight into game
+state; a single misread 0 for ``enemy_king`` once ended a match at 2:28
+with a false "win". The masks were provably clean (the same images are
+trivially legible), so the recogniser was the limit, not preprocessing.
+
+EasyOCR reads the same 12 samples 11 exactly right with ZERO wrong
+values: the one it is unsure of scores 0.42 against 0.997-1.000 for every
+correct reading, so ``TOWER_HP_MIN_CONFIDENCE`` rejects it. Abstaining
+costs one frame at a ~0.3 s cycle; a wrong value corrupts the episode.
+That confidence gate is also what makes "no readable number" trustworthy
+enough to mean "destroyed". Cost is ~84 ms/cycle for all six against
+Tesseract's 51 ms, inside the step budget.
+
+``MatchTimerReader`` still uses Tesseract, which reads the ``m:ss``
+countdown fine - it is the only ground truth for match time, everything
+else about the clock being simulated. It keeps its own persistent
+``PyTessBaseAPI`` so tessdata loads once rather than per cycle.
+
+Regions are fractions of the captured frame (0-1); CALIBRATE
 ``TOWER_HP_REGIONS`` and ``MATCH_TIMER_REGION`` for your BlueStacks crop.
+Tower boxes must bound the HP DIGITS only - excluding the gold level
+badge to their left, whose small number otherwise reads as HP (that is
+where the 1-77 "HP" values in early recordings came from). Before a king
+tower takes damage the game draws no bar and no number, only the badge,
+centred where the number would be; that crop is expected to yield
+``None`` and leave the tower at its default HP.
 
-Tesseract runs in-process via tesserocr, which binds libtesseract
-directly. One ``PyTessBaseAPI`` is built lazily and reused for the life
-of the reader, so tessdata is loaded once instead of once per cycle.
-(The pytesseract path this replaced spawned a fresh ``tesseract.exe``
-per call: ~200 ms of process overhead against ~35 ms of recognition.)
-
-The six crops are still stacked into one image and read in a single
-recognition pass. Measured with a persistent handle it is the faster of
-the two: 51 ms/cycle against 61 ms for six separate recognitions, because
-Tesseract's fixed per-image layout analysis costs more than the blank
-padding between rows. Each recognised word is mapped back to its source
-region by its vertical position in the stack.
-
-Because the crops share one canvas they must share one polarity, so
-``_preprocess_for_ocr`` normalises every crop to black digits on white
-independently of the others. That invariant is what makes compositing
-safe: deriving the canvas polarity from the crops collectively (a
-majority vote over their pixels) let a mostly-destroyed board - three
-blank crops outvoting three live ones, an ordinary late-game state -
-invert the canvas and silently erase the survivors' digits.
-
-Tesseract is a hard requirement: a missing install, missing tessdata, or
-a malformed crop all raise rather than degrading silently. A single frame
-whose digits cannot be recognised is not a failure of that kind - it is
-reported as ``None`` for that field and the caller decides.
+Both recognisers are hard requirements: a missing install or a malformed
+crop raises rather than degrading silently. A single frame whose digits
+cannot be read is not a failure of that kind - it is reported as ``None``
+for that field and the caller decides.
 """
 
 from __future__ import annotations
@@ -51,12 +57,12 @@ from ..game.state import TOWER_KEYS
 # Each entry is (x_frac, y_frac, w_frac, h_frac) within the captured frame.
 # CALIBRATE FOR YOUR RESOLUTION.
 TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
-    "enemy_king":  (0.3974, 0.0120, 0.2102, 0.0444),
-    "enemy_left":  (0.1658, 0.1322, 0.1527, 0.0351),
-    "enemy_right":  (0.6864, 0.1331, 0.1527, 0.0333),
-    "friendly_king":  (0.3924, 0.7403, 0.2200, 0.0471),
-    "friendly_left":  (0.1626, 0.6118, 0.1576, 0.0582),
-    "friendly_right":  (0.6880, 0.6091, 0.1494, 0.0370),
+    "enemy_king":  (0.4778, 0.0166, 0.0788, 0.0213),
+    "enemy_left":  (0.2085, 0.1322, 0.0706, 0.0203),
+    "enemy_right":  (0.7307, 0.1303, 0.0706, 0.0213),
+    "friendly_king":  (0.4762, 0.7560, 0.0821, 0.0222),
+    "friendly_left":  (0.2085, 0.6201, 0.0706, 0.0203),
+    "friendly_right":  (0.7307, 0.6211, 0.0657, 0.0185),
 }
 
 # (x_frac, y_frac, w_frac, h_frac) of the "m:ss" match countdown, drawn in
@@ -67,10 +73,33 @@ TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
 MATCH_TIMER_REGION: tuple[float, float, float, float] = (0.8555, 0.0240, 0.1248, 0.0370)
 
 
-# PSM.SINGLE_BLOCK (psm 6) = "a uniform block of text": Tesseract segments
-# the stack into one line per crop. Tower HP is always digits.
-TOWER_HP_PSM = PSM.SINGLE_BLOCK
-TOWER_HP_WHITELIST = "0123456789"
+# Tower HP is always digits, so EasyOCR is restricted to them.
+TOWER_HP_ALLOWLIST = "0123456789"
+
+# Minimum EasyOCR confidence for a tower-HP reading to be believed. Over the
+# calibration frames every correct reading scored 0.997-1.000 and the single
+# misread scored 0.421, so the gap this sits in is wide rather than tuned.
+# Below it the frame is reported unreadable (None) instead of guessed at.
+TOWER_HP_MIN_CONFIDENCE = 0.90
+
+# The HP digits are near-white glyphs drawn over a saturated bar - magenta
+# for the enemy, blue for the friendly side - beside a gold level badge.
+# Selecting "light and near-neutral" in LAB isolates them regardless of what
+# is behind them, which a grayscale threshold cannot do: the enemy bar is
+# glossy magenta, bright AND pale at the highlight, so brightness alone
+# floods the mask. Chroma is the distance from the neutral axis, so the bar,
+# the badge and the arena floor are all excluded by it while the glyphs are
+# not. Lightness is a percentile so it adapts per crop.
+_GLYPH_UPSCALE = 4.0
+_GLYPH_LIGHTNESS_PERCENTILE = 55.0
+_GLYPH_MAX_CHROMA = 18.0
+
+# Calibrated tower boxes bound the digits tightly enough to clip their tops
+# and bottoms, and a glyph cut off at the border recognises badly (1512 read
+# as 52). A couple of source pixels of slack fixes that. Deliberately small:
+# the gold level badge sits ~26 px to the left, so a generous margin trades
+# clipped glyphs for a badge digit in the crop.
+_TOWER_CROP_MARGIN_PX = 2
 
 # The timer crop holds exactly one line, so psm 7 skips layout analysis
 # entirely. The colon is whitelisted because it is part of the value;
@@ -83,17 +112,11 @@ MATCH_TIMER_WHITELIST = "0123456789:"
 # is a misread, not a clock.
 MAX_TIMER_SECONDS = 180
 
-# Blank rows between stacked crops, and a border around the whole stack,
-# so Tesseract splits the crops into separate lines. Not per-machine:
-# the crops are already 3x upscaled, so these are generic layout padding.
-_ROW_GAP_PX = 24
-_MARGIN_PX = 12
-
-# Every preprocessed crop is black digits on a white background, so this is
-# also what the composite is padded with. Dark-on-light rather than the
-# inverse because Tesseract is trained that way: measured over 2304 synthetic
-# region reads the two conventions were identical on accuracy (2226 correct
-# either way) but dark-on-light read in 40.2 ms against 58.5 ms.
+# The timer crop is binarized to black digits on a white background.
+# Dark-on-light rather than the inverse because Tesseract is trained that
+# way: measured over 2304 synthetic region reads the two conventions were
+# identical on accuracy (2226 correct either way) but dark-on-light read in
+# 40.2 ms against 58.5 ms.
 _BACKGROUND = 255
 
 
@@ -165,19 +188,23 @@ def _recognized_words(api: PyTessBaseAPI) -> list[tuple[str, tuple[int, int, int
 
 
 def _crop_region(
-    frame: np.ndarray, region: tuple[float, float, float, float], what: str
+    frame: np.ndarray,
+    region: tuple[float, float, float, float],
+    what: str,
+    margin: int = 0,
 ) -> np.ndarray:
     """Crop ``(x_frac, y_frac, w_frac, h_frac)`` out of ``frame``.
 
     ``what`` names the calibration constant the region came from, so an
-    empty crop says which value to fix.
+    empty crop says which value to fix. ``margin`` grows the box by that
+    many source pixels on every side.
     """
     h, w = frame.shape[:2]
     xf, yf, wf, hf = region
-    x0 = max(0, int(xf * w))
-    y0 = max(0, int(yf * h))
-    x1 = min(w, x0 + max(1, int(wf * w)))
-    y1 = min(h, y0 + max(1, int(hf * h)))
+    x0 = max(0, int(xf * w) - margin)
+    y0 = max(0, int(yf * h) - margin)
+    x1 = min(w, int(xf * w) + max(1, int(wf * w)) + margin)
+    y1 = min(h, int(yf * h) + max(1, int(hf * h)) + margin)
     crop = frame[y0:y1, x0:x1]
     if crop.size == 0:
         raise ValueError(
@@ -188,28 +215,28 @@ def _crop_region(
 
 
 def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
-    """Binarize one small HUD crop to black digits on a white background.
+    """Binarize the timer crop to black digits on a white background.
 
-    Polarity is decided from this crop alone, never from its neighbours, so
-    that stacking crops cannot make one region's contents change another's
-    rendering. Orientation comes from the pixel counts: digits occupy a
-    small minority of one of these tight boxes - 12-22% of pixels across
-    the six TOWER_HP_REGIONS on synthetic renders, and MATCH_TIMER_REGION is
-    a box of the same kind around four glyphs - so the majority class after
-    Otsu is background and is forced to white. Should some region ever
-    break that assumption its own digits invert and it reads as None; it
-    cannot drag the other five with it, which is the point of deciding per
-    crop.
+    Orientation comes from the pixel counts: the digits occupy a small
+    minority of this tight box, so the majority class after Otsu is
+    background and is forced to white. Should the crop ever break that
+    assumption its digits invert and the frame reads as None.
+
+    Tower HP does NOT come through here - see :func:`_glyph_mask`. A
+    majority-vote polarity is only safe while the digits are a clear
+    minority of the crop, and the tower boxes sit at 39-48% ink, close
+    enough to the flip point that neighbouring frames inverted
+    inconsistently.
     """
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     # Upscale + threshold makes Tesseract substantially more reliable on
     # the small UI digits.
     gray = cv2.resize(gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     if gray.min() == gray.max():
-        # A flat crop - a destroyed tower leaves no HP label - has no
-        # foreground to find, and Otsu on a constant image is degenerate.
-        # Answer directly with pure background: this region reads as None
-        # and contributes nothing to the composite.
+        # A flat crop - the timer is absent in the menu and behind the
+        # pre-match countdown - has no foreground to find, and Otsu on a
+        # constant image is degenerate. Answer with pure background so the
+        # frame reads as None.
         return np.full_like(gray, _BACKGROUND)
     _, binarized = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     if 2 * int(np.count_nonzero(binarized)) < binarized.size:
@@ -217,92 +244,123 @@ def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     return binarized
 
 
-def _stack_crops(crops: list[np.ndarray]) -> tuple[np.ndarray, list[float]]:
-    """Stack preprocessed crops vertically into one OCR image.
+def _glyph_mask(crop: np.ndarray) -> np.ndarray:
+    """Isolate tower-HP digits as black glyphs on a white background.
 
-    Every crop arrives from :func:`_preprocess_for_ocr` in the same
-    polarity, so the padding is just ``_BACKGROUND`` and no crop's contents
-    can affect how another is rendered.
+    Works in LAB and keeps pixels that are light AND near-neutral, which is
+    what the digits are and what nothing else in these crops is: the bar
+    fill and the gold level badge are strongly chromatic, and the dark glyph
+    outline is not light. Polarity is fixed by construction rather than
+    voted on, so it cannot flip between frames.
 
-    Returns the composite and the y coordinates separating consecutive
-    crops, used to attribute recognised words back to their region.
+    Nothing here special-cases a destroyed tower or an undamaged king. Both
+    simply contain no digits, the recogniser finds nothing or scores low,
+    and the caller gets ``None``.
     """
-    width = max(c.shape[1] for c in crops) + 2 * _MARGIN_PX
-    height = sum(c.shape[0] for c in crops) + _ROW_GAP_PX * (len(crops) + 1)
-    canvas = np.full((height, width), _BACKGROUND, dtype=np.uint8)
-    boundaries: list[float] = []
-    y = _ROW_GAP_PX
-    for i, crop in enumerate(crops):
-        canvas[y:y + crop.shape[0], _MARGIN_PX:_MARGIN_PX + crop.shape[1]] = crop
-        y += crop.shape[0]
-        if i < len(crops) - 1:
-            boundaries.append(y + _ROW_GAP_PX / 2.0)
-        y += _ROW_GAP_PX
-    return canvas, boundaries
+    big = cv2.resize(crop, None, fx=_GLYPH_UPSCALE, fy=_GLYPH_UPSCALE,
+                     interpolation=cv2.INTER_CUBIC)
+    lab = cv2.cvtColor(big, cv2.COLOR_BGR2LAB)
+    lightness = lab[..., 0].astype(np.float32)
+    a = lab[..., 1].astype(np.float32) - 128.0
+    b = lab[..., 2].astype(np.float32) - 128.0
+    chroma = np.sqrt(a * a + b * b)
+    glyph = (
+        (lightness >= np.percentile(lightness, _GLYPH_LIGHTNESS_PERCENTILE))
+        & (chroma <= _GLYPH_MAX_CHROMA)
+    )
+    return np.where(glyph, 0, _BACKGROUND).astype(np.uint8)
+
+
+def _make_easyocr_reader():
+    """Build the EasyOCR reader used for tower HP.
+
+    Imported here rather than at module scope because EasyOCR pulls in
+    torch, and ``src.calibrate`` imports this module only for the region
+    constants - it should not pay seconds of CUDA init to draw boxes.
+    """
+    try:
+        import easyocr
+    except ImportError as exc:
+        raise RuntimeError(
+            "EasyOCR is required to read tower HP but is not installed: "
+            f"{exc}. Install it with 'pip install easyocr' (see "
+            "requirements.txt)."
+        ) from exc
+    try:
+        return easyocr.Reader(["en"], gpu=True, verbose=False)
+    except Exception as exc:
+        raise RuntimeError(
+            f"EasyOCR failed to initialise: {exc}. Tower HP cannot be read; "
+            "check the torch install and that the recognition model "
+            "downloaded to ~/.EasyOCR."
+        ) from exc
+
+
+def _read_number(reader, mask: np.ndarray) -> int | None:
+    """Recognise one all-digit number in ``mask``, or ``None``.
+
+    ``None`` covers every way this frame can fail to produce a number: no
+    text found (a destroyed tower or an undamaged king shows none), a
+    non-digit result, or a confidence below ``TOWER_HP_MIN_CONFIDENCE``.
+    The caller keeps the last known HP rather than acting on a guess.
+
+    The crop's own box is passed as ``horizontal_list`` so EasyOCR runs
+    only its recogniser; there is nothing to detect when calibration
+    already says where the digits are.
+    """
+    height, width = mask.shape[:2]
+    results = reader.recognize(
+        mask,
+        horizontal_list=[[0, width, 0, height]],
+        free_list=[],
+        allowlist=TOWER_HP_ALLOWLIST,
+        detail=1,
+    )
+    digits = "".join(str(word).strip() for _box, word, _conf in results)
+    if not digits.isdigit():
+        return None
+    if min(conf for _box, _word, conf in results) < TOWER_HP_MIN_CONFIDENCE:
+        return None
+    return int(digits)
 
 
 class TowerHealthReader:
-    """Reads tower HP for the six towers via Tesseract OCR.
+    """Reads tower HP for the six towers with EasyOCR.
 
-    Owns one persistent Tesseract API handle, created on the first
-    :meth:`read` and released by :meth:`close`. NOT thread-safe: a
-    ``PyTessBaseAPI`` wraps a single stateful ``TessBaseAPI``, so
-    concurrent reads would interleave ``SetImageBytes`` / ``Recognize``
-    on the same instance. Call :meth:`read` from one thread only, or give
-    each thread its own reader.
+    Each region is read independently: one recogniser call per crop, with
+    the crop's own bounding box handed in so EasyOCR's text *detector*
+    never runs. Detection is pure waste here because calibration already
+    says where the digits are, and skipping it costs nothing in accuracy
+    (11/12 either way) while removing any chance of one tower's reading
+    being attributed to another. Batching the six into one call measured
+    the same ~84 ms, so the simpler form wins.
+
+    A reading is returned only if it is all digits and scores at least
+    ``TOWER_HP_MIN_CONFIDENCE``; anything else is ``None``, meaning "this
+    frame could not be read", which the caller treats as keep-last-known.
+
+    Owns one lazily built EasyOCR reader, released by :meth:`close`. NOT
+    thread-safe: read from one thread only, or give each thread its own.
     """
 
     def __init__(self) -> None:
-        self._api: PyTessBaseAPI | None = None
+        self._reader: object | None = None
 
     def read(self, frame: np.ndarray) -> dict[str, int | None]:
-        keys = list(TOWER_HP_REGIONS)
-        crops = [
-            _preprocess_for_ocr(
-                _crop_region(frame, TOWER_HP_REGIONS[k], f"TOWER_HP_REGIONS[{k!r}]")
-            )
-            for k in keys
-        ]
-        composite, boundaries = _stack_crops(crops)
-
-        api = self._get_api()
-        api.SetImageBytes(
-            composite.tobytes(),
-            composite.shape[1],
-            composite.shape[0],
-            1,                    # bytes per pixel: 8-bit grayscale
-            composite.shape[1],   # bytes per line
-        )
-        api.Recognize()
-
-        # Attribute each word to a crop by where it sits vertically. Position
-        # rather than line order: a tower whose HP is unreadable (destroyed,
-        # obscured) must yield None for *that* tower, never shift the
-        # remaining readings onto the wrong towers.
-        found: dict[int, list[tuple[int, str]]] = {}
-        for text, (left, top, _right, bottom) in _recognized_words(api):
-            text = text.strip()
-            if not text:
-                continue
-            idx = int(np.searchsorted(boundaries, (top + bottom) / 2.0))
-            found.setdefault(idx, []).append((left, text))
-
+        reader = self._get_reader()
         out: dict[str, int | None] = {k: None for k in TOWER_KEYS}
-        for i, key in enumerate(keys):
-            words = found.get(i)
-            if not words:
-                continue
-            text = " ".join(t for _, t in sorted(words))
-            if text.isdigit():
-                out[key] = int(text)
+        for key, region in TOWER_HP_REGIONS.items():
+            mask = _glyph_mask(
+                _crop_region(frame, region, f"TOWER_HP_REGIONS[{key!r}]",
+                             margin=_TOWER_CROP_MARGIN_PX)
+            )
+            out[key] = _read_number(reader, mask)
         return out
 
     def close(self) -> None:
-        """Release the Tesseract handle. Idempotent; a later :meth:`read`
+        """Drop the EasyOCR reader. Idempotent; a later :meth:`read`
         transparently builds a fresh one."""
-        if self._api is not None:
-            self._api.End()
-            self._api = None
+        self._reader = None
 
     def __enter__(self) -> TowerHealthReader:
         return self
@@ -312,10 +370,10 @@ class TowerHealthReader:
 
     # ----- internals -----
 
-    def _get_api(self) -> PyTessBaseAPI:
-        if self._api is None:
-            self._api = _make_api(TOWER_HP_PSM, TOWER_HP_WHITELIST)
-        return self._api
+    def _get_reader(self):
+        if self._reader is None:
+            self._reader = _make_easyocr_reader()
+        return self._reader
 
 
 def parse_match_timer(text: str) -> float | None:

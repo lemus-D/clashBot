@@ -6,7 +6,18 @@ inference>=0.10
 supervision>=0.18
 python-dotenv>=1.0,<2
 pyautogui>=0.9.54,<1
-# Tower-HP OCR. tesserocr binds libtesseract in-process, so the persistent
+# Tower-HP OCR. Tesseract cannot read the stylised HP digits: across ~400
+# threshold/mask/upscale/PSM/engine combinations it topped out at 9 of 12
+# known readings and emitted confident wrong values (1512 -> 112, 1812) that
+# corrupt game state. EasyOCR reads the same samples 11/12 with zero wrong
+# values, and scores its one uncertain read 0.42 against 0.997+ for correct
+# ones, so src/vision/ocr.py can reject it instead of believing it. Runs on
+# the GPU; downloads ~100 MB of models to ~/.EasyOCR on first use (do NOT
+# commit those). ~84 ms/cycle for all six towers against Tesseract's 51 ms.
+easyocr>=1.7,<2
+#
+# The match TIMER still uses Tesseract, which reads it correctly.
+# tesserocr binds libtesseract in-process, so the persistent
 # handle in src/vision/ocr.py loads tessdata once instead of spawning a
 # tesseract.exe every cycle (~200 ms -> ~0). It replaced pytesseract entirely.
 #

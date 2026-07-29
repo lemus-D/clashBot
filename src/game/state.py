@@ -15,6 +15,22 @@ the action layer commits a placement.
 Tower HP and match result are externally driven: ``TowerHealthReader``
 and ``MatchLifecycle`` push values in via ``update_tower_hp`` and
 ``set_match_result``.
+
+Two things about tower HP are inferred rather than read. Each tower's
+MAXIMUM is learned as the largest HP seen this match, because HP only
+falls and because tower level - and so max HP - varies per account and
+per opponent. DESTRUCTION is inferred from a run of unreadable frames,
+because a destroyed tower keeps neither bar nor number and so has no zero
+to read. Princess towers only: their number is legible most frames, so a
+long absence is evidence, whereas a king's is legible almost never even
+after it is damaged, so absence says nothing about it. Destruction is
+provisional - a tower that reads again afterwards retracts it, crown
+included, since rubble never shows a number.
+
+Destroyed towers award crowns but never decide the match. ``match_result``
+comes from ``MatchLifecycle`` reading the victory/defeat banner, because
+tower vision is accurate enough to shape reward and not accurate enough to
+end an episode.
 """
 
 from __future__ import annotations
@@ -24,8 +40,71 @@ from typing import Literal, Optional
 
 MatchResult = Literal["win", "loss", "draw"]
 
-DEFAULT_PRINCESS_HP = 2534
-DEFAULT_KING_HP = 4824
+# Starting guesses only - see ``set_tower_hp``, which raises a tower's max to
+# the largest HP it actually reads during the match. Tower HP depends on tower
+# LEVEL, and the level differs per account and per opponent, so no constant is
+# right for the enemy side: these were 2534/4824 (level ~11 tournament values)
+# against an account whose princess towers read 1512, which normalised a
+# full-health tower to 0.60. Observed on this account: princess (level 2) 1512,
+# friendly king (level 3) 2736, a level-2 enemy king 2532.
+DEFAULT_PRINCESS_HP = 1512
+DEFAULT_KING_HP = 2736
+
+# Consecutive unreadable frames before a tower counts as destroyed. Absence is
+# the only destruction signal available: the game draws neither bar nor number
+# over rubble, and the reader returns None rather than 0 (it never sees a 0 to
+# read). At a ~0.25s cycle this is ~7.5s.
+#
+# It was 10 (~2.5s) and that was too little evidence: a match destroyed two
+# live princess towers 0.3s apart when a fight covered both numbers at once.
+# Both really did die later, which is what made the mistake easy to miss.
+# Nothing downstream needs destruction promptly - it shapes reward and never
+# ends an episode - so the cost of waiting is far below the cost of a false
+# positive.
+TOWER_MISSING_READS_FOR_DESTROYED = 30
+
+# Successful readings before a tower may be considered destroyed at all. One
+# reading is not enough: a single spurious read on a king's crop - which holds
+# the gold level badge before the king is damaged - was enough to make the
+# king's ORDINARY silence look like destruction, ending a 67s match as a false
+# "win". A live tower draws its number steadily and clears this in about a
+# second, while a misread is isolated by definition.
+TOWER_READS_BEFORE_DESTRUCTIBLE = 3
+
+# Consecutive readings that RETRACT a destruction. Destruction is inferred from
+# absence, and absence is what an ordinary fight over a tower produces, so it
+# is a hypothesis rather than a fact - and rubble never produces a number, so a
+# tower that reads again was never destroyed. Retracting costs nothing and
+# bounds how much damage a premature call can do: the crown is handed back and
+# the HP-delta reward the false zero paid out is refunded by the same
+# arithmetic that granted it.
+#
+# Two readings rather than one so a single misread cannot resurrect a tower
+# that really is rubble.
+TOWER_READS_TO_UNDO_DESTRUCTION = 2
+
+# Towers whose destruction may be inferred from absence. Princess towers only,
+# and this is a property of the vision rather than a preference. Measured over
+# one match by dumping frames and checking them against the recording, the read
+# rate while a tower was alive was:
+#
+#   enemy_left 83%   friendly_right 80%   enemy_right 80%
+#   friendly_king 29%   enemy_king 0%
+#
+# At ~80% a long run of misses really does mean the number is gone. A king's
+# number is only intermittently legible even after it is damaged, so absence
+# says nothing about it: one match declared enemy_king destroyed at 112s and a
+# dump read it alive at 1810 HP sixty seconds later, while the match ran on to
+# 191s - a real king kill would have ended it on the spot. Both kings "died"
+# at unrelated times and the crown count reached an impossible 3-3.
+#
+# The cost of excluding them is that a genuinely destroyed king keeps its last
+# reading instead of dropping to 0 for the last frames before the banner ends
+# the episode. That is a cosmetic error in an episode that is already over,
+# against false 3-crown wins in the middle of live matches.
+ABSENCE_DESTRUCTIBLE_TOWERS: tuple[str, ...] = (
+    "friendly_left", "friendly_right", "enemy_left", "enemy_right",
+)
 
 DEFAULT_TOWER_HP: dict[str, int] = {
     "friendly_left": DEFAULT_PRINCESS_HP,
@@ -80,6 +159,15 @@ class GameState:
         self.crowns_enemy: int = 0
         self.match_result: Optional[MatchResult] = None
         self._destroyed_towers: set[str] = set()
+        # How many times each tower's HP has been read this match. Absence of a
+        # reading only means "destroyed" for a tower that was reliably readable
+        # before: an undamaged king shows no number at all, so it never
+        # accumulates reads and can never be mistaken for destroyed.
+        self._read_counts: dict[str, int] = {k: 0 for k in TOWER_KEYS}
+        self._missing_reads: dict[str, int] = {k: 0 for k in TOWER_KEYS}
+        # Consecutive readings seen for a tower currently believed destroyed,
+        # which is the evidence that belief was wrong.
+        self._revive_reads: dict[str, int] = {k: 0 for k in TOWER_KEYS}
 
     # ----- lifecycle -----
 
@@ -100,9 +188,17 @@ class GameState:
         self.match_result = None
         self.crowns_friendly = 0
         self.crowns_enemy = 0
+        # Max HP is re-learned every match: the opponent changes, and with them
+        # the enemy towers' level. Carrying a previous opponent's higher max
+        # over would normalise this match's full-health towers below 1.0.
+        self.tower_max_hp = dict(DEFAULT_TOWER_HP)
         for k in TOWER_KEYS:
             self.tower_hp[k] = self.tower_max_hp[k]
+            self._missing_reads[k] = 0
+            self._revive_reads[k] = 0
         self._destroyed_towers.clear()
+        for k in TOWER_KEYS:
+            self._read_counts[k] = 0
         print("Match started!")
 
     def end_match(self, result: Optional[MatchResult] = None) -> None:
@@ -235,30 +331,100 @@ class GameState:
     # ----- towers -----
 
     def set_tower_hp(self, key: str, value: Optional[int]) -> None:
+        """Absorb one HP reading, or ``None`` for an unreadable frame.
+
+        Destruction is inferred from a *run* of unreadable frames rather
+        than from a zero reading, because the game never draws a zero: a
+        destroyed tower loses its bar and its number entirely. The old
+        ``value <= 0`` trigger could therefore only ever fire on a misread,
+        and did - one bogus ``enemy_king`` zero ended a match at 2:28 with a
+        false "win". Only ``ABSENCE_DESTRUCTIBLE_TOWERS`` take part, and only
+        after ``TOWER_READS_BEFORE_DESTRUCTIBLE`` successful reads, so neither
+        a king's ordinary silence nor one stray reading can destroy anything.
+
+        A destroyed tower keeps being watched rather than being written off,
+        because absence is weak evidence and rubble shows no number: readings
+        that arrive afterwards retract the destruction. See
+        :meth:`_retract_tower_destroyed`.
+        """
         if key not in self.tower_hp:
             raise KeyError(f"Unknown tower key {key!r}; expected one of {TOWER_KEYS}")
+        if value is not None and value <= 0:
+            # Not a real reading - no tower ever displays 0 - so treat it as
+            # an unreadable frame rather than as a destroyed tower.
+            value = None
+        if key in self._destroyed_towers:
+            # Keep watching it. Rubble never shows a number, so readings here
+            # disprove the destruction rather than update it.
+            if value is None:
+                self._revive_reads[key] = 0
+                return
+            self._revive_reads[key] += 1
+            if self._revive_reads[key] < TOWER_READS_TO_UNDO_DESTRUCTION:
+                return
+            self._retract_tower_destroyed(key)
+            # Fall through: this is now an ordinary reading for a live tower.
         if value is None:
-            return  # OCR couldn't read this frame; keep the last known HP
+            if (
+                self.is_match_active
+                and key in ABSENCE_DESTRUCTIBLE_TOWERS
+                and self._read_counts[key] >= TOWER_READS_BEFORE_DESTRUCTIBLE
+            ):
+                self._missing_reads[key] += 1
+                if self._missing_reads[key] >= TOWER_MISSING_READS_FOR_DESTROYED:
+                    self.tower_hp[key] = 0
+                    self._register_tower_destroyed(key)
+            return  # otherwise keep the last known HP
+        self._missing_reads[key] = 0
+        self._read_counts[key] += 1
+        # HP only ever falls, so the largest reading of the match is this
+        # tower's maximum. Learned rather than assumed because the enemy's
+        # tower level is unknowable before the match and varies per opponent.
+        if value > self.tower_max_hp[key]:
+            self.tower_max_hp[key] = value
         self.tower_hp[key] = value
-        if value <= 0:
-            self._register_tower_destroyed(key)
 
     def update_tower_hp(self, readings: dict[str, Optional[int]]) -> None:
         for k, v in readings.items():
             self.set_tower_hp(k, v)
 
     def _register_tower_destroyed(self, key: str) -> None:
+        """Record a destroyed tower and award the crown for it.
+
+        Deliberately does NOT decide the match. Vision-derived tower state is
+        good enough to shape reward but not to end an episode: a single bad
+        frame used to be able to declare a win, overruling a lifecycle layer
+        that was still correctly reporting IN_MATCH. ``match_result`` now
+        comes only from ``MatchLifecycle``, which reads the victory/defeat
+        banner - the same screen a human would look at.
+        """
         if key in self._destroyed_towers:
             return
         self._destroyed_towers.add(key)
+        self._revive_reads[key] = 0
         if key.startswith("enemy"):
             self.crowns_friendly = min(3, self.crowns_friendly + 1)
-            if key == "enemy_king":
-                self.set_match_result("win")
         else:
             self.crowns_enemy = min(3, self.crowns_enemy + 1)
-            if key == "friendly_king":
-                self.set_match_result("loss")
+
+    def _retract_tower_destroyed(self, key: str) -> None:
+        """Undo a destruction a later reading disproved.
+
+        Hands the crown back and clears the counters so the tower is tracked
+        normally again - and can still be destroyed later, for real. Loud on
+        purpose: a retraction means absence-based destruction fired early, and
+        that is worth seeing in a run's output rather than inferring from a
+        recording afterwards.
+        """
+        self._destroyed_towers.discard(key)
+        self._revive_reads[key] = 0
+        self._missing_reads[key] = 0
+        if key.startswith("enemy"):
+            self.crowns_friendly = max(0, self.crowns_friendly - 1)
+        else:
+            self.crowns_enemy = max(0, self.crowns_enemy - 1)
+        print(f"Tower {key} read again after being marked destroyed - "
+              f"retracting (crowns now {self.crowns_friendly}-{self.crowns_enemy})")
 
     def is_enemy_left_alive(self) -> bool:
         v = self.tower_hp["enemy_left"]
@@ -269,8 +435,22 @@ class GameState:
         return v is None or v > 0
 
     def is_enemy_king_active(self) -> bool:
-        v = self.tower_hp["enemy_king"]
-        return v is not None and v < self.tower_max_hp["enemy_king"]
+        """Whether the enemy king tower is firing.
+
+        Two independent signals, matching the game's own rules. The king
+        activates when it takes damage - and it only draws its HP number
+        once damaged, so having ever read that number means it is active.
+        It also activates when either enemy princess tower falls, which no
+        HP reading would reveal.
+
+        Comparing HP against max would not work: the king's max is learned
+        from its readings, and its first reading is already post-damage, so
+        the two are equal exactly when it has just activated.
+        """
+        return (
+            self._read_counts["enemy_king"] >= TOWER_READS_BEFORE_DESTRUCTIBLE
+            or bool({"enemy_left", "enemy_right"} & self._destroyed_towers)
+        )
 
     # ----- result -----
 

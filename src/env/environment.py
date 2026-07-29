@@ -461,6 +461,10 @@ class ClashEnv:
                 self.state.set_match_result(signals.result)
             return True
         if self.state.match_result is not None:
+            # Only the lifecycle sets this now, so reaching it means the
+            # banner was seen on an earlier frame. It used to be reachable
+            # from a single bad tower-HP reading, which ended matches
+            # mid-play while this very check said the state was IN_MATCH.
             return True
         # Uncapped elapsed, not get_current_match_time(): that saturates at
         # MATCH_MAX_DURATION (300s), so comparing it against a longer
