@@ -1,8 +1,11 @@
-"""OCR-based tower-HP reader.
+"""OCR readers for the two numeric HUD elements: tower HP and the match timer.
 
-Crops a small region around each of the six towers and runs Tesseract
-on the digits. Regions are fractions of the captured frame (0-1);
-CALIBRATE ``TOWER_HP_REGIONS`` for your BlueStacks crop.
+``TowerHealthReader`` crops a small region around each of the six towers
+and runs Tesseract on the digits. ``MatchTimerReader`` does the same for
+the single ``m:ss`` countdown in the arena's upper right, which is the
+only ground truth for match time (everything else about the clock is
+simulated). Regions are fractions of the captured frame (0-1); CALIBRATE
+``TOWER_HP_REGIONS`` and ``MATCH_TIMER_REGION`` for your BlueStacks crop.
 
 Tesseract runs in-process via tesserocr, which binds libtesseract
 directly. One ``PyTessBaseAPI`` is built lazily and reused for the life
@@ -25,13 +28,16 @@ majority vote over their pixels) let a mostly-destroyed board - three
 blank crops outvoting three live ones, an ordinary late-game state -
 invert the canvas and silently erase the survivors' digits.
 
-Tesseract is a hard requirement: a missing install, missing tessdata, a
-malformed crop, or an OCR failure all raise rather than degrading silently.
+Tesseract is a hard requirement: a missing install, missing tessdata, or
+a malformed crop all raise rather than degrading silently. A single frame
+whose digits cannot be recognised is not a failure of that kind - it is
+reported as ``None`` for that field and the caller decides.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -53,11 +59,29 @@ TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
     "friendly_right":  (0.6880, 0.6091, 0.1494, 0.0370),
 }
 
+# (x_frac, y_frac, w_frac, h_frac) of the "m:ss" match countdown, drawn in
+# the upper right of the arena view, roughly level with the enemy king
+# tower's HP bar. CALIBRATE FOR YOUR RESOLUTION - this is a starting guess
+# only, and a wrong region makes the match clock unanchorable (which
+# ``ClashEnv`` raises about rather than running on a simulated clock).
+MATCH_TIMER_REGION: tuple[float, float, float, float] = (0.8555, 0.0240, 0.1248, 0.0370)
+
 
 # PSM.SINGLE_BLOCK (psm 6) = "a uniform block of text": Tesseract segments
 # the stack into one line per crop. Tower HP is always digits.
-OCR_PSM = PSM.SINGLE_BLOCK
-OCR_WHITELIST = "0123456789"
+TOWER_HP_PSM = PSM.SINGLE_BLOCK
+TOWER_HP_WHITELIST = "0123456789"
+
+# The timer crop holds exactly one line, so psm 7 skips layout analysis
+# entirely. The colon is whitelisted because it is part of the value;
+# without a whitelist Tesseract readily returns O for 0 and l/I for 1.
+MATCH_TIMER_PSM = PSM.SINGLE_LINE
+MATCH_TIMER_WHITELIST = "0123456789:"
+
+# Longest countdown either the regulation or the overtime timer can show
+# (regulation starts at 3:00, overtime restarts at 2:00). Anything larger
+# is a misread, not a clock.
+MAX_TIMER_SECONDS = 180
 
 # Blank rows between stacked crops, and a border around the whole stack,
 # so Tesseract splits the crops into separate lines. Not per-machine:
@@ -102,15 +126,77 @@ def _resolve_tessdata_dir() -> str:
     )
 
 
+def _make_api(psm: PSM, whitelist: str) -> PyTessBaseAPI:
+    """Build a Tesseract handle restricted to ``whitelist`` at ``psm``."""
+    tessdata = _resolve_tessdata_dir()
+    try:
+        api = PyTessBaseAPI(path=tessdata, lang="eng", psm=psm)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Tesseract failed to initialise from tessdata {tessdata!r}: "
+            f"{exc}. OCR is required; check the Tesseract install and that "
+            "eng.traineddata matches its version."
+        ) from exc
+    api.SetVariable("tessedit_char_whitelist", whitelist)
+    return api
+
+
+def _recognized_words(api: PyTessBaseAPI) -> list[tuple[str, tuple[int, int, int, int]]]:
+    """Recognised words as (text, bounding box) pairs.
+
+    An all-blank image - every tower destroyed or obscured, or a timer
+    hidden behind the pre-match countdown, both legitimate - leaves the
+    iterator empty, and tesserocr raises "No text returned" if that is read
+    anyway. Skip empty elements so the caller gets Nones instead of an
+    exception.
+    """
+    iterator = api.GetIterator()
+    if iterator is None:
+        return []
+    words: list[tuple[str, tuple[int, int, int, int]]] = []
+    iterator.Begin()
+    while True:
+        if not iterator.Empty(RIL.WORD):
+            box = iterator.BoundingBox(RIL.WORD)
+            if box is not None:
+                words.append((iterator.GetUTF8Text(RIL.WORD), box))
+        if not iterator.Next(RIL.WORD):
+            return words
+
+
+def _crop_region(
+    frame: np.ndarray, region: tuple[float, float, float, float], what: str
+) -> np.ndarray:
+    """Crop ``(x_frac, y_frac, w_frac, h_frac)`` out of ``frame``.
+
+    ``what`` names the calibration constant the region came from, so an
+    empty crop says which value to fix.
+    """
+    h, w = frame.shape[:2]
+    xf, yf, wf, hf = region
+    x0 = max(0, int(xf * w))
+    y0 = max(0, int(yf * h))
+    x1 = min(w, x0 + max(1, int(wf * w)))
+    y1 = min(h, y0 + max(1, int(hf * h)))
+    crop = frame[y0:y1, x0:x1]
+    if crop.size == 0:
+        raise ValueError(
+            f"{what} produced an empty crop ({x0},{y0})-({x1},{y1}) from a "
+            f"{w}x{h} frame; check its calibration"
+        )
+    return crop
+
+
 def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
-    """Binarize one tower-HP crop to black digits on a white background.
+    """Binarize one small HUD crop to black digits on a white background.
 
     Polarity is decided from this crop alone, never from its neighbours, so
     that stacking crops cannot make one region's contents change another's
     rendering. Orientation comes from the pixel counts: digits occupy a
-    small minority of one of these tight HP boxes - 12-22% of pixels across
-    the six TOWER_HP_REGIONS on synthetic renders - so the majority class
-    after Otsu is background and is forced to white. Should some region ever
+    small minority of one of these tight boxes - 12-22% of pixels across
+    the six TOWER_HP_REGIONS on synthetic renders, and MATCH_TIMER_REGION is
+    a box of the same kind around four glyphs - so the majority class after
+    Otsu is background and is forced to white. Should some region ever
     break that assumption its own digits invert and it reads as None; it
     cannot drag the other five with it, which is the point of deciding per
     crop.
@@ -171,7 +257,12 @@ class TowerHealthReader:
 
     def read(self, frame: np.ndarray) -> dict[str, int | None]:
         keys = list(TOWER_HP_REGIONS)
-        crops = [_preprocess_for_ocr(self._crop(frame, k)) for k in keys]
+        crops = [
+            _preprocess_for_ocr(
+                _crop_region(frame, TOWER_HP_REGIONS[k], f"TOWER_HP_REGIONS[{k!r}]")
+            )
+            for k in keys
+        ]
         composite, boundaries = _stack_crops(crops)
 
         api = self._get_api()
@@ -189,7 +280,7 @@ class TowerHealthReader:
         # obscured) must yield None for *that* tower, never shift the
         # remaining readings onto the wrong towers.
         found: dict[int, list[tuple[int, str]]] = {}
-        for text, (left, top, _right, bottom) in self._words(api):
+        for text, (left, top, _right, bottom) in _recognized_words(api):
             text = text.strip()
             if not text:
                 continue
@@ -223,54 +314,104 @@ class TowerHealthReader:
 
     def _get_api(self) -> PyTessBaseAPI:
         if self._api is None:
-            tessdata = _resolve_tessdata_dir()
-            try:
-                api = PyTessBaseAPI(path=tessdata, lang="eng", psm=OCR_PSM)
-            except RuntimeError as exc:
-                raise RuntimeError(
-                    f"Tesseract failed to initialise from tessdata {tessdata!r}: "
-                    f"{exc}. Tower-HP OCR is required; check the Tesseract "
-                    "install and that eng.traineddata matches its version."
-                ) from exc
-            api.SetVariable("tessedit_char_whitelist", OCR_WHITELIST)
-            self._api = api
+            self._api = _make_api(TOWER_HP_PSM, TOWER_HP_WHITELIST)
         return self._api
 
-    @staticmethod
-    def _words(api: PyTessBaseAPI) -> list[tuple[str, tuple[int, int, int, int]]]:
-        """Recognised words as (text, bounding box) pairs.
 
-        An all-blank composite - every tower destroyed or obscured, which is
-        legitimate - leaves the iterator empty, and tesserocr raises
-        "No text returned" if that is read anyway. Skip empty elements so the
-        caller gets six Nones instead of an exception.
-        """
-        iterator = api.GetIterator()
-        if iterator is None:
-            return []
-        words: list[tuple[str, tuple[int, int, int, int]]] = []
-        iterator.Begin()
-        while True:
-            if not iterator.Empty(RIL.WORD):
-                box = iterator.BoundingBox(RIL.WORD)
-                if box is not None:
-                    words.append((iterator.GetUTF8Text(RIL.WORD), box))
-            if not iterator.Next(RIL.WORD):
-                return words
+def parse_match_timer(text: str) -> float | None:
+    """Parse an on-screen countdown into seconds *remaining*, or None.
 
-    @staticmethod
-    def _crop(frame: np.ndarray, key: str) -> np.ndarray:
-        h, w = frame.shape[:2]
-        xf, yf, wf, hf = TOWER_HP_REGIONS[key]
-        x0 = max(0, int(xf * w))
-        y0 = max(0, int(yf * h))
-        x1 = min(w, x0 + max(1, int(wf * w)))
-        y1 = min(h, y0 + max(1, int(hf * h)))
-        crop = frame[y0:y1, x0:x1]
-        if crop.size == 0:
-            raise ValueError(
-                f"Tower HP region for {key!r} produced an empty crop "
-                f"({x0},{y0})-({x1},{y1}) from a {w}x{h} frame; "
-                "check TOWER_HP_REGIONS calibration"
-            )
-        return crop
+    The game draws ``m:ss`` and counts DOWN - 3:00 at the start of
+    regulation, and a fresh 2:00 when overtime begins - so the returned
+    value is time left on whichever countdown is on screen, never elapsed
+    time. Disambiguating the two countdowns is the caller's problem; see
+    :class:`MatchTimerReader`.
+
+    Tesseract's failure modes on this glyph run are dropping the thin
+    colon and substituting look-alikes, so the accepted forms are narrow
+    and everything else is a rejected read (None) rather than a guess:
+
+    - ``"2:47"`` - the normal case.
+    - ``"247"`` - colon dropped. Unambiguous because the seconds field is
+      always two digits, so a 3-digit run is m + ss.
+    - anything else, including 4-digit runs (a colon misread as a digit),
+      seconds >= 60, and totals above ``MAX_TIMER_SECONDS``, is None.
+
+    Character substitutions are handled upstream by
+    ``MATCH_TIMER_WHITELIST``; whitespace and stray whitelist characters
+    are stripped here.
+    """
+    cleaned = re.sub(r"[^0-9:]", "", text)
+    match = re.fullmatch(r"(\d):([0-5]\d)", cleaned) or re.fullmatch(
+        r"(\d)([0-5]\d)", cleaned
+    )
+    if match is None:
+        return None
+    remaining = float(int(match.group(1)) * 60 + int(match.group(2)))
+    if remaining > MAX_TIMER_SECONDS:
+        return None
+    return remaining
+
+
+class MatchTimerReader:
+    """Reads the on-screen ``m:ss`` match countdown via Tesseract OCR.
+
+    :meth:`read` returns seconds remaining on the displayed countdown, or
+    ``None`` when this frame could not be read - timer absent (menu,
+    postmatch), occluded by the pre-match countdown overlay, mid-animation,
+    or a parse that failed validation. A ``None`` is an ordinary outcome
+    for one frame, exactly as an unreadable tower HP is; what an unreadable
+    *run* of frames means is the caller's decision.
+
+    Overtime is deliberately NOT disambiguated here. The overtime clock
+    restarts from 2:00, so "1:30" alone cannot say whether 90s of
+    regulation or 90s of overtime remain, and a reader that guessed would
+    hand out an elapsed time two minutes wrong. This class reports the
+    displayed countdown as-is; ``GameState.anchor_match_clock`` is what
+    rejects a reading that disagrees with its own clock, which is what
+    keeps an overtime display from ever anchoring the match clock.
+
+    Owns one persistent Tesseract API handle with the same threading
+    caveat as :class:`TowerHealthReader`: one thread per reader.
+    """
+
+    def __init__(self) -> None:
+        self._api: PyTessBaseAPI | None = None
+
+    def read(self, frame: np.ndarray) -> float | None:
+        crop = _preprocess_for_ocr(
+            _crop_region(frame, MATCH_TIMER_REGION, "MATCH_TIMER_REGION")
+        )
+        api = self._get_api()
+        api.SetImageBytes(
+            crop.tobytes(),
+            crop.shape[1],
+            crop.shape[0],
+            1,                # bytes per pixel: 8-bit grayscale
+            crop.shape[1],    # bytes per line
+        )
+        api.Recognize()
+        text = "".join(t.strip() for t, _box in _recognized_words(api))
+        if not text:
+            return None
+        return parse_match_timer(text)
+
+    def close(self) -> None:
+        """Release the Tesseract handle. Idempotent; a later :meth:`read`
+        transparently builds a fresh one."""
+        if self._api is not None:
+            self._api.End()
+            self._api = None
+
+    def __enter__(self) -> MatchTimerReader:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    # ----- internals -----
+
+    def _get_api(self) -> PyTessBaseAPI:
+        if self._api is None:
+            self._api = _make_api(MATCH_TIMER_PSM, MATCH_TIMER_WHITELIST)
+        return self._api

@@ -64,6 +64,28 @@ in the codebase; the four hot spots are:
 4. **Lifecycle pixel samples and template images** in
    [`src/matchLifecycle.py`](src/matchLifecycle.py) and
    [`assets/templates/`](assets/templates/).
+5. **Match timer region** in [`src/vision/ocr.py`](src/vision/ocr.py)
+   (`MATCH_TIMER_REGION`) — the `m:ss` countdown, used to anchor the match
+   clock. Wrong values here are fatal: the env raises rather than run on a
+   simulated clock that is ~5s fast.
+
+`python -m src.main --calibrate` walks all of these except the lifecycle
+samples and prints the constants to paste in.
+
+To redo just one constant, name its phase — `viewport` (1), `hand` (2),
+`towers` (3), `timer` (5) — and only that phase runs and only its constant
+is printed:
+
+```bash
+python -m src.main --calibrate timer      # just MATCH_TIMER_REGION
+python -m src.main --calibrate hand       # just HAND_CARD_POSITIONS
+```
+
+An unknown phase name is an error listing the valid ones. The `towers` and
+`timer` phases box in-match HUD elements, so run them with a live match on
+screen. Skipping the `viewport` phase means the other phases measure
+against the committed `WINDOW_CROP_*` crop (the same frame the bot sees at
+runtime), so re-run `viewport` first if the window size or theme changed.
 
 Run with `--debug` to see the captured frame and the tile grid overlay
 while you tune.
@@ -101,7 +123,7 @@ For imitation learning, record with `--record` (bot play) or
 | `hand_costs`    | (4,)                 | elixir cost per slot                     |
 | `hand_playable` | (4,)                 | 1 where elixir >= cost, 0 elsewhere      |
 | `elixir`        | scalar               | 0-10                                     |
-| `match_time`    | scalar               | seconds elapsed                          |
+| `match_time`    | scalar               | seconds elapsed, timer-anchored, cap 300 |
 | `time_norm`     | scalar               | match_time / 300                         |
 | `phase_onehot`  | (4,)                 | normal / double / ot_d / ot_t            |
 | `arena`         | (16, 9, 2*\|T\|)     | one-hot troop x color per tile           |

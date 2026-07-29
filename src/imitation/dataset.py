@@ -3,7 +3,8 @@
 Recordings hold two independent timestamped streams (see
 ``src/env/environment.py``): ``{"type": "obs"}`` lines from the
 perception loop and ``{"type": "act"}`` lines from the bot's executor or
-the human's mouse. This module joins them.
+the human's mouse. This module joins them. Any other line type (e.g.
+``{"type": "diag"}`` lifecycle diagnostics) is skipped.
 
 Pairing rule: **every action attaches to the nearest observation whose
 timestamp strictly precedes it** — the last state the actor could
@@ -93,11 +94,14 @@ def _read_streams(path: str, flat_size: int) -> tuple[list[dict], list[dict]]:
                 observations.append(rec)
             elif kind == "act":
                 actions.append(rec)
-            else:
-                raise ValueError(
-                    f"{path}:{lineno}: unknown record type {kind!r}; "
-                    f"expected 'meta', 'obs' or 'act'."
-                )
+            # Anything else is an auxiliary stream this trainer has no use
+            # for — currently {"type": "diag"} lifecycle diagnostics, which
+            # every --debug run writes. Skipped, not an error: auxiliary
+            # line types are additive by design (they leave obs/act lines
+            # untouched, hence no record_format bump), so refusing them
+            # would break training on files that are perfectly valid. The
+            # strictness that protects the data is still enforced above:
+            # the meta header, the schema hash and the obs_flat width.
 
     if not meta_seen:
         raise ValueError(

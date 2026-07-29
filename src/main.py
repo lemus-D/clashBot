@@ -8,6 +8,7 @@ Usage::
     python -m src.main --record-human demos/run.jsonl --episodes 5
     python -m src.main --policy imitation --weights models/imitation.pt
     python -m src.main --calibrate
+    python -m src.main --calibrate timer
 """
 
 from __future__ import annotations
@@ -15,12 +16,15 @@ from __future__ import annotations
 import argparse
 import random
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
 
+from .calibrate import ALL_PHASES, PHASE_NAMES, resolve_phases
 from .env.actions import Action, action_space_size
 from .env.environment import ClashEnv
 from .game.board import HAND_SIZE, ARENA_COLS, ARENA_ROWS
@@ -29,6 +33,7 @@ from .debug.overlay import render_debug_overlay
 
 WINDOW_TITLE = "BlueStacks App Player 1"
 MODEL_ID = "troop-counter/8"
+DEBUG_RECORD_DIR = "logs"
 
 
 class RandomPolicy:
@@ -64,7 +69,11 @@ class RandomPolicy:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="clashBot main loop")
-    p.add_argument("--debug", action="store_true", help="show OpenCV debug overlay")
+    p.add_argument(
+        "--debug", action="store_true",
+        help=f"show OpenCV debug overlay; also records to {DEBUG_RECORD_DIR}/ "
+             f"unless --record gives an explicit path",
+    )
     p.add_argument("--record", default=None, help="JSONL path for imitation logs")
     p.add_argument(
         "--record-human", default=None, metavar="PATH",
@@ -83,13 +92,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window", default=WINDOW_TITLE)
     p.add_argument("--model", default=MODEL_ID)
     p.add_argument(
-        "--calibrate", action="store_true",
-        help="run the interactive calibration wizard and exit",
+        "--calibrate", nargs="?", const=ALL_PHASES, default=None, metavar="PHASE",
+        help="run the interactive calibration wizard and exit; with no value "
+             f"runs every phase, or name one of: {', '.join(PHASE_NAMES)}",
     )
     args = p.parse_args()
     if args.policy == "imitation" and not args.weights:
         p.error("--policy imitation requires --weights")
+    if args.calibrate is not None:
+        try:
+            resolve_phases(args.calibrate)
+        except ValueError as exc:
+            p.error(str(exc))
     return args
+
+
+def resolve_record_path(record: str | None, debug: bool) -> str | None:
+    """Decide where this run records, creating the parent directory.
+
+    An explicit ``--record`` always wins. ``--debug`` on its own records to
+    a timestamped default so a misbehaving debug run can be reviewed after
+    the fact and consecutive runs never overwrite each other. Returns None
+    when neither flag asks for a recording.
+    """
+    if not record:
+        if not debug:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        record = str(Path(DEBUG_RECORD_DIR) / f"debug-{stamp}.jsonl")
+    Path(record).parent.mkdir(parents=True, exist_ok=True)
+    return record
 
 
 def run_episode(env: ClashEnv, policy: Callable[[dict], Action], debug: bool) -> None:
@@ -124,9 +156,9 @@ def run() -> None:
     args = parse_args()
     load_dotenv()
 
-    if args.calibrate:
+    if args.calibrate is not None:
         from .calibrate import calibrate
-        calibrate(args.window)
+        calibrate(args.window, args.calibrate)
         return
 
     if args.record_human:
@@ -144,10 +176,13 @@ def run() -> None:
         policy: Callable[[dict], Action] = ImitationPolicy(args.weights)
     else:
         policy = RandomPolicy(no_op_prob=args.no_op_prob, seed=args.seed)
+    record_path = resolve_record_path(args.record, args.debug)
+    if record_path:
+        print(f"Recording to: {record_path}")
     env = ClashEnv(
         window_title=args.window,
         model_id=args.model,
-        record_path=args.record,
+        record_path=record_path,
     )
 
     print(f"Action space size: {action_space_size()}")

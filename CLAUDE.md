@@ -36,10 +36,18 @@ speculatively generalize for cases that don't exist yet.)
   `index_to_action` / `action_to_index` convert.
 - Vision (`src/vision/`): Roboflow model (`troop-counter/8`); screen capture
   via `mss` / `pywinctl` in `capture.py`; match lifecycle (menu / in-match /
-  postmatch + auto-rematch) in `lifecycle.py`; tower-HP OCR via Tesseract in
-  `ocr.py` (required; raises on missing install or a failed read).
+  postmatch + auto-rematch) in `lifecycle.py`; tower-HP and match-timer OCR via
+  Tesseract in `ocr.py` (required; raises on missing install, but a single
+  unreadable frame is reported as `None` and the caller decides).
 - Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
   `state.py` (time, elixir simulation, tower HP, crowns), `cards.py`.
+- Match clock: elixir is simulated but time is NOT trusted to simulation. The
+  match is detected from the elixir bar, which is already up during the 3-2-1
+  countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`
+  re-derives `match_start_time` from the first trustworthy `MatchTimerReader`
+  reading (once per match) and `ClashEnv` raises if that never happens.
+  `get_current_match_time()` is clamped to 300s for `time_norm`;
+  `get_elapsed_seconds()` is the uncapped one for timeouts.
 - Recording format (`record_format: 2`, defined in `env/environment.py`, used
   by BOTH `--record` and `--record-human`): a `{"type": "meta", ...}` header
   (record_format + observation `schema_hash` + `schema_descriptor()`), then two
@@ -64,7 +72,13 @@ speculatively generalize for cases that don't exist yet.)
   `--record`, `--record-human`, `--calibrate`.
 - Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
 - Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
-  positions, tower HP regions, lifecycle samples). Keep them centralized there.
+  positions, tower HP regions, match timer region, lifecycle samples). Keep them
+  centralized there.
+- `src/calibrate.py` has four phases, selectable individually by name
+  (`viewport` / `hand` / `towers` / `timer`); bare `--calibrate` runs all four.
+  Phases 2-4 report fractions of the CROPPED viewport, so when `viewport` is
+  skipped the frame comes from `ScreenCapture` with the committed
+  `WINDOW_CROP_*` — never from the raw window grab, or every fraction is wrong.
 
 ## Setup & Commands
 
@@ -73,6 +87,9 @@ speculatively generalize for cases that don't exist yet.)
 - Config: copy `.env.example` to `.env`, set Roboflow `API_KEY`.
 - Run: `python -m src.main` (add `--debug` for overlay, `--record logs/run.jsonl
   --episodes N` to record).
+- Calibrate: `python -m src.main --calibrate` for all four phases, or
+  `--calibrate <viewport|hand|towers|timer>` for one (`towers` / `timer` need a
+  live match on screen).
 - Record human demos: `python -m src.main --record-human demos/run.jsonl
   --episodes N` — human plays in BlueStacks (drag-style placement only).
 - Train imitation policy: `python -m src.imitation.train demos/run.jsonl

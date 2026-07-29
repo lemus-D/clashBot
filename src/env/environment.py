@@ -27,6 +27,13 @@ silently mis-pairs them. Readers pair offline: every action attaches to
 the nearest observation preceding its timestamp. See
 ``open_record_jsonl`` for the schema header and
 ``src/imitation/dataset.py`` for the pairing.
+
+A recording run also emits one ``{"type": "diag"}`` line per perception
+cycle holding the raw lifecycle decision inputs (elixir magenta
+fraction, template scores, banner pixel and colour distances, and which
+code path produced the verdict). It is a separate line type, not extra
+observation fields, so the observation schema hash stays put; readers
+ignore unknown types, so it needs no ``record_format`` bump.
 """
 
 from __future__ import annotations
@@ -57,7 +64,7 @@ from ..vision.lifecycle import (
     TEMPLATE_MATCH_THRESHOLD,
 )
 from .observation import ObservationBuilder, schema_descriptor, schema_hash
-from ..vision.ocr import TowerHealthReader
+from ..vision.ocr import MatchTimerReader, TowerHealthReader
 
 # Roboflow inference is heavy; import lazily inside ``_load_model`` so
 # tests / static checks can import this module without the SDK.
@@ -110,6 +117,15 @@ def default_reward(
 # *layout* is unchanged, only how records are framed, so trained
 # checkpoints stay valid while old recordings are refused.
 RECORD_FORMAT = 2
+
+# How long a match may run without the on-screen timer ever being read
+# before we give up. The clock starts when the elixir bar appears, a few
+# seconds before the real match does, so the first frames legitimately
+# fail: the timer sits frozen at 3:00 (unusable as an anchor) or is hidden
+# behind the countdown overlay. Failing for this long means
+# MATCH_TIMER_REGION is miscalibrated, and running on an unanchored clock
+# is exactly the ~5s-fast simulation this anchoring exists to remove.
+CLOCK_ANCHOR_GRACE_SEC = 20.0
 
 
 def check_record_meta(meta: dict, path: str) -> None:
@@ -210,6 +226,39 @@ def obs_record(
     }
 
 
+def diag_record(*, t: float, step: int, signals: LifecycleSignals) -> dict:
+    """One lifecycle-diagnostics line: the raw inputs behind this cycle's
+    lifecycle verdict, stamped with the same frame-capture ``t`` as the
+    observation line for the same cycle.
+
+    A third line type rather than extra observation fields, and no
+    ``record_format`` bump: the observation layout is hashed into every
+    recording's meta header and into trained checkpoints, so growing it
+    would invalidate both, whereas an *additional* optional line type
+    leaves every existing obs/act line byte-identical and readers that
+    don't know it skip it (see ``src/imitation/dataset.py``).
+
+    ``template_hits`` is ``{}`` and the banner fields are ``None`` when
+    the elixir gate short-circuited before those signals were computed —
+    absence here is itself the diagnosis.
+    """
+    banner = signals.banner
+    return {
+        "type": "diag",
+        "t": t,
+        "step": step,
+        "path": signals.path,
+        "lifecycle_state": signals.state,
+        "lifecycle_result": signals.result,
+        "elixir_magenta_frac": signals.elixir_magenta_frac,
+        "elixir_bar_visible": signals.elixir_bar_visible,
+        "template_hits": signals.template_hits,
+        "banner_bgr": list(banner.bgr) if banner is not None else None,
+        "banner_dist_victory": banner.dist_victory if banner is not None else None,
+        "banner_dist_defeat": banner.dist_defeat if banner is not None else None,
+    }
+
+
 def act_record(
     *,
     t: float,
@@ -260,6 +309,7 @@ class ClashEnv:
         self.state = GameState()
         self.lifecycle = MatchLifecycle()
         self.tower_reader = TowerHealthReader()
+        self.timer_reader = MatchTimerReader()
         self.observer = ObservationBuilder()
         self.executor = ActionExecutor()
 
@@ -321,6 +371,7 @@ class ClashEnv:
         # first action is chosen from it.
         obs, signals = self.observe()
         self._write_obs_record(obs, reward=0.0, step=0, signals=signals)
+        self._write_diag_record(step=0, signals=signals)
         return obs
 
     def step(self, action: Any) -> tuple[dict, float, bool, dict]:
@@ -380,6 +431,7 @@ class ClashEnv:
         self._write_obs_record(
             obs, reward=reward, step=self._step_count + 1, signals=signals
         )
+        self._write_diag_record(step=self._step_count + 1, signals=signals)
 
         if done:
             self.state.end_match(self.state.match_result)
@@ -410,14 +462,18 @@ class ClashEnv:
             return True
         if self.state.match_result is not None:
             return True
-        return (
-            self.state.get_current_match_time() >= self.max_match_duration_sec
-        )
+        # Uncapped elapsed, not get_current_match_time(): that saturates at
+        # MATCH_MAX_DURATION (300s), so comparing it against a longer
+        # timeout could never fire and a match with no postmatch screen
+        # would run forever.
+        return self.state.get_elapsed_seconds() >= self.max_match_duration_sec
 
     def close(self) -> None:
         if self._record_file is not None:
             self._record_file.close()
             self._record_file = None
+        self.tower_reader.close()
+        self.timer_reader.close()
         if self.capture is not None:
             self.capture.__exit__(None, None, None)
             self.capture = None
@@ -473,6 +529,29 @@ class ClashEnv:
         self.board.process_detections(detections)
         readings = self.tower_reader.read(frame)
         self.state.update_tower_hp(readings)
+        if not self.state.clock_anchored:
+            self._anchor_clock(frame)
+
+    def _anchor_clock(self, frame: np.ndarray) -> None:
+        """Pin the match clock to the on-screen timer, once per match.
+
+        Only runs while the clock is unanchored, so the extra OCR pass
+        costs a handful of frames at the start of a match rather than one
+        per cycle. Individual unreadable frames are expected and ignored;
+        never getting a usable reading is a calibration failure and raises.
+        """
+        remaining = self.timer_reader.read(frame)
+        if remaining is not None and self.state.anchor_match_clock(remaining):
+            return
+        if self.state.get_elapsed_seconds() > CLOCK_ANCHOR_GRACE_SEC:
+            raise RuntimeError(
+                f"Could not anchor the match clock to the on-screen timer "
+                f"within {CLOCK_ANCHOR_GRACE_SEC:.0f}s (last read: "
+                f"{remaining!r}). Match time would be pure simulation, "
+                f"running ~5s ahead of the game. Calibrate "
+                f"MATCH_TIMER_REGION in src/vision/ocr.py to the 'm:ss' "
+                f"countdown in the captured frame."
+            )
 
     def _build_observation(self) -> dict:
         assert self.board is not None
@@ -501,6 +580,13 @@ class ClashEnv:
                 state=self.state,
                 source="bot",
             ),
+        )
+
+    def _write_diag_record(self, step: int, signals: LifecycleSignals) -> None:
+        if self._record_file is None:
+            return
+        write_record(
+            self._record_file, diag_record(t=self.frame_time, step=step, signals=signals)
         )
 
     def _write_act_record(

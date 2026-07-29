@@ -12,6 +12,14 @@ Two layered signals:
 
 Per-machine coordinates and thresholds are module-level constants
 marked ``CALIBRATE``.
+
+Every verdict also carries the raw numbers it was decided from (magenta
+fraction, banner pixel and its colour distances, template scores) and a
+``path`` naming which of the layers above produced it. Those are pure
+diagnostics — nothing reads them to decide anything — and exist because
+a wrong verdict is otherwise indistinguishable from a right one after
+the fact. ``ClashEnv`` writes them as ``{"type": "diag"}`` records while
+recording.
 """
 
 from __future__ import annotations
@@ -72,6 +80,58 @@ TEMPLATE_FILES = {
 }
 TEMPLATE_MATCH_THRESHOLD = 0.80
 
+# ----- verdict paths -----
+#
+# Which layer actually decided a frame's state. Recorded so a wrong
+# verdict can be traced to the signal that produced it instead of being
+# guessed at from the state alone.
+PATH_ELIXIR_GATE = "elixir_gate"        # magenta fraction cleared the gate
+PATH_TEMPLATE_SWEEP = "template_sweep"  # a template scored over threshold
+PATH_BANNER_COLOR = "banner_color"      # colour fallback matched a banner
+PATH_HYSTERESIS = "hysteresis"          # no signal; previous state kept
+PATH_DEFAULT_MENU = "default_menu"      # no signal and no state to keep
+
+
+def _color_distance(a, b) -> float:
+    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1])) + abs(int(a[2]) - int(b[2]))
+
+
+@dataclass(frozen=True)
+class BannerSample:
+    """The postmatch banner pixel and its distance to each reference colour.
+
+    Both the state fallback and the win/loss readout are decided purely
+    from these two distances, so sampling once and passing this around
+    replaces two independent re-samples of the same pixel and makes the
+    numbers recordable.
+    """
+
+    bgr: tuple[int, int, int]
+    dist_victory: float
+    dist_defeat: float
+
+    @classmethod
+    def at(cls, frame: np.ndarray, frac_xy: tuple[float, float]) -> "BannerSample":
+        px = _sample_pixel(frame, frac_xy)
+        return cls(
+            bgr=(int(px[0]), int(px[1]), int(px[2])),
+            dist_victory=_color_distance(px, COLOR_VICTORY_GOLD),
+            dist_defeat=_color_distance(px, COLOR_DEFEAT_BLUE),
+        )
+
+    def matches_a_banner(self) -> bool:
+        return (
+            self.dist_victory <= COLOR_TOLERANCE
+            or self.dist_defeat <= COLOR_TOLERANCE
+        )
+
+    def result(self) -> str | None:
+        if self.dist_victory <= COLOR_TOLERANCE:
+            return "win"
+        if self.dist_defeat <= COLOR_TOLERANCE:
+            return "loss"
+        return None
+
 
 @dataclass
 class LifecycleSignals:
@@ -79,9 +139,15 @@ class LifecycleSignals:
     result: str | None = None
     template_hits: dict[str, float] = field(default_factory=dict)
 
-
-def _color_distance(a, b) -> float:
-    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1])) + abs(int(a[2]) - int(b[2]))
+    # ----- diagnostics -----
+    # Raw decision inputs, recorded but never acted on. Deliberately here
+    # and not in the observation dict: the observation schema is hashed
+    # into recordings and trained checkpoints, so it must not grow to
+    # carry debug data.
+    path: str = PATH_HYSTERESIS
+    elixir_magenta_frac: float = 0.0
+    elixir_bar_visible: bool = False
+    banner: BannerSample | None = None
 
 
 def _sample_pixel(frame: np.ndarray, frac_xy) -> np.ndarray:
@@ -139,9 +205,18 @@ class MatchLifecycle:
         # bar visible is IN_MATCH regardless of what matchTemplate would say,
         # and the four full-frame sweeps can be skipped. The frame a match ends
         # on loses the bar, so the postmatch transition is still seen at once.
-        if frame is not None and frame.size and self._elixir_bar_visible(frame):
+        bar_visible = False
+        magenta_frac = 0.0
+        if frame is not None and frame.size:
+            bar_visible, magenta_frac = self._elixir_bar_visible(frame)
+        if bar_visible:
             self._last_state = STATE_IN_MATCH
-            return LifecycleSignals(state=STATE_IN_MATCH)
+            return LifecycleSignals(
+                state=STATE_IN_MATCH,
+                path=PATH_ELIXIR_GATE,
+                elixir_magenta_frac=magenta_frac,
+                elixir_bar_visible=True,
+            )
 
         hits = {k: self._locate_template(frame, k)[0] for k in TEMPLATE_FILES}
 
@@ -156,57 +231,66 @@ class MatchLifecycle:
         elif defeat_hit:
             result = "loss"
 
+        banner: BannerSample | None = None
         if victory_hit or defeat_hit or ok_hit:
             state = STATE_POSTMATCH
+            path = PATH_TEMPLATE_SWEEP
         elif battle_hit:
             state = STATE_MENU
+            path = PATH_TEMPLATE_SWEEP
         else:
-            state = self._color_based_state(frame)
-            if state == STATE_POSTMATCH:
-                result = result or self._color_based_result(frame)
+            state, path, banner = self._color_based_state(frame)
+            if state == STATE_POSTMATCH and banner is not None:
+                result = result or banner.result()
 
         self._last_state = state
-        return LifecycleSignals(state=state, result=result, template_hits=hits)
+        return LifecycleSignals(
+            state=state,
+            result=result,
+            template_hits=hits,
+            path=path,
+            elixir_magenta_frac=magenta_frac,
+            elixir_bar_visible=bar_visible,
+            banner=banner,
+        )
 
-    def _color_based_state(self, frame: np.ndarray) -> str:
+    def _color_based_state(
+        self, frame: np.ndarray
+    ) -> tuple[str, str, BannerSample | None]:
+        """State from banner colour alone, plus the verdict path and the
+        banner sample it was read from (None when no pixel was sampled)."""
         if frame is None or frame.size == 0:
-            return self._last_state
-        if self._elixir_bar_visible(frame):
-            return STATE_IN_MATCH
+            return self._last_state, PATH_HYSTERESIS, None
+        if self._elixir_bar_visible(frame)[0]:
+            return STATE_IN_MATCH, PATH_ELIXIR_GATE, None
 
-        banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
-        if (
-            _color_distance(banner_px, COLOR_VICTORY_GOLD) <= COLOR_TOLERANCE
-            or _color_distance(banner_px, COLOR_DEFEAT_BLUE) <= COLOR_TOLERANCE
-        ):
-            return STATE_POSTMATCH
+        banner = BannerSample.at(frame, VICTORY_BANNER_SAMPLE)
+        if banner.matches_a_banner():
+            return STATE_POSTMATCH, PATH_BANNER_COLOR, banner
 
         # Bias toward keeping the previous state instead of bouncing to MENU
         # on a single noisy frame.
         if self._last_state == STATE_IN_MATCH:
-            return STATE_IN_MATCH
-        return STATE_MENU
+            return STATE_IN_MATCH, PATH_HYSTERESIS, banner
+        return STATE_MENU, PATH_DEFAULT_MENU, banner
 
     @staticmethod
-    def _elixir_bar_visible(frame: np.ndarray) -> bool:
+    def _elixir_bar_visible(frame: np.ndarray) -> tuple[bool, float]:
+        """``(bar visible, magenta fraction)``. The fraction is the number
+        the in-match gate turns on, so it is returned rather than
+        discarded — a below-threshold frame is meaningless to diagnose
+        without knowing how far below it fell."""
         h, w = frame.shape[:2]
         x0, y0, x1, y1 = ELIXIR_BAR_PATCH
         patch = frame[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)]
         if patch.size == 0:
-            return False
+            return False, 0.0
         b = patch[..., 0].astype(int)
         g = patch[..., 1].astype(int)
         r = patch[..., 2].astype(int)
         magenta = (b > 180) & (r > 180) & (g < 140)
-        return float(magenta.mean()) >= ELIXIR_MAGENTA_MIN_FRAC
-
-    def _color_based_result(self, frame: np.ndarray) -> str | None:
-        banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
-        if _color_distance(banner_px, COLOR_VICTORY_GOLD) <= COLOR_TOLERANCE:
-            return "win"
-        if _color_distance(banner_px, COLOR_DEFEAT_BLUE) <= COLOR_TOLERANCE:
-            return "loss"
-        return None
+        frac = float(magenta.mean())
+        return frac >= ELIXIR_MAGENTA_MIN_FRAC, frac
 
     # ----- side effects -----
 
