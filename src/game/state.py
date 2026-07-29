@@ -1,34 +1,42 @@
 """Tracks elapsed match time, elixir, tower HP, and match outcome.
 
+Match time runs off a local clock, but that clock is *anchored* to the
+on-screen ``m:ss`` countdown: ``start_match`` can only stamp the moment
+the elixir bar became visible, which is several seconds before the real
+3-2-1 countdown ends, so ``anchor_match_clock`` re-derives
+``match_start_time`` from the first trustworthy timer reading
+(``MatchTimerReader``). Without it the clock runs permanently ~5s ahead.
+
 Elixir regeneration is simulated rather than read from screen - it
 reproduces the in-game rates exactly (2.8s, 1.4s, 0.93s per pip across
 normal/double/triple phases) and is corrected by ``spend_elixir`` when
 the action layer commits a placement.
 
 Tower HP and match result are externally driven: ``TowerHealthReader``
-and ``MatchLifecycle`` push values in via ``set_tower_hp`` and
-``set_match_result``. Callbacks fire on ``start_match`` / ``end_match``
-so ``ClashEnv`` can subscribe without subclassing.
+and ``MatchLifecycle`` push values in via ``update_tower_hp`` and
+``set_match_result``.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Callable, Literal, Optional
+from typing import Literal, Optional
 
 MatchResult = Literal["win", "loss", "draw"]
 
 DEFAULT_PRINCESS_HP = 2534
 DEFAULT_KING_HP = 4824
 
-TOWER_KEYS = (
-    "friendly_left",
-    "friendly_right",
-    "friendly_king",
-    "enemy_left",
-    "enemy_right",
-    "enemy_king",
-)
+DEFAULT_TOWER_HP: dict[str, int] = {
+    "friendly_left": DEFAULT_PRINCESS_HP,
+    "friendly_right": DEFAULT_PRINCESS_HP,
+    "friendly_king": DEFAULT_KING_HP,
+    "enemy_left": DEFAULT_PRINCESS_HP,
+    "enemy_right": DEFAULT_PRINCESS_HP,
+    "enemy_king": DEFAULT_KING_HP,
+}
+
+TOWER_KEYS: tuple[str, ...] = tuple(DEFAULT_TOWER_HP)
 
 
 class GameState:
@@ -50,50 +58,42 @@ class GameState:
     STARTING_ELIXIR = 5.0
     MAX_ELIXIR = 10.0
 
+    # Largest gap between an on-screen timer reading and the running clock
+    # that is still accepted as a correction. A genuine correction is the
+    # few seconds between the elixir bar appearing and the match actually
+    # starting. A big gap means the reading is not regulation time at all -
+    # the overtime countdown restarts from 2:00 and would anchor the clock
+    # two minutes early - or it is a plain OCR misread. Reject either.
+    ANCHOR_MAX_CORRECTION_SEC = 30.0
+
     def __init__(self):
         self.match_start_time: Optional[float] = None
+        self.clock_anchored: bool = False
         self.current_elixir: float = self.STARTING_ELIXIR
         self.last_elixir_update: Optional[float] = None
         self.is_match_active: bool = False
 
-        self.tower_hp: dict[str, Optional[int]] = {
-            "friendly_left": DEFAULT_PRINCESS_HP,
-            "friendly_right": DEFAULT_PRINCESS_HP,
-            "friendly_king": DEFAULT_KING_HP,
-            "enemy_left": DEFAULT_PRINCESS_HP,
-            "enemy_right": DEFAULT_PRINCESS_HP,
-            "enemy_king": DEFAULT_KING_HP,
-        }
-        self.tower_max_hp: dict[str, int] = {
-            "friendly_left": DEFAULT_PRINCESS_HP,
-            "friendly_right": DEFAULT_PRINCESS_HP,
-            "friendly_king": DEFAULT_KING_HP,
-            "enemy_left": DEFAULT_PRINCESS_HP,
-            "enemy_right": DEFAULT_PRINCESS_HP,
-            "enemy_king": DEFAULT_KING_HP,
-        }
+        self.tower_hp: dict[str, Optional[int]] = dict(DEFAULT_TOWER_HP)
+        self.tower_max_hp: dict[str, int] = dict(DEFAULT_TOWER_HP)
 
         self.crowns_friendly: int = 0
         self.crowns_enemy: int = 0
         self.match_result: Optional[MatchResult] = None
         self._destroyed_towers: set[str] = set()
 
-        self._on_start: list[Callable[["GameState"], None]] = []
-        self._on_end: list[Callable[["GameState"], None]] = []
-
-    # ----- callbacks -----
-
-    def on_match_start(self, callback: Callable[["GameState"], None]) -> None:
-        self._on_start.append(callback)
-
-    def on_match_end(self, callback: Callable[["GameState"], None]) -> None:
-        self._on_end.append(callback)
-
     # ----- lifecycle -----
 
     def start_match(self) -> None:
+        """Begin a match with a provisional clock.
+
+        ``match_start_time`` is only a guess until :meth:`anchor_match_clock`
+        replaces it with a value derived from the on-screen timer: the
+        caller detects the match from the elixir bar, which is already
+        visible during the pre-match countdown.
+        """
         now = time.time()
         self.match_start_time = now
+        self.clock_anchored = False
         self.last_elixir_update = now
         self.current_elixir = self.STARTING_ELIXIR
         self.is_match_active = True
@@ -103,30 +103,86 @@ class GameState:
         for k in TOWER_KEYS:
             self.tower_hp[k] = self.tower_max_hp[k]
         self._destroyed_towers.clear()
-        for cb in self._on_start:
-            cb(self)
         print("Match started!")
 
     def end_match(self, result: Optional[MatchResult] = None) -> None:
         if result is not None:
             self.match_result = result
         self.is_match_active = False
-        for cb in self._on_end:
-            cb(self)
         print(f"Match ended! result={self.match_result}")
 
     # ----- timing -----
 
-    def get_current_match_time(self) -> float:
-        if not self.is_match_active or self.match_start_time is None:
-            return 0
-        elapsed = time.time() - self.match_start_time
-        return min(elapsed, self.MATCH_MAX_DURATION)
+    def anchor_match_clock(self, remaining_sec: float) -> bool:
+        """Re-derive ``match_start_time`` from an on-screen timer reading.
 
-    def get_time_remaining(self) -> float:
-        if not self.is_match_active:
+        ``remaining_sec`` is seconds left on the displayed countdown (see
+        ``MatchTimerReader``), so the implied elapsed time is
+        ``REGULAR_TIME_END - remaining_sec``. Returns True if the reading
+        was adopted as ground truth, False if it was rejected - in which
+        case the caller should try the next frame.
+
+        Only the first accepted reading moves the clock. Local time and
+        game time advance at the same rate once they agree, so one anchor
+        suffices, and re-anchoring every frame would instead make
+        ``match_time`` jitter by up to a second on the timer's own
+        whole-second quantization (the display shows 2:59 for the whole
+        interval where 179.0-179.999s remain, so a single anchor is
+        accurate to ~1s and biased ~0.5s late).
+
+        Readings that are rejected:
+
+        - a full ``REGULAR_TIME_END`` (3:00), which is also what the game
+          shows frozen during the pre-match countdown and therefore cannot
+          be told apart from a match that has genuinely just begun;
+        - anything outside 0..REGULAR_TIME_END, which neither countdown
+          can display;
+        - anything implying an elapsed time more than
+          ``ANCHOR_MAX_CORRECTION_SEC`` from the current clock: an
+          overtime countdown or an OCR misread, not a correction.
+
+        ``last_elixir_update`` is deliberately untouched. Elixir accrual is
+        measured from that stamp, so moving it into the future would make
+        ``update_elixir`` compute negative gain and silently drain elixir.
+        """
+        if not self.is_match_active or self.match_start_time is None:
+            return False
+        if self.clock_anchored:
+            return False
+        if not 0.0 <= remaining_sec < self.REGULAR_TIME_END:
+            return False
+        implied_elapsed = self.REGULAR_TIME_END - remaining_sec
+        drift = implied_elapsed - self.get_elapsed_seconds()
+        if abs(drift) > self.ANCHOR_MAX_CORRECTION_SEC:
+            return False
+        self.match_start_time = time.time() - implied_elapsed
+        self.clock_anchored = True
+        print(
+            f"Match clock anchored to on-screen timer "
+            f"({remaining_sec:.0f}s left, elapsed {implied_elapsed:.1f}s, "
+            f"corrected by {drift:+.1f}s)"
+        )
+        return True
+
+    def get_elapsed_seconds(self) -> float:
+        """Seconds since match start, floored at 0 and NOT capped.
+
+        Use this for "has this match run too long" decisions:
+        :meth:`get_current_match_time` saturates at ``MATCH_MAX_DURATION``
+        and so can never exceed a timeout set above it.
+        """
+        if not self.is_match_active or self.match_start_time is None:
             return 0.0
-        return max(0.0, self.MATCH_MAX_DURATION - self.get_current_match_time())
+        return max(0.0, time.time() - self.match_start_time)
+
+    def get_current_match_time(self) -> float:
+        """Elapsed match seconds, clamped to ``MATCH_MAX_DURATION``.
+
+        The clamp is load-bearing for the observation's ``time_norm``
+        (normalized by the same constant, so it stays in 0..1) and for the
+        phase/elixir-rate lookups. Timeouts want :meth:`get_elapsed_seconds`.
+        """
+        return min(self.get_elapsed_seconds(), self.MATCH_MAX_DURATION)
 
     def get_match_phase(self) -> str:
         if not self.is_match_active:
@@ -139,9 +195,6 @@ class GameState:
         if elapsed < self.TRIPLE_ELIXIR_START:
             return "overtime_double"
         return "overtime_triple"
-
-    def is_overtime(self) -> bool:
-        return self.get_current_match_time() >= self.REGULAR_TIME_END
 
     # ----- elixir -----
 
@@ -160,7 +213,10 @@ class GameState:
         if self.last_elixir_update is None:
             self.last_elixir_update = now
             return
-        elapsed = now - self.last_elixir_update
+        # Floored at 0: regeneration must never run backwards. A negative
+        # interval (a clock adjustment, or a future-dated stamp) would
+        # otherwise subtract elixir here with nothing spent.
+        elapsed = max(0.0, now - self.last_elixir_update)
         gained = elapsed / self.get_elixir_rate()
         self.current_elixir = min(self.MAX_ELIXIR, self.current_elixir + gained)
         self.last_elixir_update = now
@@ -173,21 +229,18 @@ class GameState:
         self.update_elixir()
         if self.current_elixir + 1e-6 >= amount:
             self.current_elixir -= amount
-            print(f"Spent {amount} elixir. Remaining: {self.current_elixir:.1f}")
             return True
-        print(
-            f"Not enough elixir! Have {self.current_elixir:.1f}, need {amount}"
-        )
         return False
 
     # ----- towers -----
 
     def set_tower_hp(self, key: str, value: Optional[int]) -> None:
         if key not in self.tower_hp:
-            print(f"Unknown tower key: {key}")
-            return
+            raise KeyError(f"Unknown tower key {key!r}; expected one of {TOWER_KEYS}")
+        if value is None:
+            return  # OCR couldn't read this frame; keep the last known HP
         self.tower_hp[key] = value
-        if value is not None and value <= 0:
+        if value <= 0:
             self._register_tower_destroyed(key)
 
     def update_tower_hp(self, readings: dict[str, Optional[int]]) -> None:
@@ -202,22 +255,22 @@ class GameState:
             self.crowns_friendly = min(3, self.crowns_friendly + 1)
             if key == "enemy_king":
                 self.set_match_result("win")
-        elif key.startswith("friendly"):
+        else:
             self.crowns_enemy = min(3, self.crowns_enemy + 1)
             if key == "friendly_king":
                 self.set_match_result("loss")
 
     def is_enemy_left_alive(self) -> bool:
-        v = self.tower_hp.get("enemy_left")
+        v = self.tower_hp["enemy_left"]
         return v is None or v > 0
 
     def is_enemy_right_alive(self) -> bool:
-        v = self.tower_hp.get("enemy_right")
+        v = self.tower_hp["enemy_right"]
         return v is None or v > 0
 
     def is_enemy_king_active(self) -> bool:
-        v = self.tower_hp.get("enemy_king")
-        return v is not None and v < self.tower_max_hp.get("enemy_king", DEFAULT_KING_HP)
+        v = self.tower_hp["enemy_king"]
+        return v is not None and v < self.tower_max_hp["enemy_king"]
 
     # ----- result -----
 
@@ -228,22 +281,14 @@ class GameState:
 
     def get_formatted_time(self) -> str:
         elapsed = self.get_current_match_time()
-        minutes = int(elapsed // 60)
-        seconds = int(elapsed % 60)
-        return f"{minutes}:{seconds:02d}"
-
-    def get_formatted_time_remaining(self) -> str:
-        remaining = self.get_time_remaining()
-        minutes = int(remaining // 60)
-        seconds = int(remaining % 60)
-        return f"{minutes}:{seconds:02d}"
+        return f"{int(elapsed // 60)}:{int(elapsed % 60):02d}"
 
     def get_status_string(self) -> str:
         if not self.is_match_active:
             return "No active match"
         return (
             f"Time: {self.get_formatted_time()} | "
-            f"Elixir: {self.current_elixir:.1f}/10 | "
+            f"Elixir: {self.current_elixir:.1f}/{self.MAX_ELIXIR:.0f} | "
             f"Phase: {self.get_match_phase()} | "
             f"Rate: {self.get_elixir_rate():.2f}s/elixir | "
             f"Crowns: {self.crowns_friendly}-{self.crowns_enemy}"

@@ -15,7 +15,7 @@ and match lifecycle.
 | [`src/cardClasses.py`](src/cardClasses.py)   | `Card` / `Troop` / `BlankSpace` data classes                |
 | [`src/gameBoard.py`](src/gameBoard.py)       | 4-card hand, 9x16 arena, placement rules, tensor encoding   |
 | [`src/gameState.py`](src/gameState.py)       | Match time, elixir, tower HP, crowns, win/loss              |
-| [`src/towerHealth.py`](src/towerHealth.py)   | OCR tower HP reader (Tesseract, optional)                   |
+| [`src/towerHealth.py`](src/towerHealth.py)   | OCR tower HP reader (Tesseract, required)                   |
 | [`src/matchLifecycle.py`](src/matchLifecycle.py) | Menu / in-match / postmatch detection + auto-rematch    |
 | [`src/observation.py`](src/observation.py)   | Builds the structured observation dict                      |
 | [`src/actions.py`](src/actions.py)           | Discrete action space + mouse executor                      |
@@ -34,9 +34,9 @@ and match lifecycle.
    pip install -r requirements.txt
    ```
 
-3. (Optional) Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)
-   for tower-HP reading. If unavailable, tower HP defaults to "full" and
-   reward shaping degrades but the bot still runs.
+3. Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and
+   make sure it's on your `PATH`. It's required for tower-HP reading; the bot
+   raises if a read fails or the binary is missing.
 4. Copy `.env.example` to `.env` and set your Roboflow `API_KEY`.
 
 ## Run
@@ -64,6 +64,28 @@ in the codebase; the four hot spots are:
 4. **Lifecycle pixel samples and template images** in
    [`src/matchLifecycle.py`](src/matchLifecycle.py) and
    [`assets/templates/`](assets/templates/).
+5. **Match timer region** in [`src/vision/ocr.py`](src/vision/ocr.py)
+   (`MATCH_TIMER_REGION`) — the `m:ss` countdown, used to anchor the match
+   clock. Wrong values here are fatal: the env raises rather than run on a
+   simulated clock that is ~5s fast.
+
+`python -m src.main --calibrate` walks all of these except the lifecycle
+samples and prints the constants to paste in.
+
+To redo just one constant, name its phase — `viewport` (1), `hand` (2),
+`towers` (3), `timer` (5) — and only that phase runs and only its constant
+is printed:
+
+```bash
+python -m src.main --calibrate timer      # just MATCH_TIMER_REGION
+python -m src.main --calibrate hand       # just HAND_CARD_POSITIONS
+```
+
+An unknown phase name is an error listing the valid ones. The `towers` and
+`timer` phases box in-match HUD elements, so run them with a live match on
+screen. Skipping the `viewport` phase means the other phases measure
+against the committed `WINDOW_CROP_*` crop (the same frame the bot sees at
+runtime), so re-run `viewport` first if the window size or theme changed.
 
 Run with `--debug` to see the captured frame and the tile grid overlay
 while you tune.
@@ -88,10 +110,8 @@ while not done:
 env.close()
 ```
 
-For imitation learning, set ``record_path="logs/run.jsonl"`` and play
-the game manually while the bot watches: every step writes a JSON line
-with the observation, the chosen action, the reward, and the lifecycle
-state.
+For imitation learning, record with `--record` (bot play) or
+`--record-human` (your own play); both write the format below.
 
 ## Observation schema
 
@@ -103,7 +123,7 @@ state.
 | `hand_costs`    | (4,)                 | elixir cost per slot                     |
 | `hand_playable` | (4,)                 | 1 where elixir >= cost, 0 elsewhere      |
 | `elixir`        | scalar               | 0-10                                     |
-| `match_time`    | scalar               | seconds elapsed                          |
+| `match_time`    | scalar               | seconds elapsed, timer-anchored, cap 300 |
 | `time_norm`     | scalar               | match_time / 300                         |
 | `phase_onehot`  | (4,)                 | normal / double / ot_d / ot_t            |
 | `arena`         | (16, 9, 2*\|T\|)     | one-hot troop x color per tile           |
@@ -113,6 +133,37 @@ state.
 
 `ObservationBuilder.flatten(obs)` produces a single 1-D `float32` array
 for MLP-style policies.
+
+## Recording format (JSONL, `record_format: 2`)
+
+Observations and actions are **two independent timestamped streams**,
+not one line per step. A perception cycle takes ~0.3 s — far longer than
+the gap between two quick card placements — so any format that carries
+one action per step silently drops or mis-attributes the extras.
+
+```jsonc
+{"type":"meta","record_format":2,"schema_hash":"…","schema":{…}}
+{"type":"obs","t":1712.104,"step":0,"obs_flat":[…],"reward":0.0,
+ "lifecycle_state":"in_match","lifecycle_result":null,"match_time":0.4,
+ "elixir":5.0,"match_result":null,"source":"human"}
+{"type":"act","t":1712.310,"action_index":416,"hand_index":2,"tile_x":4,
+ "tile_y":11,"success":true,"reason":"human","source":"human"}
+{"type":"act","t":1712.480,"action_index":100,"hand_index":0,"tile_x":5,
+ "tile_y":11,"success":true,"reason":"human","source":"human"}
+{"type":"obs","t":1713.720,"step":1,…}
+```
+
+- `obs.t` is the frame **capture** time; `act.t` is the moment the action
+  was issued (bot) or the drag released (human). Same `time.time()` clock.
+- No-op actions are never written — an observation with nothing attached
+  *is* the no-op sample.
+- Pairing happens offline in `src/imitation/dataset.py`: each action binds
+  to the nearest observation captured **strictly before** it. One
+  observation may take several actions (→ several training rows); ties on
+  the coarse 15.6 ms Windows clock resolve backwards.
+- `record_format` is checked on both append and load. Format-1 files (one
+  flat line per step, action inline) are refused — their actions carry no
+  timestamp, so they cannot be re-paired.
 
 ## Action space
 

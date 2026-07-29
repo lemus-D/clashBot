@@ -14,3 +14,8 @@ Thumbs.db
 
 # Secrets
 .env
+
+# Recordings, demo data, trained checkpoints
+logs/
+demos/
+models/

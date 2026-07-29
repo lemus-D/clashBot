@@ -1,22 +1,31 @@
 """Visual detection of match lifecycle: menu -> in-match -> postmatch.
 
-Two layered signals are used:
+Two layered signals:
 
-1. Pixel-color sampling at calibrated coordinates (cheap, always on).
-2. Optional template matching against PNGs in ``assets/templates/``
-   (more reliable when calibrated, silently skipped when missing).
+1. A magenta-pixel fraction inside the elixir bar means in-match. This
+   is checked first and short-circuits: it costs microseconds, whereas
+   the template sweep below is four full-frame passes.
+2. Template matching against PNGs in ``src/assets/templates/``
+   (battle button, OK button, victory/defeat banners), for the frames
+   where the elixir bar is absent. Banner colors are the fallback when
+   no template hits.
 
-All coordinates and color thresholds are exposed as module-level
-constants. They are guesses tuned to a portrait BlueStacks crop and
-almost certainly need adjustment for your machine - search for
-``CALIBRATE`` to find them.
+Per-machine coordinates and thresholds are module-level constants
+marked ``CALIBRATE``.
+
+Every verdict also carries the raw numbers it was decided from (magenta
+fraction, banner pixel and its colour distances, template scores) and a
+``path`` naming which of the layers above produced it. Those are pure
+diagnostics — nothing reads them to decide anything — and exist because
+a wrong verdict is otherwise indistinguishable from a right one after
+the fact. ``ClashEnv`` writes them as ``{"type": "diag"}`` records while
+recording.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -26,32 +35,40 @@ import pyautogui
 # ----- lifecycle states -----
 
 STATE_MENU = "MENU"
-STATE_COUNTDOWN = "COUNTDOWN"
 STATE_IN_MATCH = "IN_MATCH"
 STATE_POSTMATCH = "POSTMATCH"
 
 # ----- calibration -----
 
-# Sample these (x_frac, y_frac) pixels in the captured frame. CALIBRATE.
-ELIXIR_BAR_SAMPLE = (0.50, 0.965)        # purple elixir bar in-match
-VICTORY_BANNER_SAMPLE = (0.50, 0.20)     # yellow/gold victory banner area
-DEFEAT_BANNER_SAMPLE = (0.50, 0.20)      # blue defeat banner area
-COUNTDOWN_SAMPLE = (0.50, 0.50)          # center "3 / 2 / 1" overlay
+# (x_frac, y_frac) pixel sampled for the postmatch banner color. CALIBRATE.
+VICTORY_BANNER_SAMPLE = (0.50, 0.20)
+
+# In-match detection: fraction of magenta pixels inside the left part of
+# the elixir bar. A patch is far more robust than a single pixel - the
+# bar is thin and crossed by white segment ticks. (x0, y0, x1, y1)
+# fractions of the frame. CALIBRATE.
+ELIXIR_BAR_PATCH = (0.20, 0.955, 0.40, 0.978)
+ELIXIR_MAGENTA_MIN_FRAC = 0.10
 
 # Reference colors in BGR; tolerance is per-channel L1 distance.
-COLOR_PURPLE_ELIXIR = (180, 60, 200)
 COLOR_VICTORY_GOLD = (60, 200, 235)
 COLOR_DEFEAT_BLUE = (200, 110, 60)
 COLOR_TOLERANCE = 60
 
-# Click targets for auto-rematch (fractions of monitor). CALIBRATE.
+# Fallback click targets when template matching fails (fractions of
+# monitor). CALIBRATE.
 OK_BUTTON_FRAC = (0.50, 0.93)
-BATTLE_BUTTON_FRAC = (0.50, 0.62)
+BATTLE_BUTTON_FRAC = (0.50, 0.78)
 
-# Template assets (relative to project root).
-# __file__ is src/vision/lifecycle.py, so three dirnames reach the project root.
+# Templates were captured at a larger window size than the current
+# capture; resize them at load so matchTemplate scores stay high.
+# CALIBRATE when the BlueStacks window size changes.
+TEMPLATE_SCALE = 0.74
+
+# Template assets live next to the source tree in src/assets/templates.
+# __file__ is src/vision/lifecycle.py, so two dirnames reach src/.
 TEMPLATE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "assets",
     "templates",
 )
@@ -63,16 +80,74 @@ TEMPLATE_FILES = {
 }
 TEMPLATE_MATCH_THRESHOLD = 0.80
 
-
-@dataclass
-class LifecycleSignals:
-    state: str
-    result: Optional[str] = None
-    template_hits: dict[str, float] = None  # type: ignore[assignment]
+# ----- verdict paths -----
+#
+# Which layer actually decided a frame's state. Recorded so a wrong
+# verdict can be traced to the signal that produced it instead of being
+# guessed at from the state alone.
+PATH_ELIXIR_GATE = "elixir_gate"        # magenta fraction cleared the gate
+PATH_TEMPLATE_SWEEP = "template_sweep"  # a template scored over threshold
+PATH_BANNER_COLOR = "banner_color"      # colour fallback matched a banner
+PATH_HYSTERESIS = "hysteresis"          # no signal; previous state kept
+PATH_DEFAULT_MENU = "default_menu"      # no signal and no state to keep
 
 
 def _color_distance(a, b) -> float:
     return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1])) + abs(int(a[2]) - int(b[2]))
+
+
+@dataclass(frozen=True)
+class BannerSample:
+    """The postmatch banner pixel and its distance to each reference colour.
+
+    Both the state fallback and the win/loss readout are decided purely
+    from these two distances, so sampling once and passing this around
+    replaces two independent re-samples of the same pixel and makes the
+    numbers recordable.
+    """
+
+    bgr: tuple[int, int, int]
+    dist_victory: float
+    dist_defeat: float
+
+    @classmethod
+    def at(cls, frame: np.ndarray, frac_xy: tuple[float, float]) -> "BannerSample":
+        px = _sample_pixel(frame, frac_xy)
+        return cls(
+            bgr=(int(px[0]), int(px[1]), int(px[2])),
+            dist_victory=_color_distance(px, COLOR_VICTORY_GOLD),
+            dist_defeat=_color_distance(px, COLOR_DEFEAT_BLUE),
+        )
+
+    def matches_a_banner(self) -> bool:
+        return (
+            self.dist_victory <= COLOR_TOLERANCE
+            or self.dist_defeat <= COLOR_TOLERANCE
+        )
+
+    def result(self) -> str | None:
+        if self.dist_victory <= COLOR_TOLERANCE:
+            return "win"
+        if self.dist_defeat <= COLOR_TOLERANCE:
+            return "loss"
+        return None
+
+
+@dataclass
+class LifecycleSignals:
+    state: str
+    result: str | None = None
+    template_hits: dict[str, float] = field(default_factory=dict)
+
+    # ----- diagnostics -----
+    # Raw decision inputs, recorded but never acted on. Deliberately here
+    # and not in the observation dict: the observation schema is hashed
+    # into recordings and trained checkpoints, so it must not grow to
+    # carry debug data.
+    path: str = PATH_HYSTERESIS
+    elixir_magenta_frac: float = 0.0
+    elixir_bar_visible: bool = False
+    banner: BannerSample | None = None
 
 
 def _sample_pixel(frame: np.ndarray, frac_xy) -> np.ndarray:
@@ -85,7 +160,7 @@ def _sample_pixel(frame: np.ndarray, frac_xy) -> np.ndarray:
 class MatchLifecycle:
     """Detects which lifecycle state the game is in and drives rematches."""
 
-    def __init__(self, template_dir: Optional[str] = None):
+    def __init__(self, template_dir: str | None = None):
         self.template_dir = template_dir or TEMPLATE_DIR
         self._templates: dict[str, np.ndarray] = {}
         self._load_templates()
@@ -99,91 +174,151 @@ class MatchLifecycle:
             if os.path.isfile(path):
                 img = cv2.imread(path, cv2.IMREAD_COLOR)
                 if img is not None:
+                    if TEMPLATE_SCALE != 1.0:
+                        img = cv2.resize(
+                            img, None, fx=TEMPLATE_SCALE, fy=TEMPLATE_SCALE
+                        )
                     self._templates[key] = img
 
-    def _match_template(self, frame: np.ndarray, key: str) -> float:
+    def _locate_template(
+        self, frame: np.ndarray, key: str
+    ) -> tuple[float, tuple[float, float] | None]:
+        """Best match score and its centre as (x_frac, y_frac), or None."""
         tmpl = self._templates.get(key)
         if tmpl is None or frame is None or frame.size == 0:
-            return 0.0
+            return 0.0, None
         if tmpl.shape[0] > frame.shape[0] or tmpl.shape[1] > frame.shape[1]:
-            return 0.0
+            return 0.0, None
         result = cv2.matchTemplate(frame, tmpl, cv2.TM_CCOEFF_NORMED)
-        return float(result.max())
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        h, w = frame.shape[:2]
+        cx = (max_loc[0] + tmpl.shape[1] / 2) / w
+        cy = (max_loc[1] + tmpl.shape[0] / 2) / h
+        return float(max_val), (cx, cy)
 
     # ----- detection -----
 
     def detect_state(self, frame: np.ndarray) -> LifecycleSignals:
-        hits = {k: self._match_template(frame, k) for k in TEMPLATE_FILES}
+        # Cheap gate first: the elixir bar is on screen only while a match is
+        # running, and none of the four templates (battle / ok / victory /
+        # defeat) can be on screen at the same time as it. So a frame with the
+        # bar visible is IN_MATCH regardless of what matchTemplate would say,
+        # and the four full-frame sweeps can be skipped. The frame a match ends
+        # on loses the bar, so the postmatch transition is still seen at once.
+        bar_visible = False
+        magenta_frac = 0.0
+        if frame is not None and frame.size:
+            bar_visible, magenta_frac = self._elixir_bar_visible(frame)
+        if bar_visible:
+            self._last_state = STATE_IN_MATCH
+            return LifecycleSignals(
+                state=STATE_IN_MATCH,
+                path=PATH_ELIXIR_GATE,
+                elixir_magenta_frac=magenta_frac,
+                elixir_bar_visible=True,
+            )
 
-        victory_hit = hits.get("victory", 0.0) >= TEMPLATE_MATCH_THRESHOLD
-        defeat_hit = hits.get("defeat", 0.0) >= TEMPLATE_MATCH_THRESHOLD
-        ok_hit = hits.get("ok_button", 0.0) >= TEMPLATE_MATCH_THRESHOLD
-        battle_hit = hits.get("battle_button", 0.0) >= TEMPLATE_MATCH_THRESHOLD
+        hits = {k: self._locate_template(frame, k)[0] for k in TEMPLATE_FILES}
 
-        result: Optional[str] = None
+        victory_hit = hits["victory"] >= TEMPLATE_MATCH_THRESHOLD
+        defeat_hit = hits["defeat"] >= TEMPLATE_MATCH_THRESHOLD
+        ok_hit = hits["ok_button"] >= TEMPLATE_MATCH_THRESHOLD
+        battle_hit = hits["battle_button"] >= TEMPLATE_MATCH_THRESHOLD
+
+        result: str | None = None
         if victory_hit:
             result = "win"
         elif defeat_hit:
             result = "loss"
 
+        banner: BannerSample | None = None
         if victory_hit or defeat_hit or ok_hit:
             state = STATE_POSTMATCH
+            path = PATH_TEMPLATE_SWEEP
         elif battle_hit:
             state = STATE_MENU
+            path = PATH_TEMPLATE_SWEEP
         else:
-            state = self._color_based_state(frame)
-            if state == STATE_POSTMATCH:
-                result = result or self._color_based_result(frame)
+            state, path, banner = self._color_based_state(frame)
+            if state == STATE_POSTMATCH and banner is not None:
+                result = result or banner.result()
 
         self._last_state = state
-        return LifecycleSignals(state=state, result=result, template_hits=hits)
+        return LifecycleSignals(
+            state=state,
+            result=result,
+            template_hits=hits,
+            path=path,
+            elixir_magenta_frac=magenta_frac,
+            elixir_bar_visible=bar_visible,
+            banner=banner,
+        )
 
-    def _color_based_state(self, frame: np.ndarray) -> str:
+    def _color_based_state(
+        self, frame: np.ndarray
+    ) -> tuple[str, str, BannerSample | None]:
+        """State from banner colour alone, plus the verdict path and the
+        banner sample it was read from (None when no pixel was sampled)."""
         if frame is None or frame.size == 0:
-            return self._last_state
-        elixir_px = _sample_pixel(frame, ELIXIR_BAR_SAMPLE)
-        if _color_distance(elixir_px, COLOR_PURPLE_ELIXIR) <= COLOR_TOLERANCE:
-            return STATE_IN_MATCH
+            return self._last_state, PATH_HYSTERESIS, None
+        if self._elixir_bar_visible(frame)[0]:
+            return STATE_IN_MATCH, PATH_ELIXIR_GATE, None
 
-        banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
-        if (
-            _color_distance(banner_px, COLOR_VICTORY_GOLD) <= COLOR_TOLERANCE
-            or _color_distance(banner_px, COLOR_DEFEAT_BLUE) <= COLOR_TOLERANCE
-        ):
-            return STATE_POSTMATCH
+        banner = BannerSample.at(frame, VICTORY_BANNER_SAMPLE)
+        if banner.matches_a_banner():
+            return STATE_POSTMATCH, PATH_BANNER_COLOR, banner
 
         # Bias toward keeping the previous state instead of bouncing to MENU
         # on a single noisy frame.
         if self._last_state == STATE_IN_MATCH:
-            return STATE_IN_MATCH
-        return STATE_MENU
+            return STATE_IN_MATCH, PATH_HYSTERESIS, banner
+        return STATE_MENU, PATH_DEFAULT_MENU, banner
 
-    def _color_based_result(self, frame: np.ndarray) -> Optional[str]:
-        banner_px = _sample_pixel(frame, VICTORY_BANNER_SAMPLE)
-        if _color_distance(banner_px, COLOR_VICTORY_GOLD) <= COLOR_TOLERANCE:
-            return "win"
-        if _color_distance(banner_px, COLOR_DEFEAT_BLUE) <= COLOR_TOLERANCE:
-            return "loss"
-        return None
+    @staticmethod
+    def _elixir_bar_visible(frame: np.ndarray) -> tuple[bool, float]:
+        """``(bar visible, magenta fraction)``. The fraction is the number
+        the in-match gate turns on, so it is returned rather than
+        discarded — a below-threshold frame is meaningless to diagnose
+        without knowing how far below it fell."""
+        h, w = frame.shape[:2]
+        x0, y0, x1, y1 = ELIXIR_BAR_PATCH
+        patch = frame[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)]
+        if patch.size == 0:
+            return False, 0.0
+        b = patch[..., 0].astype(int)
+        g = patch[..., 1].astype(int)
+        r = patch[..., 2].astype(int)
+        magenta = (b > 180) & (r > 180) & (g < 140)
+        frac = float(magenta.mean())
+        return frac >= ELIXIR_MAGENTA_MIN_FRAC, frac
 
     # ----- side effects -----
 
-    def auto_rematch(self, monitor: dict, between_clicks_sec: float = 1.5) -> None:
-        """Click ``OK`` then ``Battle`` to start a new match.
-
-        Coordinates are taken from ``OK_BUTTON_FRAC`` and
-        ``BATTLE_BUTTON_FRAC``. The caller passes the ``mss`` monitor
-        dict so we can convert to global screen coordinates.
-        """
-        import time
-
-        ok_x = monitor["left"] + int(OK_BUTTON_FRAC[0] * monitor["width"])
-        ok_y = monitor["top"] + int(OK_BUTTON_FRAC[1] * monitor["height"])
-        pyautogui.moveTo(ok_x, ok_y)
+    def _click_frac(self, monitor: dict, frac_xy: tuple[float, float]) -> None:
+        x = monitor["left"] + int(frac_xy[0] * monitor["width"])
+        y = monitor["top"] + int(frac_xy[1] * monitor["height"])
+        pyautogui.moveTo(x, y)
         pyautogui.click()
-        time.sleep(between_clicks_sec)
 
-        battle_x = monitor["left"] + int(BATTLE_BUTTON_FRAC[0] * monitor["width"])
-        battle_y = monitor["top"] + int(BATTLE_BUTTON_FRAC[1] * monitor["height"])
-        pyautogui.moveTo(battle_x, battle_y)
-        pyautogui.click()
+    def _click_template(
+        self,
+        monitor: dict,
+        frame: np.ndarray | None,
+        key: str,
+        fallback_frac: tuple[float, float],
+    ) -> None:
+        """Click the template's matched centre, or ``fallback_frac``."""
+        frac = fallback_frac
+        if frame is not None:
+            score, loc = self._locate_template(frame, key)
+            if loc is not None and score >= TEMPLATE_MATCH_THRESHOLD:
+                frac = loc
+        self._click_frac(monitor, frac)
+
+    def click_ok(self, monitor: dict, frame: np.ndarray | None = None) -> None:
+        """Dismiss the postmatch screen."""
+        self._click_template(monitor, frame, "ok_button", OK_BUTTON_FRAC)
+
+    def click_battle(self, monitor: dict, frame: np.ndarray | None = None) -> None:
+        """Start a match from the main menu."""
+        self._click_template(monitor, frame, "battle_button", BATTLE_BUTTON_FRAC)

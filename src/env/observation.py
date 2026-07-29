@@ -4,9 +4,9 @@ The observation schema is the contract any ML policy can rely on. All
 arrays have known dtypes and shapes regardless of detection noise, so
 downstream tensors are stable across frames.
 
-Schema produced by ``build``:
+Schema (see ``OBSERVATION_SHAPES`` for the canonical key order):
 
-- ``hand``         (4, V)  one-hot card identity
+- ``hand``         (4, V)  one-hot card identity (V = |TROOP_CLASSES|)
 - ``hand_costs``   (4,)    elixir cost per slot (0 for empty)
 - ``hand_playable``(4,)    1.0 where elixir is sufficient, else 0.0
 - ``elixir``       float   0-10
@@ -24,7 +24,8 @@ policies.
 
 from __future__ import annotations
 
-from typing import Optional
+import hashlib
+import json
 
 import numpy as np
 
@@ -40,38 +41,49 @@ from ..game.state import GameState, TOWER_KEYS
 PHASES = ("normal", "double", "overtime_double", "overtime_triple")
 PHASE_INDEX = {p: i for i, p in enumerate(PHASES)}
 
+# Canonical schema: key order here is the flatten() order. Scalars have
+# shape ().
+OBSERVATION_SHAPES: dict[str, tuple[int, ...]] = {
+    "hand": (HAND_SIZE, len(TROOP_CLASSES)),
+    "hand_costs": (HAND_SIZE,),
+    "hand_playable": (HAND_SIZE,),
+    "elixir": (),
+    "match_time": (),
+    "time_norm": (),
+    "phase_onehot": (len(PHASES),),
+    "arena": (ARENA_ROWS, ARENA_COLS, len(TROOP_CLASSES) * 2),
+    "tower_hp": (len(TOWER_KEYS),),
+    "crowns": (2,),
+    "playable_mask": (ARENA_ROWS, ARENA_COLS),
+}
+
+
+def schema_descriptor() -> dict:
+    """Everything needed to interpret — or later migrate — a flattened
+    observation: the troop class list (one-hot channel meanings) and the
+    field shapes in flatten order."""
+    return {
+        "obs_flat_size": sum(
+            int(np.prod(shape)) for shape in OBSERVATION_SHAPES.values()
+        ),
+        "troop_classes": list(TROOP_CLASSES),
+        "observation_shapes": {
+            k: list(v) for k, v in OBSERVATION_SHAPES.items()
+        },
+    }
+
+
+def schema_hash() -> str:
+    """Short stable fingerprint of the observation schema."""
+    blob = json.dumps(schema_descriptor(), sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
 
 class ObservationBuilder:
-    """Constructs the structured observation dict.
+    """Constructs the structured observation dict."""
 
-    ``card_vocab`` defaults to ``TROOP_CLASSES`` so hand and arena share
-    a vocabulary; pass an explicit vocab if you want to widen it for
-    spell cards.
-    """
-
-    def __init__(self, card_vocab: Optional[list[str]] = None):
-        self.card_vocab = list(card_vocab) if card_vocab is not None else list(TROOP_CLASSES)
-        self.vocab_size = len(self.card_vocab)
-        self.arena_channels = len(TROOP_CLASSES) * 2
-
-    # ----- shape inspection -----
-
-    def observation_shapes(self) -> dict[str, tuple]:
-        return {
-            "hand": (HAND_SIZE, self.vocab_size),
-            "hand_costs": (HAND_SIZE,),
-            "hand_playable": (HAND_SIZE,),
-            "elixir": (),
-            "match_time": (),
-            "time_norm": (),
-            "phase_onehot": (len(PHASES),),
-            "arena": (ARENA_ROWS, ARENA_COLS, self.arena_channels),
-            "tower_hp": (len(TOWER_KEYS),),
-            "crowns": (2,),
-            "playable_mask": (ARENA_ROWS, ARENA_COLS),
-        }
-
-    # ----- main entry point -----
+    def observation_shapes(self) -> dict[str, tuple[int, ...]]:
+        return dict(OBSERVATION_SHAPES)
 
     def build(self, board: GameBoard, state: GameState) -> dict:
         elixir = float(state.get_current_elixir())
@@ -82,23 +94,19 @@ class ObservationBuilder:
         if phase in PHASE_INDEX:
             phase_vec[PHASE_INDEX[phase]] = 1.0
 
-        hand = board.hand_to_tensor(self.card_vocab)
         hand_costs = board.hand_costs()
         hand_playable = (hand_costs <= elixir + 1e-6).astype(np.float32)
         hand_playable *= (hand_costs > 0).astype(np.float32)  # empty slot = unplayable
 
         tower_hp = np.zeros((len(TOWER_KEYS),), dtype=np.float32)
         for i, key in enumerate(TOWER_KEYS):
-            current = state.tower_hp.get(key)
-            max_hp = state.tower_max_hp.get(key, 1) or 1
+            current = state.tower_hp[key]
             if current is None:
                 tower_hp[i] = 1.0
             else:
-                tower_hp[i] = float(np.clip(current / max_hp, 0.0, 1.0))
-
-        crowns = np.array(
-            [state.crowns_friendly, state.crowns_enemy], dtype=np.float32
-        )
+                tower_hp[i] = float(
+                    np.clip(current / state.tower_max_hp[key], 0.0, 1.0)
+                )
 
         playable_mask = board.get_placeable_mask(
             enemy_left_tower_alive=state.is_enemy_left_alive(),
@@ -107,8 +115,8 @@ class ObservationBuilder:
         ).astype(np.float32)
 
         return {
-            "hand": hand.astype(np.float32),
-            "hand_costs": hand_costs.astype(np.float32),
+            "hand": board.hand_to_tensor(),
+            "hand_costs": hand_costs,
             "hand_playable": hand_playable,
             "elixir": np.float32(elixir),
             "match_time": np.float32(match_time),
@@ -116,41 +124,19 @@ class ObservationBuilder:
             "phase_onehot": phase_vec,
             "arena": board.to_tensor(),
             "tower_hp": tower_hp,
-            "crowns": crowns,
+            "crowns": np.array(
+                [state.crowns_friendly, state.crowns_enemy], dtype=np.float32
+            ),
             "playable_mask": playable_mask,
         }
 
-    # ----- flat representation -----
-
     @staticmethod
     def flatten(obs: dict) -> np.ndarray:
-        parts = []
-        for key in (
-            "hand",
-            "hand_costs",
-            "hand_playable",
-            "elixir",
-            "match_time",
-            "time_norm",
-            "phase_onehot",
-            "arena",
-            "tower_hp",
-            "crowns",
-            "playable_mask",
-        ):
-            v = obs[key]
-            arr = np.asarray(v, dtype=np.float32).reshape(-1)
-            parts.append(arr)
-        return np.concatenate(parts, axis=0)
+        """Concatenate all fields into one 1-D float32 vector, in
+        ``OBSERVATION_SHAPES`` key order."""
+        return np.concatenate(
+            [np.asarray(obs[key], dtype=np.float32).reshape(-1) for key in OBSERVATION_SHAPES]
+        )
 
     def flat_size(self) -> int:
-        size = 0
-        for shape in self.observation_shapes().values():
-            if not shape:
-                size += 1
-            else:
-                n = 1
-                for d in shape:
-                    n *= d
-                size += n
-        return size
+        return sum(int(np.prod(shape)) for shape in OBSERVATION_SHAPES.values())

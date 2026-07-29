@@ -24,7 +24,6 @@ from typing import Optional
 
 import pyautogui
 
-from ..game.cards import Card
 from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS, HAND_SIZE
 from ..game.state import GameState
 
@@ -41,6 +40,17 @@ HAND_CARD_POSITIONS: tuple[tuple[float, float], ...] = (
 
 DRAG_DURATION_SEC = 0.20
 POST_DRAG_PAUSE_SEC = 0.05
+
+# pyautogui sleeps PAUSE seconds after *every* call it makes, including
+# the mouseDown / moveTo / mouseUp that dragTo is built from. At the
+# 0.1s default a single placement burns ~0.45s of pure sleep, which is
+# more than a whole perception cycle. 0.02s is still long enough for
+# BlueStacks to register each event, and the explicit
+# POST_DRAG_PAUSE_SEC below covers the card-pickup settle.
+# FAILSAFE is deliberately left enabled (slam the cursor into a screen
+# corner to abort the bot).
+PYAUTOGUI_PAUSE_SEC = 0.02
+pyautogui.PAUSE = PYAUTOGUI_PAUSE_SEC
 
 
 # Sentinel for the "do nothing this step" action.
@@ -135,7 +145,7 @@ class ActionExecutor:
             return ActionResult(success=False, reason=f"bad hand_index {action.hand_index}")
 
         card = board.cards_in_hand[action.hand_index]
-        if not isinstance(card, Card):
+        if card is None:
             return ActionResult(success=False, reason="hand slot empty")
 
         if not (0 <= action.tile_x < ARENA_COLS and 0 <= action.tile_y < ARENA_ROWS):

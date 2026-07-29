@@ -1,20 +1,19 @@
 """Screen capture wrapper around ``mss`` + ``pywinctl``.
 
-The window crop offsets are the BlueStacks-specific magic numbers that
-used to live inside ``windowCap.start_window_cap``. They strip away the
-side toolbars and top chrome so the captured frame is just the game
-viewport. CALIBRATE these for your BlueStacks resolution and theme.
+The window crop offsets strip the BlueStacks side toolbars and top
+chrome so the captured frame is just the game viewport. CALIBRATE
+these for your BlueStacks resolution and theme.
 """
 
 from __future__ import annotations
 
+import sys
 import time
-from typing import Optional
 
+import cv2
 import mss
 import numpy as np
 import pywinctl as gw
-import cv2
 
 
 WINDOW_CROP_TOP    = 47
@@ -49,7 +48,7 @@ class ScreenCapture:
         self.crop_bottom = crop_bottom
         self.activate_on_open = activate
 
-        self._sct: Optional[mss.base.MSSBase] = None
+        self._sct: mss.base.MSSBase | None = None
         self._window = None
 
     # ----- context management -----
@@ -68,8 +67,13 @@ class ScreenCapture:
                     self._window.restore()
                 self._window.activate()
                 time.sleep(0.5)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(
+                    f"WARNING: could not activate window "
+                    f"{self.window_title!r} ({exc}); capture may grab the "
+                    f"wrong screen region if the window is hidden or moved.",
+                    file=sys.stderr,
+                )
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -94,5 +98,4 @@ class ScreenCapture:
         if self._sct is None:
             raise RuntimeError("ScreenCapture is not open")
         shot = self._sct.grab(self.monitor)
-        img = np.array(shot)
-        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return cv2.cvtColor(np.array(shot), cv2.COLOR_BGRA2BGR)

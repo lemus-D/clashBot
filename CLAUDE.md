@@ -26,21 +26,59 @@ See ./README.md for the full module map, observation schema, and action space.
 (Current state — under active revision. Describe and improve it as it is; don't
 speculatively generalize for cases that don't exist yet.)
 
-- Core loop: `ClashEnv` in `src/environment.py` — reset / step / close, reward
-  shaping, JSONL recording. This is the contract everything else serves.
-- Vision: Roboflow model (`troop-counter/7`) + screen capture via `mss` /
-  `pywinctl` in `src/capture.py`.
-- Observation: built in `src/observation.py` as a structured dict; `flatten()`
-  gives a 1-D float32 array for MLP policies.
-- Actions: `src/actions.py` — 577 discrete choices (NO_OP + hand x tile);
+- Core loop: `ClashEnv` in `src/env/environment.py` — reset / step / observe /
+  close, reward shaping, JSONL recording. This is the contract everything else
+  serves. `observe()` is the passive perceive-only cycle (used by `step` and
+  the demo recorder).
+- Observation: `src/env/observation.py` — structured dict; `flatten()` gives a
+  1-D float32 array for MLP policies.
+- Actions: `src/env/actions.py` — 577 discrete choices (NO_OP + hand x tile);
   `index_to_action` / `action_to_index` convert.
-- Game model: `gameBoard.py` (9x16 arena, hand, placement), `gameState.py`
-  (time, elixir, tower HP, crowns), `cardDatabase.py`, `cardClasses.py`.
-- Lifecycle: `matchLifecycle.py` — menu / in-match / postmatch + auto-rematch.
-- Tower HP: `towerHealth.py` via optional Tesseract OCR (degrades gracefully).
-- Entry point: `src/main.py` — CLI driver with `RandomPolicy`, `--debug`, `--record`.
+- Vision (`src/vision/`): Roboflow model (`troop-counter/8`); screen capture
+  via `mss` / `pywinctl` in `capture.py`; match lifecycle (menu / in-match /
+  postmatch + auto-rematch) in `lifecycle.py`; tower-HP and match-timer OCR via
+  Tesseract in `ocr.py` (required; raises on missing install, but a single
+  unreadable frame is reported as `None` and the caller decides).
+- Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
+  `state.py` (time, elixir simulation, tower HP, crowns), `cards.py`.
+- Match clock: elixir is simulated but time is NOT trusted to simulation. The
+  match is detected from the elixir bar, which is already up during the 3-2-1
+  countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`
+  re-derives `match_start_time` from the first trustworthy `MatchTimerReader`
+  reading (once per match) and `ClashEnv` raises if that never happens.
+  `get_current_match_time()` is clamped to 300s for `time_norm`;
+  `get_elapsed_seconds()` is the uncapped one for timeouts.
+- Recording format (`record_format: 2`, defined in `env/environment.py`, used
+  by BOTH `--record` and `--record-human`): a `{"type": "meta", ...}` header
+  (record_format + observation `schema_hash` + `schema_descriptor()`), then two
+  independent timestamped streams — `{"type": "obs", "t": ...}` per perception
+  cycle and `{"type": "act", "t": ...}` per placement. NOT one line per step: a
+  cycle is ~0.3s and a human can place several cards inside one. No-ops are not
+  written. Pairing is offline (`dataset.py`): each action binds to the nearest
+  observation captured strictly before it; an obs may take N actions (N rows)
+  or none (a no-op row). `obs.t` is frame-capture time, `act.t` is issue /
+  drag-release time. Format-1 files and cross-schema data are refused on both
+  append and load; checkpoints also carry the schema hash.
+- Imitation learning (`src/imitation/`): `recorder.py` records human play —
+  pynput mouse watcher maps hand→arena drags to timestamped actions while
+  `env.observe()` runs passively; adds `"source": "human"`.
+  `dataset.py` loads and pairs demos with no-op downsampling; `model.py` is a
+  factored-head net (shared MLP trunk → play/slot/tile heads, NOT one 577-way
+  softmax); `train.py` trains it; `policy.py` runs a checkpoint with
+  inference-time masking of unaffordable slots and unplaceable tiles.
+  PyTorch; this machine has an RTX 4070 — use the cu128 CUDA build, at the
+  torch version torchvision pins (see requirements.txt for the command).
+- Entry point: `src/main.py` — CLI driver: `RandomPolicy`, `--debug`,
+  `--record`, `--record-human`, `--calibrate`.
+- Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
 - Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
-  positions, tower HP regions, lifecycle samples). Keep them centralized there.
+  positions, tower HP regions, match timer region, lifecycle samples). Keep them
+  centralized there.
+- `src/calibrate.py` has four phases, selectable individually by name
+  (`viewport` / `hand` / `towers` / `timer`); bare `--calibrate` runs all four.
+  Phases 2-4 report fractions of the CROPPED viewport, so when `viewport` is
+  skipped the frame comes from `ScreenCapture` with the committed
+  `WINDOW_CROP_*` — never from the raw window grab, or every fraction is wrong.
 
 ## Setup & Commands
 
@@ -49,6 +87,14 @@ speculatively generalize for cases that don't exist yet.)
 - Config: copy `.env.example` to `.env`, set Roboflow `API_KEY`.
 - Run: `python -m src.main` (add `--debug` for overlay, `--record logs/run.jsonl
   --episodes N` to record).
+- Calibrate: `python -m src.main --calibrate` for all four phases, or
+  `--calibrate <viewport|hand|towers|timer>` for one (`towers` / `timer` need a
+  live match on screen).
+- Record human demos: `python -m src.main --record-human demos/run.jsonl
+  --episodes N` — human plays in BlueStacks (drag-style placement only).
+- Train imitation policy: `python -m src.imitation.train demos/run.jsonl
+  --out models/imitation.pt`; run it:
+  `python -m src.main --policy imitation --weights models/imitation.pt`.
 - Build: none yet. Tests: none yet. (Flag if you think one is needed.)
 
 ## Coding Practices
@@ -62,8 +108,8 @@ speculatively generalize for cases that don't exist yet.)
   should stay decoupled; don't let them bleed into each other.
 - Fail loud, not silent: raise specific, descriptive exceptions rather than
   swallowing errors or quietly degrading. Messages should say what failed and
-  what was expected. (Optional Tesseract OCR is the one documented exception —
-  it may fall back to "full" tower HP when unavailable.)
+  what was expected. Tesseract OCR is a hard requirement, not an exception to
+  this rule.
 
 ### Conciseness & Scope
 
@@ -74,6 +120,7 @@ speculatively generalize for cases that don't exist yet.)
 - Don't add config options, layers, or generality "just in case."
 - Fewer moving parts is better. Reach for a new abstraction only when real
   duplication or complexity justifies it.
+- When responding in terminal, brevity and conciseness is important if followups are needed for further clarification they will be asked
 
 ## Machine Learning Notes
 

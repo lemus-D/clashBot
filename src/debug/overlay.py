@@ -9,6 +9,21 @@ import cv2
 import numpy as np
 
 from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS
+from ..game.state import GameState
+
+TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
+TEXT_SCALE = 0.6
+TEXT_COLOR = (0, 255, 0)
+TEXT_THICKNESS = 2
+TEXT_LINE_HEIGHT = 24
+
+# Perceived tower HP, top row first so it reads in screen order (enemy
+# towers are at the top of the frame).
+TOWER_HP_ROWS: tuple[tuple[str, tuple[str, str, str]], ...] = (
+    ("Enemy towers", ("enemy_left", "enemy_right", "enemy_king")),
+    ("Friendly towers", ("friendly_left", "friendly_right", "friendly_king")),
+)
+UNKNOWN_HP = "--"
 
 
 def draw_tile_grid(frame: np.ndarray, game_board: GameBoard) -> np.ndarray:
@@ -40,45 +55,59 @@ def draw_tile_grid(frame: np.ndarray, game_board: GameBoard) -> np.ndarray:
     return frame
 
 
+def draw_text_lines(frame: np.ndarray, lines: list[str], top_y: int) -> None:
+    """Draw a stack of status lines in place, first baseline at ``top_y``."""
+    for i, line in enumerate(lines):
+        cv2.putText(
+            frame,
+            line,
+            (10, top_y + i * TEXT_LINE_HEIGHT),
+            TEXT_FONT,
+            TEXT_SCALE,
+            TEXT_COLOR,
+            TEXT_THICKNESS,
+        )
+
+
+def tower_hp_lines(state: GameState) -> list[str]:
+    """One line per side of the tower HP the program currently believes.
+
+    Reads ``state.tower_hp`` only - the values the OCR reader last pushed
+    in - so the overlay never triggers its own vision pass. A tower whose
+    HP was never successfully read shows ``--`` instead of a number.
+    """
+    lines: list[str] = []
+    for label, keys in TOWER_HP_ROWS:
+        cells = []
+        for name, key in zip(("L", "R", "K"), keys):
+            hp = state.tower_hp[key]
+            cells.append(f"{name}:{UNKNOWN_HP if hp is None else hp}")
+        lines.append(f"{label}  " + "  ".join(cells))
+    return lines
+
+
 def render_debug_overlay(
     frame: np.ndarray,
     board: GameBoard,
-    state,
-    detection_summary: dict | None = None,
+    state: GameState,
     lifecycle_state: str | None = None,
 ) -> np.ndarray:
-    """Annotate a captured frame with grid + status text.
-
-    Detector boxes/labels are intentionally NOT drawn here so this is
-    cheap to call without a Supervision dependency. ``main.py`` mixes
-    in the annotated detection frame separately when desired.
-    """
+    """Annotate a captured frame with the tile grid and status text."""
     out = frame.copy()
     out = draw_tile_grid(out, board)
 
-    lines: list[str] = []
-    if state is not None:
-        try:
-            lines.append(state.get_status_string())
-        except Exception:
-            pass
+    lines = [state.get_status_string()]
     if lifecycle_state is not None:
         lines.append(f"Lifecycle: {lifecycle_state}")
-    if detection_summary is not None:
-        lines.append(f"Cards: {len(detection_summary.get('cards_in_hand', []))}")
-        lines.append(f"Troops: {len(detection_summary.get('troops_on_board', []))}")
+    draw_text_lines(out, lines, top_y=30)
 
-    y_off = 30
-    for line in lines:
-        cv2.putText(
-            out,
-            line,
-            (10, y_off),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            2,
-        )
-        y_off += 24
+    # Bottom-left, above the frame edge: clear of the status stack at the
+    # top and of the arena rows, which end above the hand-card strip.
+    hp_lines = tower_hp_lines(state)
+    draw_text_lines(
+        out,
+        hp_lines,
+        top_y=out.shape[0] - 12 - TEXT_LINE_HEIGHT * (len(hp_lines) - 1),
+    )
 
     return out
