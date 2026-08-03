@@ -1,43 +1,27 @@
-"""OCR readers for the two numeric HUD elements: tower HP and the match timer.
+"""OCR for the match timer - the one HUD element still read by a recogniser.
 
-The two use different recognisers, for measured reasons.
+``MatchTimerReader`` uses Tesseract, which reads the ``m:ss`` countdown
+fine. This is the only ground truth for match time, everything else about
+the clock being simulated. It keeps its own persistent ``PyTessBaseAPI``
+so tessdata loads once rather than per cycle.
 
-``TowerHealthReader`` reads the six tower HP numbers with EasyOCR on the
-GPU. It used Tesseract, which could not do it: the HP digits are a heavy
-stylised game font about 14 px tall, and across ~400 combinations of
-threshold, mask, upscale (3-8x), interpolation, morphology, PSM and engine
-mode it plateaued at 9 of 12 known readings - while emitting confident
-wrong values like 112 or 1812 for 1512. Those flow straight into game
-state; a single misread 0 for ``enemy_king`` once ended a match at 2:28
-with a false "win". The masks were provably clean (the same images are
-trivially legible), so the recogniser was the limit, not preprocessing.
+This module used to also read the six tower HP numbers, with EasyOCR after
+Tesseract proved unable to (it plateaued at 9 of 12 known readings while
+emitting confident wrong values like 112 or 1812 for 1512, and one misread
+0 for ``enemy_king`` ended a match at 2:28 with a false "win"). EasyOCR
+did better but still only read ~36-54% of frames and cost ~84 ms/cycle.
+Both are gone: tower HP is now the fill fraction of the on-screen HP bar,
+measured geometrically in ``towers.py`` for microseconds and with no
+recogniser to be wrong. The elixir count moved to template matching in
+``elixir.py`` for the same reason.
 
-EasyOCR reads the same 12 samples 11 exactly right with ZERO wrong
-values: the one it is unsure of scores 0.42 against 0.997-1.000 for every
-correct reading, so ``TOWER_HP_MIN_CONFIDENCE`` rejects it. Abstaining
-costs one frame at a ~0.3 s cycle; a wrong value corrupts the episode.
-That confidence gate is also what makes "no readable number" trustworthy
-enough to mean "destroyed". Cost is ~84 ms/cycle for all six against
-Tesseract's 51 ms, inside the step budget.
+The region is a fraction of the captured frame (0-1); CALIBRATE
+``MATCH_TIMER_REGION`` for your BlueStacks crop.
 
-``MatchTimerReader`` still uses Tesseract, which reads the ``m:ss``
-countdown fine - it is the only ground truth for match time, everything
-else about the clock being simulated. It keeps its own persistent
-``PyTessBaseAPI`` so tessdata loads once rather than per cycle.
-
-Regions are fractions of the captured frame (0-1); CALIBRATE
-``TOWER_HP_REGIONS`` and ``MATCH_TIMER_REGION`` for your BlueStacks crop.
-Tower boxes must bound the HP DIGITS only - excluding the gold level
-badge to their left, whose small number otherwise reads as HP (that is
-where the 1-77 "HP" values in early recordings came from). Before a king
-tower takes damage the game draws no bar and no number, only the badge,
-centred where the number would be; that crop is expected to yield
-``None`` and leave the tower at its default HP.
-
-Both recognisers are hard requirements: a missing install or a malformed
-crop raises rather than degrading silently. A single frame whose digits
-cannot be read is not a failure of that kind - it is reported as ``None``
-for that field and the caller decides.
+Tesseract is a hard requirement: a missing install or a malformed crop
+raises rather than degrading silently. A single frame whose digits cannot
+be read is not a failure of that kind - it is reported as ``None`` and the
+caller decides.
 """
 
 from __future__ import annotations
@@ -51,20 +35,8 @@ import cv2
 import numpy as np
 from tesserocr import PSM, RIL, PyTessBaseAPI
 
-from ..game.state import TOWER_KEYS
-from .hud import crop_region, glyph_mask
+from .hud import crop_region
 
-
-# Each entry is (x_frac, y_frac, w_frac, h_frac) within the captured frame.
-# CALIBRATE FOR YOUR RESOLUTION.
-TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
-    "enemy_king":  (0.4762, 0.0148, 0.0821, 0.0222),
-    "enemy_left":  (0.2085, 0.1294, 0.0706, 0.0222),
-    "enemy_right":  (0.7307, 0.1303, 0.0706, 0.0213),
-    "friendly_king":  (0.4762, 0.7560, 0.0837, 0.0203),
-    "friendly_left":  (0.2085, 0.6183, 0.0706, 0.0231),
-    "friendly_right":  (0.7307, 0.6192, 0.0706, 0.0194),
-}
 
 # (x_frac, y_frac, w_frac, h_frac) of the "m:ss" match countdown, drawn in
 # the upper right of the arena view, roughly level with the enemy king
@@ -73,22 +45,6 @@ TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
 # ``ClashEnv`` raises about rather than running on a simulated clock).
 MATCH_TIMER_REGION: tuple[float, float, float, float] = (0.8555, 0.0240, 0.1248, 0.0370)
 
-
-# Tower HP is always digits, so EasyOCR is restricted to them.
-TOWER_HP_ALLOWLIST = "0123456789"
-
-# Minimum EasyOCR confidence for a tower-HP reading to be believed. Over the
-# calibration frames every correct reading scored 0.997-1.000 and the single
-# misread scored 0.421, so the gap this sits in is wide rather than tuned.
-# Below it the frame is reported unreadable (None) instead of guessed at.
-TOWER_HP_MIN_CONFIDENCE = 0.90
-
-# Calibrated tower boxes bound the digits tightly enough to clip their tops
-# and bottoms, and a glyph cut off at the border recognises badly (1512 read
-# as 52). A couple of source pixels of slack fixes that. Deliberately small:
-# the gold level badge sits ~26 px to the left, so a generous margin trades
-# clipped glyphs for a badge digit in the crop.
-_TOWER_CROP_MARGIN_PX = 2
 
 # The timer crop holds exactly one line, so psm 7 skips layout analysis
 # entirely. The colon is whitelisted because it is part of the value;
@@ -184,11 +140,12 @@ def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     background and is forced to white. Should the crop ever break that
     assumption its digits invert and the frame reads as None.
 
-    Tower HP does NOT come through here - see ``hud.glyph_mask``. A
-    majority-vote polarity is only safe while the digits are a clear
-    minority of the crop, and the tower boxes sit at 39-48% ink, close
-    enough to the flip point that neighbouring frames inverted
-    inconsistently.
+    A majority-vote polarity is only safe while the digits are a clear
+    minority of the crop, which is true of this tight one-line box. It is
+    not universally true of HUD crops - the old tower-HP boxes sat at
+    39-48% ink, close enough to the flip point that neighbouring frames
+    inverted inconsistently, which is why ``hud.glyph_mask`` fixes polarity
+    by construction instead.
     """
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
     # Upscale + threshold makes Tesseract substantially more reliable on
@@ -204,111 +161,6 @@ def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     if 2 * int(np.count_nonzero(binarized)) < binarized.size:
         binarized = cv2.bitwise_not(binarized)
     return binarized
-
-
-def _make_easyocr_reader():
-    """Build the EasyOCR reader used for tower HP.
-
-    Imported here rather than at module scope because EasyOCR pulls in
-    torch, and ``src.calibrate`` imports this module only for the region
-    constants - it should not pay seconds of CUDA init to draw boxes.
-    """
-    try:
-        import easyocr
-    except ImportError as exc:
-        raise RuntimeError(
-            "EasyOCR is required to read tower HP but is not installed: "
-            f"{exc}. Install it with 'pip install easyocr' (see "
-            "requirements.txt)."
-        ) from exc
-    try:
-        return easyocr.Reader(["en"], gpu=True, verbose=False)
-    except Exception as exc:
-        raise RuntimeError(
-            f"EasyOCR failed to initialise: {exc}. Tower HP cannot be read; "
-            "check the torch install and that the recognition model "
-            "downloaded to ~/.EasyOCR."
-        ) from exc
-
-
-def _read_number(reader, mask: np.ndarray) -> int | None:
-    """Recognise one all-digit number in ``mask``, or ``None``.
-
-    ``None`` covers every way this frame can fail to produce a number: no
-    text found (a destroyed tower or an undamaged king shows none), a
-    non-digit result, or a confidence below ``TOWER_HP_MIN_CONFIDENCE``.
-    The caller keeps the last known HP rather than acting on a guess.
-
-    The crop's own box is passed as ``horizontal_list`` so EasyOCR runs
-    only its recogniser; there is nothing to detect when calibration
-    already says where the digits are.
-    """
-    height, width = mask.shape[:2]
-    results = reader.recognize(
-        mask,
-        horizontal_list=[[0, width, 0, height]],
-        free_list=[],
-        allowlist=TOWER_HP_ALLOWLIST,
-        detail=1,
-    )
-    digits = "".join(str(word).strip() for _box, word, _conf in results)
-    if not digits.isdigit():
-        return None
-    if min(conf for _box, _word, conf in results) < TOWER_HP_MIN_CONFIDENCE:
-        return None
-    return int(digits)
-
-
-class TowerHealthReader:
-    """Reads tower HP for the six towers with EasyOCR.
-
-    Each region is read independently: one recogniser call per crop, with
-    the crop's own bounding box handed in so EasyOCR's text *detector*
-    never runs. Detection is pure waste here because calibration already
-    says where the digits are, and skipping it costs nothing in accuracy
-    (11/12 either way) while removing any chance of one tower's reading
-    being attributed to another. Batching the six into one call measured
-    the same ~84 ms, so the simpler form wins.
-
-    A reading is returned only if it is all digits and scores at least
-    ``TOWER_HP_MIN_CONFIDENCE``; anything else is ``None``, meaning "this
-    frame could not be read", which the caller treats as keep-last-known.
-
-    Owns one lazily built EasyOCR reader, released by :meth:`close`. NOT
-    thread-safe: read from one thread only, or give each thread its own.
-    """
-
-    def __init__(self) -> None:
-        self._reader: object | None = None
-
-    def read(self, frame: np.ndarray) -> dict[str, int | None]:
-        reader = self._get_reader()
-        out: dict[str, int | None] = {k: None for k in TOWER_KEYS}
-        for key, region in TOWER_HP_REGIONS.items():
-            mask = glyph_mask(
-                crop_region(frame, region, f"TOWER_HP_REGIONS[{key!r}]",
-                            margin=_TOWER_CROP_MARGIN_PX)
-            )
-            out[key] = _read_number(reader, mask)
-        return out
-
-    def close(self) -> None:
-        """Drop the EasyOCR reader. Idempotent; a later :meth:`read`
-        transparently builds a fresh one."""
-        self._reader = None
-
-    def __enter__(self) -> TowerHealthReader:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
-
-    # ----- internals -----
-
-    def _get_reader(self):
-        if self._reader is None:
-            self._reader = _make_easyocr_reader()
-        return self._reader
 
 
 def parse_match_timer(text: str) -> float | None:
@@ -364,8 +216,8 @@ class MatchTimerReader:
     rejects a reading that disagrees with its own clock, which is what
     keeps an overtime display from ever anchoring the match clock.
 
-    Owns one persistent Tesseract API handle with the same threading
-    caveat as :class:`TowerHealthReader`: one thread per reader.
+    Owns one persistent Tesseract API handle and is NOT thread-safe: read
+    from one thread only, or give each thread its own reader.
     """
 
     def __init__(self) -> None:

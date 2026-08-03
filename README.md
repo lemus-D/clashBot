@@ -14,9 +14,10 @@ and match lifecycle.
 | -------------------------------------------------- | ---------------------------------------------------------- |
 | [`src/vision/capture.py`](src/vision/capture.py)   | `mss` + `pywinctl` window capture wrapper                  |
 | [`src/vision/lifecycle.py`](src/vision/lifecycle.py) | Menu / in-match / postmatch detection + auto-rematch     |
-| [`src/vision/ocr.py`](src/vision/ocr.py)           | Tower-HP reader (EasyOCR) and match-timer reader (Tesseract) |
+| [`src/vision/ocr.py`](src/vision/ocr.py)           | Match-timer reader (Tesseract) — the only remaining OCR      |
 | [`src/vision/hud.py`](src/vision/hud.py)           | Shared HUD primitives: fractional crops + glyph isolation   |
 | [`src/vision/elixir.py`](src/vision/elixir.py)     | Elixir count read by matching 11 reference crops (no OCR)   |
+| [`src/vision/towers.py`](src/vision/towers.py)     | Tower HP as HP-bar fill fraction (no OCR)                   |
 
 **Game model** — what the pixels mean:
 
@@ -69,11 +70,14 @@ and match lifecycle.
    on Windows it must come from the prebuilt wheel pinned in
    `requirements.txt` (pick the `cpXXX` matching your Python).
 
-   Tesseract reads the **match timer**. The **tower HP** numbers are read by
-   EasyOCR, which downloads ~100 MB of models to `~/.EasyOCR` on first use and
-   runs on the GPU. Both recognisers are hard requirements: a missing install
-   raises rather than degrading silently. See the header of
-   [`src/vision/ocr.py`](src/vision/ocr.py) for why the two differ.
+   Tesseract reads the **match timer**, and that is now the only OCR in the
+   project — a hard requirement that raises rather than degrading silently.
+   Tower HP and the elixir count used to be OCR'd too; both are now measured
+   geometrically (bar fill fraction and reference-crop matching), which is
+   faster and cannot misread. See the headers of
+   [`src/vision/towers.py`](src/vision/towers.py) and
+   [`src/vision/elixir.py`](src/vision/elixir.py) for the measurements behind
+   that change.
 4. Copy `.env.example` to `.env` and set your Roboflow `API_KEY`.
 
 ## Run
@@ -97,8 +101,11 @@ in the codebase; the hot spots are:
    (`WINDOW_CROP_TOP/LEFT/RIGHT/BOTTOM`).
 2. **Hand card pixel positions** (`hand` phase) in
    [`src/env/actions.py`](src/env/actions.py) (`HAND_CARD_POSITIONS`).
-3. **Tower HP regions** (`towers` phase) in
-   [`src/vision/ocr.py`](src/vision/ocr.py) (`TOWER_HP_REGIONS`).
+3. **Tower HP-bar regions** (`towers` phase) in
+   [`src/vision/towers.py`](src/vision/towers.py) (`TOWER_BAR_REGIONS`). Box
+   the coloured **bar**, not the HP number, and bound it tightly left-to-right
+   — HP is the bar's fill fraction *relative to the box*, so a box wider than
+   the bar reads a full tower as damaged.
 4. **Match timer region** (`timer` phase) in
    [`src/vision/ocr.py`](src/vision/ocr.py)
    (`MATCH_TIMER_REGION`) — the `m:ss` countdown, used to anchor the match
@@ -198,7 +205,7 @@ to load against another.
 | `time_norm`     | scalar               | match_time / 300                         |
 | `phase_onehot`  | (4,)                 | normal / double / ot_d / ot_t            |
 | `arena`         | (16, 9, 2*\|T\|)     | one-hot troop x color per tile           |
-| `tower_hp`      | (6,)                 | normalized HP per tower                  |
+| `tower_hp`      | (6,)                 | normalized HP per tower (bar fill; 0 = destroyed) |
 | `crowns`        | (2,)                 | (friendly, enemy) crown counts           |
 | `playable_mask` | (16, 9)              | 1 where friendly may place               |
 
@@ -247,11 +254,13 @@ enumerate `(hand_index, tile_y, tile_x)`. Use ``index_to_action`` and
 Items still owned by future iterations (ordered roughly by impact):
 
 - Tighten lifecycle detection with real template assets.
-- Replace OCR tower HP with a fine-tuned digit classifier. EasyOCR fixed
-  the *wrong*-value problem that made Tesseract unusable here, but it still
-  only reads a tower's number on roughly a third to a half of frames, and
-  destruction is inferred from a long run of misses rather than observed.
-  A classifier would be both faster and more consistently readable.
+- Separate a live low-HP tower from a destroyed one in a single frame.
+  Tower HP is now the HP bar's fill fraction, which removed OCR from this
+  path entirely, but an empty bar and an absent bar still look alike, so
+  destruction is inferred from a run of absences rather than observed.
+  Detecting the bar's empty *track* would fix that; a first attempt failed
+  on the only evidence available (see `src/vision/towers.py`) and it needs
+  frames of a genuinely low-HP princess tower to tune against.
 - Detect the "up next" card identity, not just filter it out, so the
   policy can plan ahead.
 - Train a baseline policy (PPO on the flat observation, or behavior

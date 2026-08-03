@@ -72,16 +72,17 @@ def draw_text_lines(frame: np.ndarray, lines: list[str], top_y: int) -> None:
 def tower_hp_lines(state: GameState) -> list[str]:
     """One line per side of the tower HP the program currently believes.
 
-    Reads ``state.tower_hp`` only - the values the OCR reader last pushed
-    in - so the overlay never triggers its own vision pass. A tower whose
-    HP was never successfully read shows ``--`` instead of a number.
+    Reads ``state.tower_hp`` only - the values the vision layer last pushed
+    in - so the overlay never triggers its own vision pass. Values are
+    normalized bar fill, shown as percentages; ``DEAD`` marks a tower the
+    destruction debounce has committed to.
     """
     lines: list[str] = []
     for label, keys in TOWER_HP_ROWS:
         cells = []
         for name, key in zip(("L", "R", "K"), keys):
             hp = state.tower_hp[key]
-            cells.append(f"{name}:{UNKNOWN_HP if hp is None else hp}")
+            cells.append(f"{name}:{'DEAD' if hp <= 0.0 else f'{hp * 100:3.0f}%'}")
         lines.append(f"{label}  " + "  ".join(cells))
     return lines
 

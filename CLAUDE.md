@@ -36,12 +36,19 @@ speculatively generalize for cases that don't exist yet.)
   `index_to_action` / `action_to_index` convert.
 - Vision (`src/vision/`): Roboflow model (`troop-counter/8`); screen capture
   via `mss` / `pywinctl` in `capture.py`; match lifecycle (menu / in-match /
-  postmatch + auto-rematch) in `lifecycle.py`; OCR in `ocr.py` — tower HP via
-  EasyOCR (Tesseract emitted confident wrong values on the stylised digits),
-  match timer via Tesseract/`tesserocr`. Both required; they raise on missing
-  install, but a single unreadable frame is reported as `None` and the caller
-  decides. A tower-HP read below `TOWER_HP_MIN_CONFIDENCE` is rejected rather
-  than believed.
+  postmatch + auto-rematch) in `lifecycle.py`; the match timer is the ONLY
+  remaining OCR (`ocr.py`, Tesseract/`tesserocr`; required, raises on missing
+  install, but a single unreadable frame is `None` and the caller decides).
+- Tower HP is the FILL FRACTION of the on-screen HP bar (`src/vision/towers.py`),
+  normalized 0.0-1.0, measured column-wise. This replaced EasyOCR on the HP
+  digits (~84ms/cycle, only ~36-54% of frames legible) and deleted the learned
+  max-HP denominator, whose one 5147 misread used to poison a whole match.
+  Bars deplete right-to-left. Destroyed reads 0.000 — but so does a bar hidden
+  behind a fight, so destruction needs a sustained run of absences (debounced
+  in `state.py`, retracted if the tower reads again). Kings are excluded from
+  destruction inference: a king kill is the banner's verdict, not vision's.
+  Do NOT reuse the old HP-number regions for the bars — the princess number is
+  drawn above the bar, and the offset differs per tower.
 - Elixir is READ, not simulated: `src/vision/elixir.py` classifies the HUD
   count against 11 reference crops (`src/assets/templates/elixir/0..10.png`,
   captured by `--calibrate elixir`) rather than OCR'ing it — an 11-way choice
@@ -84,8 +91,8 @@ speculatively generalize for cases that don't exist yet.)
   `--record`, `--record-human`, `--calibrate`.
 - Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
 - Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
-  positions, tower HP regions, match timer region, lifecycle samples). Keep them
-  centralized there.
+  positions, tower HP-bar regions, match timer region, elixir digit region,
+  lifecycle samples). Keep them centralized there.
 - `src/calibrate.py` has five phases, selectable individually by name
   (`viewport` / `hand` / `towers` / `timer` / `elixir`); bare `--calibrate`
   runs all five. Phases 2-5 report fractions of the CROPPED viewport, so when
@@ -123,8 +130,8 @@ speculatively generalize for cases that don't exist yet.)
   should stay decoupled; don't let them bleed into each other.
 - Fail loud, not silent: raise specific, descriptive exceptions rather than
   swallowing errors or quietly degrading. Messages should say what failed and
-  what was expected. Both OCR engines (EasyOCR, Tesseract) are hard
-  requirements, not an exception to this rule.
+  what was expected. Tesseract (the match timer) and the elixir reference
+  crops are hard requirements, not an exception to this rule.
 
 ### Conciseness & Scope
 

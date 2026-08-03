@@ -6,17 +6,16 @@ inference>=0.10
 supervision>=0.18
 python-dotenv>=1.0,<2
 pyautogui>=0.9.54,<1
-# Tower-HP OCR. Tesseract cannot read the stylised HP digits: across ~400
-# threshold/mask/upscale/PSM/engine combinations it topped out at 9 of 12
-# known readings and emitted confident wrong values (1512 -> 112, 1812) that
-# corrupt game state. EasyOCR reads the same samples 11/12 with zero wrong
-# values, and scores its one uncertain read 0.42 against 0.997+ for correct
-# ones, so src/vision/ocr.py can reject it instead of believing it. Runs on
-# the GPU; downloads ~100 MB of models to ~/.EasyOCR on first use (do NOT
-# commit those). ~84 ms/cycle for all six towers against Tesseract's 51 ms.
-easyocr>=1.7,<2
+# EasyOCR was here to read the six tower-HP numbers, after Tesseract proved
+# unable to (it topped out at 9 of 12 known readings and emitted confident
+# wrong values like 1512 -> 112). It is gone because the numbers are gone:
+# tower HP is now the fill fraction of the on-screen HP bar, measured
+# geometrically in src/vision/towers.py. That removed a ~100 MB model
+# download, ~84 ms/cycle, and a recogniser that could be confidently wrong.
+# If you have a stale ~/.EasyOCR directory from an older checkout, it is now
+# dead weight and safe to delete.
 #
-# The match TIMER still uses Tesseract, which reads it correctly.
+# The match TIMER is the only remaining OCR, and uses Tesseract.
 # tesserocr binds libtesseract in-process, so the persistent
 # handle in src/vision/ocr.py loads tessdata once instead of spawning a
 # tesseract.exe every cycle (~200 ms -> ~0). It replaced pytesseract entirely.

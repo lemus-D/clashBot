@@ -14,7 +14,7 @@ Schema (see ``OBSERVATION_SHAPES`` for the canonical key order):
 - ``time_norm``    float   match_time / MATCH_MAX_DURATION
 - ``phase_onehot`` (4,)    normal / double / overtime_double / overtime_triple
 - ``arena``        (16, 9, C) one-hot per tile (C = 2 * |TROOP_CLASSES|)
-- ``tower_hp``     (6,)    normalized HP per tower
+- ``tower_hp``     (6,)    normalized HP per tower (HP-bar fill fraction)
 - ``crowns``       (2,)    [friendly, enemy] crown counts
 - ``playable_mask``(16, 9) 1 where friendly may place
 
@@ -98,15 +98,12 @@ class ObservationBuilder:
         hand_playable = (hand_costs <= elixir + 1e-6).astype(np.float32)
         hand_playable *= (hand_costs > 0).astype(np.float32)  # empty slot = unplayable
 
-        tower_hp = np.zeros((len(TOWER_KEYS),), dtype=np.float32)
-        for i, key in enumerate(TOWER_KEYS):
-            current = state.tower_hp[key]
-            if current is None:
-                tower_hp[i] = 1.0
-            else:
-                tower_hp[i] = float(
-                    np.clip(current / state.tower_max_hp[key], 0.0, 1.0)
-                )
+        # Already normalised 0.0-1.0 by the vision layer: it is HP-bar fill,
+        # not an HP count, so there is no maximum to divide by here.
+        tower_hp = np.array(
+            [state.tower_hp[key] for key in TOWER_KEYS], dtype=np.float32
+        )
+        np.clip(tower_hp, 0.0, 1.0, out=tower_hp)
 
         playable_mask = board.get_placeable_mask(
             enemy_left_tower_alive=state.is_enemy_left_alive(),

@@ -65,32 +65,47 @@ from ..vision.lifecycle import (
 )
 from .observation import ObservationBuilder, schema_descriptor, schema_hash
 from ..vision.elixir import ElixirReader
-from ..vision.ocr import MatchTimerReader, TowerHealthReader
+from ..vision.ocr import MatchTimerReader
+from ..vision.towers import TowerBarReader
 
 # Roboflow inference is heavy; import lazily inside ``_load_model`` so
 # tests / static checks can import this module without the SDK.
 
 
-# prev_tower_hp is a copy of state.tower_hp taken before the step.
+# prev_tower_hp is a copy of state.tower_hp taken before the step: normalized
+# 0.0-1.0 bar fill per tower, not raw HP points.
 RewardFn = Callable[
-    [dict[str, Optional[int]], GameState, Optional[str], "ActionResult"], float
+    [dict[str, float], GameState, Optional[str], "ActionResult"], float
 ]
+
+# Reward per unit of normalized tower HP swung. Chosen so destroying a full
+# tower pays ~1.5, matching what 0.001-per-HP paid on a 1512-HP princess
+# tower before HP became a fraction.
+TOWER_HP_REWARD_SCALE = 1.5
 
 
 def default_reward(
-    prev_tower_hp: dict[str, Optional[int]],
+    prev_tower_hp: dict[str, float],
     state: GameState,
     result: Optional[str],
     action_result: ActionResult,
 ) -> float:
-    """0.001 per HP knocked off enemy towers, -0.001 per friendly HP lost,
-    +/-10 on win/loss, -0.05 for a failed (non-no-op) action."""
+    """Reward proportional to normalized tower HP swung this step.
 
-    def total(side: str, tower_hp: dict[str, Optional[int]]) -> float:
+    ``TOWER_HP_REWARD_SCALE`` per unit of normalized HP taken off enemy
+    towers, the same per unit lost on friendly ones, +/-10 on win/loss,
+    -0.05 for a failed (non-no-op) action.
+
+    The scale exists because tower HP became a 0.0-1.0 bar fill rather than
+    a raw HP count. At the old 0.001-per-HP rate, destroying a full 1512-HP
+    princess tower paid 1.512; the scale keeps that worth ~1.5 so reward
+    magnitudes - and the +/-10 terminal bonus that should dominate them -
+    stay comparable to runs recorded before the change.
+    """
+
+    def total(side: str, tower_hp: dict[str, float]) -> float:
         return sum(
-            float(v)
-            for k, v in tower_hp.items()
-            if k.startswith(side) and v is not None
+            float(v) for k, v in tower_hp.items() if k.startswith(side)
         )
 
     delta_enemy = total("enemy", prev_tower_hp) - total("enemy", state.tower_hp)
@@ -98,7 +113,7 @@ def default_reward(
         "friendly", state.tower_hp
     )
 
-    reward = 0.001 * (delta_enemy - delta_friendly)
+    reward = TOWER_HP_REWARD_SCALE * (delta_enemy - delta_friendly)
 
     if result == "win":
         reward += 10.0
@@ -309,7 +324,7 @@ class ClashEnv:
         self.board: Optional[GameBoard] = None
         self.state = GameState()
         self.lifecycle = MatchLifecycle()
-        self.tower_reader = TowerHealthReader()
+        self.tower_reader = TowerBarReader()
         self.timer_reader = MatchTimerReader()
         self.elixir_reader = ElixirReader()
         self.observer = ObservationBuilder()

@@ -11,7 +11,8 @@ Five phases, run in order by default (follow the on-screen prompts;
 rectangles are two clicks, top-left then bottom-right):
   1. ``viewport`` — mark the game viewport rectangle on the raw window.
   2. ``hand``     — click the centre of each of the four hand-card slots.
-  3. ``towers``   — mark each tower's HP-number rectangle (6 total).
+  3. ``towers``   — mark each tower's HP-BAR rectangle (6 total). The bar,
+     not the number: HP is read as the bar's fill fraction.
   4. ``timer``    — mark the "m:ss" match countdown rectangle.
   5. ``elixir``   — mark the elixir count, then capture one labelled
      reference crop per value (0-10) by keypress. This phase is the only
@@ -344,16 +345,22 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
             card_fracs = [(x / cw, y / ch) for x, y in card_pts]
 
         if "towers" in phases:
-            # Phase 3: tower HP regions — drag a box around each HP number
-            print("\nPhase 3 (towers): drag a box around each tower's HP number"
+            # Phase 3: tower HP BARS — not the HP numbers. Tower HP is now
+            # read as the bar's fill fraction, so the box must bound the bar
+            # itself, tightly: the fraction is relative to the box, so a box
+            # wider than the bar reads a full tower as less than full.
+            print("\nPhase 3 (towers): drag a box around each tower's HP BAR"
+                  " — the coloured strip, NOT the number"
                   " — needs a LIVE MATCH on screen")
+            print("  Bound the bar tightly left-to-right: fill is measured as a"
+                  " fraction of the box width, so extra width reads as missing HP.")
             tower_keys = [
                 "enemy_king", "enemy_left", "enemy_right",
                 "friendly_king", "friendly_left", "friendly_right",
             ]
             tower_regions = {}
             for key in tower_keys:
-                r_tl, r_br = _collect_rect(cropped, f"HP region: {key}")
+                r_tl, r_br = _collect_rect(cropped, f"HP BAR: {key}")
                 tower_regions[key] = _fractions(r_tl, r_br, cw, ch)
 
         if "timer" in phases:
@@ -405,14 +412,15 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
         print(")")
         print()
 
-    if tower_regions is not None or timer_region is not None:
-        print("# src/vision/ocr.py")
     if tower_regions is not None:
-        print("TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {")
+        print("# src/vision/towers.py")
+        print("TOWER_BAR_REGIONS: dict[str, tuple[float, float, float, float]] = {")
         for key, (xf, yf, wf, hf) in tower_regions.items():
             print(f'    "{key}":  ({xf:.4f}, {yf:.4f}, {wf:.4f}, {hf:.4f}),')
         print("}")
+        print()
     if timer_region is not None:
+        print("# src/vision/ocr.py")
         xf, yf, wf, hf = timer_region
         print(
             "MATCH_TIMER_REGION: tuple[float, float, float, float] = "
