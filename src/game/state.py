@@ -7,10 +7,14 @@ the elixir bar became visible, which is several seconds before the real
 ``match_start_time`` from the first trustworthy timer reading
 (``MatchTimerReader``). Without it the clock runs permanently ~5s ahead.
 
-Elixir regeneration is simulated rather than read from screen - it
-reproduces the in-game rates exactly (2.8s, 1.4s, 0.93s per pip across
-normal/double/triple phases) and is corrected by ``spend_elixir`` when
-the action layer commits a placement.
+Elixir is READ from screen and only interpolated by simulation. The
+regeneration rates are reproduced exactly (2.8s, 1.4s, 0.93s per pip
+across normal/double/triple phases) and ``spend_elixir`` debits a
+committed placement, but simulation alone has no ground truth for what
+the match actually granted and drifts over five minutes with nothing to
+correct it. ``set_elixir`` pins the value to the integer the HUD shows
+each perception cycle; the simulation's job is reduced to carrying the
+fraction between reads, since the display only shows the floor.
 
 Tower HP and match result are externally driven: ``TowerHealthReader``
 and ``MatchLifecycle`` push values in via ``update_tower_hp`` and
@@ -320,6 +324,42 @@ class GameState:
     def get_current_elixir(self) -> float:
         self.update_elixir()
         return self.current_elixir
+
+    def set_elixir(self, value: Optional[int]) -> None:
+        """Adopt an on-screen elixir reading as ground truth.
+
+        ``value`` is the integer the HUD shows (see ``ElixirReader``), or
+        ``None`` for a frame that could not be classified - in which case
+        the simulation carries the value to the next good read.
+
+        The display is the FLOOR of the true elixir, so a reading of 4 is
+        consistent with anything in [4, 5). When the simulated value
+        already falls inside that window it is KEPT, which is what
+        preserves the sub-pip fraction the digit cannot show. Otherwise the
+        simulation has drifted and is snapped back onto the reading.
+
+        Snapping to the floor rather than to the middle of the window is
+        deliberate: it can only ever understate how much elixir we have, so
+        a placement this value says is affordable really is. The reverse
+        error produces a rejected placement and a -0.05 reward for
+        something the policy did nothing wrong to earn.
+
+        ``last_elixir_update`` is restamped either way, so the accrual
+        measured by :meth:`update_elixir` starts from this reading rather
+        than double-counting the interval before it.
+        """
+        if value is None:
+            return
+        if not 0 <= value <= int(self.MAX_ELIXIR):
+            raise ValueError(
+                f"Elixir reading {value} is outside 0..{int(self.MAX_ELIXIR)}; "
+                "the reader classifies against templates for those values "
+                "only, so this means its output was corrupted"
+            )
+        floor = float(value)
+        if not floor <= self.current_elixir < floor + 1.0:
+            self.current_elixir = min(self.MAX_ELIXIR, floor)
+        self.last_elixir_update = time.time()
 
     def spend_elixir(self, amount: float) -> bool:
         self.update_elixir()

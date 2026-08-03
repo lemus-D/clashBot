@@ -52,17 +52,18 @@ import numpy as np
 from tesserocr import PSM, RIL, PyTessBaseAPI
 
 from ..game.state import TOWER_KEYS
+from .hud import crop_region, glyph_mask
 
 
 # Each entry is (x_frac, y_frac, w_frac, h_frac) within the captured frame.
 # CALIBRATE FOR YOUR RESOLUTION.
 TOWER_HP_REGIONS: dict[str, tuple[float, float, float, float]] = {
-    "enemy_king":  (0.4778, 0.0166, 0.0788, 0.0213),
-    "enemy_left":  (0.2085, 0.1322, 0.0706, 0.0203),
+    "enemy_king":  (0.4762, 0.0148, 0.0821, 0.0222),
+    "enemy_left":  (0.2085, 0.1294, 0.0706, 0.0222),
     "enemy_right":  (0.7307, 0.1303, 0.0706, 0.0213),
-    "friendly_king":  (0.4762, 0.7560, 0.0821, 0.0222),
-    "friendly_left":  (0.2085, 0.6201, 0.0706, 0.0203),
-    "friendly_right":  (0.7307, 0.6211, 0.0657, 0.0185),
+    "friendly_king":  (0.4762, 0.7560, 0.0837, 0.0203),
+    "friendly_left":  (0.2085, 0.6183, 0.0706, 0.0231),
+    "friendly_right":  (0.7307, 0.6192, 0.0706, 0.0194),
 }
 
 # (x_frac, y_frac, w_frac, h_frac) of the "m:ss" match countdown, drawn in
@@ -81,18 +82,6 @@ TOWER_HP_ALLOWLIST = "0123456789"
 # misread scored 0.421, so the gap this sits in is wide rather than tuned.
 # Below it the frame is reported unreadable (None) instead of guessed at.
 TOWER_HP_MIN_CONFIDENCE = 0.90
-
-# The HP digits are near-white glyphs drawn over a saturated bar - magenta
-# for the enemy, blue for the friendly side - beside a gold level badge.
-# Selecting "light and near-neutral" in LAB isolates them regardless of what
-# is behind them, which a grayscale threshold cannot do: the enemy bar is
-# glossy magenta, bright AND pale at the highlight, so brightness alone
-# floods the mask. Chroma is the distance from the neutral axis, so the bar,
-# the badge and the arena floor are all excluded by it while the glyphs are
-# not. Lightness is a percentile so it adapts per crop.
-_GLYPH_UPSCALE = 4.0
-_GLYPH_LIGHTNESS_PERCENTILE = 55.0
-_GLYPH_MAX_CHROMA = 18.0
 
 # Calibrated tower boxes bound the digits tightly enough to clip their tops
 # and bottoms, and a glyph cut off at the border recognises badly (1512 read
@@ -187,33 +176,6 @@ def _recognized_words(api: PyTessBaseAPI) -> list[tuple[str, tuple[int, int, int
             return words
 
 
-def _crop_region(
-    frame: np.ndarray,
-    region: tuple[float, float, float, float],
-    what: str,
-    margin: int = 0,
-) -> np.ndarray:
-    """Crop ``(x_frac, y_frac, w_frac, h_frac)`` out of ``frame``.
-
-    ``what`` names the calibration constant the region came from, so an
-    empty crop says which value to fix. ``margin`` grows the box by that
-    many source pixels on every side.
-    """
-    h, w = frame.shape[:2]
-    xf, yf, wf, hf = region
-    x0 = max(0, int(xf * w) - margin)
-    y0 = max(0, int(yf * h) - margin)
-    x1 = min(w, int(xf * w) + max(1, int(wf * w)) + margin)
-    y1 = min(h, int(yf * h) + max(1, int(hf * h)) + margin)
-    crop = frame[y0:y1, x0:x1]
-    if crop.size == 0:
-        raise ValueError(
-            f"{what} produced an empty crop ({x0},{y0})-({x1},{y1}) from a "
-            f"{w}x{h} frame; check its calibration"
-        )
-    return crop
-
-
 def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     """Binarize the timer crop to black digits on a white background.
 
@@ -222,7 +184,7 @@ def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     background and is forced to white. Should the crop ever break that
     assumption its digits invert and the frame reads as None.
 
-    Tower HP does NOT come through here - see :func:`_glyph_mask`. A
+    Tower HP does NOT come through here - see ``hud.glyph_mask``. A
     majority-vote polarity is only safe while the digits are a clear
     minority of the crop, and the tower boxes sit at 39-48% ink, close
     enough to the flip point that neighbouring frames inverted
@@ -242,33 +204,6 @@ def _preprocess_for_ocr(crop: np.ndarray) -> np.ndarray:
     if 2 * int(np.count_nonzero(binarized)) < binarized.size:
         binarized = cv2.bitwise_not(binarized)
     return binarized
-
-
-def _glyph_mask(crop: np.ndarray) -> np.ndarray:
-    """Isolate tower-HP digits as black glyphs on a white background.
-
-    Works in LAB and keeps pixels that are light AND near-neutral, which is
-    what the digits are and what nothing else in these crops is: the bar
-    fill and the gold level badge are strongly chromatic, and the dark glyph
-    outline is not light. Polarity is fixed by construction rather than
-    voted on, so it cannot flip between frames.
-
-    Nothing here special-cases a destroyed tower or an undamaged king. Both
-    simply contain no digits, the recogniser finds nothing or scores low,
-    and the caller gets ``None``.
-    """
-    big = cv2.resize(crop, None, fx=_GLYPH_UPSCALE, fy=_GLYPH_UPSCALE,
-                     interpolation=cv2.INTER_CUBIC)
-    lab = cv2.cvtColor(big, cv2.COLOR_BGR2LAB)
-    lightness = lab[..., 0].astype(np.float32)
-    a = lab[..., 1].astype(np.float32) - 128.0
-    b = lab[..., 2].astype(np.float32) - 128.0
-    chroma = np.sqrt(a * a + b * b)
-    glyph = (
-        (lightness >= np.percentile(lightness, _GLYPH_LIGHTNESS_PERCENTILE))
-        & (chroma <= _GLYPH_MAX_CHROMA)
-    )
-    return np.where(glyph, 0, _BACKGROUND).astype(np.uint8)
 
 
 def _make_easyocr_reader():
@@ -350,9 +285,9 @@ class TowerHealthReader:
         reader = self._get_reader()
         out: dict[str, int | None] = {k: None for k in TOWER_KEYS}
         for key, region in TOWER_HP_REGIONS.items():
-            mask = _glyph_mask(
-                _crop_region(frame, region, f"TOWER_HP_REGIONS[{key!r}]",
-                             margin=_TOWER_CROP_MARGIN_PX)
+            mask = glyph_mask(
+                crop_region(frame, region, f"TOWER_HP_REGIONS[{key!r}]",
+                            margin=_TOWER_CROP_MARGIN_PX)
             )
             out[key] = _read_number(reader, mask)
         return out
@@ -438,7 +373,7 @@ class MatchTimerReader:
 
     def read(self, frame: np.ndarray) -> float | None:
         crop = _preprocess_for_ocr(
-            _crop_region(frame, MATCH_TIMER_REGION, "MATCH_TIMER_REGION")
+            crop_region(frame, MATCH_TIMER_REGION, "MATCH_TIMER_REGION")
         )
         api = self._get_api()
         api.SetImageBytes(

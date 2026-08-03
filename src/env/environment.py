@@ -64,6 +64,7 @@ from ..vision.lifecycle import (
     TEMPLATE_MATCH_THRESHOLD,
 )
 from .observation import ObservationBuilder, schema_descriptor, schema_hash
+from ..vision.elixir import ElixirReader
 from ..vision.ocr import MatchTimerReader, TowerHealthReader
 
 # Roboflow inference is heavy; import lazily inside ``_load_model`` so
@@ -310,6 +311,7 @@ class ClashEnv:
         self.lifecycle = MatchLifecycle()
         self.tower_reader = TowerHealthReader()
         self.timer_reader = MatchTimerReader()
+        self.elixir_reader = ElixirReader()
         self.observer = ObservationBuilder()
         self.executor = ActionExecutor()
 
@@ -478,6 +480,7 @@ class ClashEnv:
             self._record_file = None
         self.tower_reader.close()
         self.timer_reader.close()
+        self.elixir_reader.close()
         if self.capture is not None:
             self.capture.__exit__(None, None, None)
             self.capture = None
@@ -533,6 +536,7 @@ class ClashEnv:
         self.board.process_detections(detections)
         readings = self.tower_reader.read(frame)
         self.state.update_tower_hp(readings)
+        self.state.set_elixir(self.elixir_reader.read(frame))
         if not self.state.clock_anchored:
             self._anchor_clock(frame)
 

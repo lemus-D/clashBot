@@ -36,11 +36,23 @@ speculatively generalize for cases that don't exist yet.)
   `index_to_action` / `action_to_index` convert.
 - Vision (`src/vision/`): Roboflow model (`troop-counter/8`); screen capture
   via `mss` / `pywinctl` in `capture.py`; match lifecycle (menu / in-match /
-  postmatch + auto-rematch) in `lifecycle.py`; tower-HP and match-timer OCR via
-  Tesseract in `ocr.py` (required; raises on missing install, but a single
-  unreadable frame is reported as `None` and the caller decides).
+  postmatch + auto-rematch) in `lifecycle.py`; OCR in `ocr.py` — tower HP via
+  EasyOCR (Tesseract emitted confident wrong values on the stylised digits),
+  match timer via Tesseract/`tesserocr`. Both required; they raise on missing
+  install, but a single unreadable frame is reported as `None` and the caller
+  decides. A tower-HP read below `TOWER_HP_MIN_CONFIDENCE` is rejected rather
+  than believed.
+- Elixir is READ, not simulated: `src/vision/elixir.py` classifies the HUD
+  count against 11 reference crops (`src/assets/templates/elixir/0..10.png`,
+  captured by `--calibrate elixir`) rather than OCR'ing it — an 11-way choice
+  at a fixed position, so matching is exact where OCR could misread. The
+  display shows the FLOOR, which is the conservative direction for
+  affordability. `GameState.set_elixir` makes the reading authoritative and
+  demotes the simulation to carrying the fraction between reads. Templates
+  are stamped with the region they were captured against; a stamp that
+  disagrees with `ELIXIR_DIGIT_REGION` raises rather than reading nothing.
 - Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
-  `state.py` (time, elixir simulation, tower HP, crowns), `cards.py`.
+  `state.py` (time, elixir, tower HP, crowns), `cards.py`.
 - Match clock: elixir is simulated but time is NOT trusted to simulation. The
   match is detected from the elixir bar, which is already up during the 3-2-1
   countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`
@@ -74,11 +86,14 @@ speculatively generalize for cases that don't exist yet.)
 - Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
   positions, tower HP regions, match timer region, lifecycle samples). Keep them
   centralized there.
-- `src/calibrate.py` has four phases, selectable individually by name
-  (`viewport` / `hand` / `towers` / `timer`); bare `--calibrate` runs all four.
-  Phases 2-4 report fractions of the CROPPED viewport, so when `viewport` is
-  skipped the frame comes from `ScreenCapture` with the committed
+- `src/calibrate.py` has five phases, selectable individually by name
+  (`viewport` / `hand` / `towers` / `timer` / `elixir`); bare `--calibrate`
+  runs all five. Phases 2-5 report fractions of the CROPPED viewport, so when
+  `viewport` is skipped the frame comes from `ScreenCapture` with the committed
   `WINDOW_CROP_*` — never from the raw window grab, or every fraction is wrong.
+  `elixir` is the only phase that also WRITES files (the reference crops), and
+  its live preview must not sit over the game viewport: `grab()` re-reads the
+  window rect every call, so an overlapping window gets captured instead.
 
 ## Setup & Commands
 
@@ -108,8 +123,8 @@ speculatively generalize for cases that don't exist yet.)
   should stay decoupled; don't let them bleed into each other.
 - Fail loud, not silent: raise specific, descriptive exceptions rather than
   swallowing errors or quietly degrading. Messages should say what failed and
-  what was expected. Tesseract OCR is a hard requirement, not an exception to
-  this rule.
+  what was expected. Both OCR engines (EasyOCR, Tesseract) are hard
+  requirements, not an exception to this rule.
 
 ### Conciseness & Scope
 

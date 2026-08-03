@@ -2,27 +2,31 @@
 
 Usage::
 
-    python -m src.main --calibrate           # all four phases
+    python -m src.main --calibrate           # every phase
     python -m src.main --calibrate timer     # just the match timer
     # or directly:
     python -m src.calibrate [PHASE]
 
-Four phases, run in order by default (follow the on-screen prompts;
+Five phases, run in order by default (follow the on-screen prompts;
 rectangles are two clicks, top-left then bottom-right):
   1. ``viewport`` — mark the game viewport rectangle on the raw window.
   2. ``hand``     — click the centre of each of the four hand-card slots.
   3. ``towers``   — mark each tower's HP-number rectangle (6 total).
   4. ``timer``    — mark the "m:ss" match countdown rectangle.
+  5. ``elixir``   — mark the elixir count, then capture one labelled
+     reference crop per value (0-10) by keypress. This phase is the only
+     one that both prints a constant AND writes files:
+     ``src/assets/templates/elixir/``.
 
 Any single phase can be run on its own by name, so re-calibrating one
 constant does not mean redoing the others. Only the constants for the
 phases actually run are printed.
 
-Phases 3 and 4 read in-match HUD elements, so they need a live match on
+Phases 3-5 read in-match HUD elements, so they need a live match on
 screen; phases 1 and 2 do not (the hand is visible in-match only, but its
 slots do not move, so the menu is fine for phase 1).
 
-Phases 2-4 report fractions of the *cropped* game viewport, not of the raw
+Phases 2-5 report fractions of the *cropped* game viewport, not of the raw
 window. When phase 1 runs, that crop is the rectangle just drawn; when it
 is skipped, the frame comes from :class:`ScreenCapture` with the committed
 ``WINDOW_CROP_*`` constants — i.e. byte-for-byte the frame the runtime
@@ -54,7 +58,7 @@ _WIN = "clashBot calibration"
 
 # Phase names accepted by :func:`calibrate`, in run order. "all" is also
 # accepted and means every one of them.
-PHASE_NAMES: tuple[str, ...] = ("viewport", "hand", "towers", "timer")
+PHASE_NAMES: tuple[str, ...] = ("viewport", "hand", "towers", "timer", "elixir")
 ALL_PHASES = "all"
 
 
@@ -175,6 +179,86 @@ def _collect_rect(frame: np.ndarray, label: str) -> tuple[tuple[int, int], tuple
     return pts[0], pts[1]
 
 
+def _capture_elixir_templates(
+    window_title: str, region: tuple[float, float, float, float]
+) -> None:
+    """Capture one labelled reference crop per elixir value, live.
+
+    The elixir counter is classified against 11 reference crops rather
+    than read by OCR, so those crops have to come from this machine's
+    pixels once. Values are labelled by keypress: ``0``-``9`` for those
+    values, ``a`` for 10, ``q`` or Esc to finish. The crop being labelled
+    is the one on screen in the preview, so there is no race between
+    reading the number and pressing the key.
+
+    The preview is moved to the top-left of the screen because
+    :meth:`ScreenCapture.grab` re-reads the window rectangle on every
+    grab: a preview window sitting over the game viewport gets captured
+    instead of the game. That failure is self-announcing - the preview
+    fills with a recursive image of itself - and dragging the window off
+    the viewport fixes it.
+    """
+    from .vision.elixir import (
+        MAX_ELIXIR_READING,
+        missing_template_values,
+        save_template,
+    )
+    from .vision.hud import crop_region
+
+    key_for = {str(v): v for v in range(10)}
+    key_for["a"] = 10
+
+    print(
+        f"\nPhase 5 (elixir): capture one reference crop per elixir value"
+        f" — needs a LIVE MATCH on screen\n"
+        f"  Keys: 0-9 = that value, a = 10, q/Esc = done.\n"
+        f"  Play normally and label the number as it changes; you need all"
+        f" of 0..{MAX_ELIXIR_READING}.\n"
+        f"  If the preview shows a picture of itself, drag it off the game"
+        f" viewport — it is being captured instead of the game."
+    )
+
+    with ScreenCapture(window_title) as cap:
+        cv2.namedWindow(_WIN, cv2.WINDOW_NORMAL)
+        cv2.moveWindow(_WIN, 0, 0)
+        cv2.resizeWindow(_WIN, 520, 260)
+        while True:
+            frame = _grab_painted(cap.grab, window_title)
+            crop = crop_region(frame, region, "ELIXIR_DIGIT_REGION")
+            preview = cv2.resize(
+                crop, None, fx=6.0, fy=6.0, interpolation=cv2.INTER_NEAREST
+            )
+            canvas = np.zeros((preview.shape[0] + 70, max(preview.shape[1], 500), 3),
+                              dtype=np.uint8)
+            canvas[:preview.shape[0], :preview.shape[1]] = preview
+            missing = missing_template_values()
+            cv2.putText(canvas, f"still needed: {missing or 'none - press q'}",
+                        (8, preview.shape[0] + 24), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 255), 1)
+            cv2.putText(canvas, "0-9 = value   a = 10   q = done",
+                        (8, preview.shape[0] + 50), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 0), 1)
+            cv2.imshow(_WIN, canvas)
+
+            key = cv2.waitKey(50) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            value = key_for.get(chr(key)) if 32 <= key < 127 else None
+            if value is not None:
+                path = save_template(frame, value, region)
+                print(f"  saved elixir={value} -> {path}")
+
+    remaining = missing_template_values()
+    if remaining:
+        print(
+            f"  WARNING: no crop captured for {remaining}. Those values will "
+            f"read as unreadable and fall back to simulated elixir; re-run "
+            f"'--calibrate elixir' to add them."
+        )
+    else:
+        print(f"  All 0..{MAX_ELIXIR_READING} captured.")
+
+
 def resolve_phases(phase: str) -> tuple[str, ...]:
     """Phases to run for a ``--calibrate`` value. ``"all"`` means every one.
 
@@ -229,7 +313,9 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
         # skips this phase can substitute _grab_cropped().
         cropped = frame_raw[tl[1]:br[1], tl[0]:br[0]]
 
-    if cropped is None and any(p in ("hand", "towers", "timer") for p in phases):
+    if cropped is None and any(
+        p in ("hand", "towers", "timer", "elixir") for p in phases
+    ):
         # Phase 1 was skipped: the remaining phases still need the viewport,
         # so take it the way the runtime does.
         print(
@@ -243,6 +329,7 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
     card_fracs: list[tuple[float, float]] | None = None
     tower_regions: dict[str, tuple[float, float, float, float]] | None = None
     timer_region: tuple[float, float, float, float] | None = None
+    elixir_region: tuple[float, float, float, float] | None = None
 
     if cropped is not None:
         ch, cw = cropped.shape[:2]
@@ -278,7 +365,25 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
             )
             timer_region = _fractions(t_tl, t_br, cw, ch)
 
+        if "elixir" in phases:
+            # Phase 5a: elixir counter region — the box the reference crops
+            # are captured through, so it is drawn before they are taken.
+            print("\nPhase 5 (elixir): drag a box around the elixir COUNT"
+                  " (the number beside the elixir bar)"
+                  " — needs a LIVE MATCH on screen")
+            e_tl, e_br = _collect_rect(
+                cropped, "Elixir count region (include room for a 2-digit 10)"
+            )
+            elixir_region = _fractions(e_tl, e_br, cw, ch)
+
     cv2.destroyAllWindows()
+
+    if elixir_region is not None:
+        # Phase 5b: the labelled reference crops, taken through the box just
+        # drawn rather than the committed constant — which is still the old
+        # value until the user pastes what this run prints.
+        _capture_elixir_templates(window_title, elixir_region)
+        cv2.destroyAllWindows()
 
     # Print results — only the constants for the phases that ran
     print("\n=== Calibration complete — paste these into your source files ===\n")
@@ -312,6 +417,19 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
         print(
             "MATCH_TIMER_REGION: tuple[float, float, float, float] = "
             f"({xf:.4f}, {yf:.4f}, {wf:.4f}, {hf:.4f})"
+        )
+
+    if elixir_region is not None:
+        xf, yf, wf, hf = elixir_region
+        print("\n# src/vision/elixir.py")
+        print(
+            "ELIXIR_DIGIT_REGION: tuple[float, float, float, float] = "
+            f"({xf:.4f}, {yf:.4f}, {wf:.4f}, {hf:.4f})"
+        )
+        print(
+            "# ^ REQUIRED: the reference crops just captured are stamped with "
+            "this region\n#   and the reader refuses to use them until the "
+            "constant matches."
         )
 
 

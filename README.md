@@ -8,20 +8,49 @@ and match lifecycle.
 
 ## What's in the box
 
-| Module                                       | Role                                                        |
-| -------------------------------------------- | ----------------------------------------------------------- |
-| [`src/capture.py`](src/capture.py)           | `mss` + `pywinctl` window capture wrapper                   |
-| [`src/cardDatabase.py`](src/cardDatabase.py) | Static card name -> elixir cost lookup                      |
-| [`src/cardClasses.py`](src/cardClasses.py)   | `Card` / `Troop` / `BlankSpace` data classes                |
-| [`src/gameBoard.py`](src/gameBoard.py)       | 4-card hand, 9x16 arena, placement rules, tensor encoding   |
-| [`src/gameState.py`](src/gameState.py)       | Match time, elixir, tower HP, crowns, win/loss              |
-| [`src/towerHealth.py`](src/towerHealth.py)   | OCR tower HP reader (Tesseract, required)                   |
-| [`src/matchLifecycle.py`](src/matchLifecycle.py) | Menu / in-match / postmatch detection + auto-rematch    |
-| [`src/observation.py`](src/observation.py)   | Builds the structured observation dict                      |
-| [`src/actions.py`](src/actions.py)           | Discrete action space + mouse executor                      |
-| [`src/environment.py`](src/environment.py)   | `ClashEnv`: reset / step / close, reward, JSONL recording   |
-| [`src/windowCap.py`](src/windowCap.py)       | Debug overlay rendering only                                |
-| [`src/main.py`](src/main.py)                 | CLI driver with `RandomPolicy` and `--debug` / `--record`   |
+**Vision** — pixels in:
+
+| Module                                             | Role                                                       |
+| -------------------------------------------------- | ---------------------------------------------------------- |
+| [`src/vision/capture.py`](src/vision/capture.py)   | `mss` + `pywinctl` window capture wrapper                  |
+| [`src/vision/lifecycle.py`](src/vision/lifecycle.py) | Menu / in-match / postmatch detection + auto-rematch     |
+| [`src/vision/ocr.py`](src/vision/ocr.py)           | Tower-HP reader (EasyOCR) and match-timer reader (Tesseract) |
+| [`src/vision/hud.py`](src/vision/hud.py)           | Shared HUD primitives: fractional crops + glyph isolation   |
+| [`src/vision/elixir.py`](src/vision/elixir.py)     | Elixir count read by matching 11 reference crops (no OCR)   |
+
+**Game model** — what the pixels mean:
+
+| Module                                   | Role                                                      |
+| ----------------------------------------- | ---------------------------------------------------------- |
+| [`src/game/cards.py`](src/game/cards.py) | `Card` / `Troop` data classes + name -> elixir cost lookup |
+| [`src/game/board.py`](src/game/board.py) | 4-card hand, 9x16 arena, placement rules, tensor encoding  |
+| [`src/game/state.py`](src/game/state.py) | Match time, elixir, tower HP, crowns, win/loss             |
+
+**Environment** — the policy-facing contract:
+
+| Module                                                 | Role                                                    |
+| ------------------------------------------------------- | --------------------------------------------------------- |
+| [`src/env/observation.py`](src/env/observation.py)     | Builds the structured observation dict + schema hashing |
+| [`src/env/actions.py`](src/env/actions.py)             | Discrete action space + mouse executor                  |
+| [`src/env/environment.py`](src/env/environment.py)     | `ClashEnv`: reset / step / observe / close, reward, JSONL recording |
+
+**Imitation learning** — learning from recorded play:
+
+| Module                                                 | Role                                                  |
+| ------------------------------------------------------- | ------------------------------------------------------- |
+| [`src/imitation/recorder.py`](src/imitation/recorder.py) | Records human play (pynput drag watcher + passive `observe()`) |
+| [`src/imitation/dataset.py`](src/imitation/dataset.py) | Loads and pairs two-stream demos, with no-op downsampling |
+| [`src/imitation/model.py`](src/imitation/model.py)     | Factored-head network (play / slot / tile) + checkpoint I/O |
+| [`src/imitation/train.py`](src/imitation/train.py)     | Trains the factored-head policy                       |
+| [`src/imitation/policy.py`](src/imitation/policy.py)   | Runs a checkpoint with inference-time action masking  |
+
+**Entry points and tooling:**
+
+| Module                                     | Role                                                           |
+| ------------------------------------------- | ---------------------------------------------------------------- |
+| [`src/main.py`](src/main.py)               | CLI driver: policy selection, `--debug`, `--record`, `--record-human` |
+| [`src/calibrate.py`](src/calibrate.py)     | Interactive per-machine calibration wizard (5 phases)          |
+| [`src/debug/overlay.py`](src/debug/overlay.py) | Debug overlay rendering only                               |
 
 ## Setup
 
@@ -35,8 +64,16 @@ and match lifecycle.
    ```
 
 3. Install [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) and
-   make sure it's on your `PATH`. It's required for tower-HP reading; the bot
-   raises if a read fails or the binary is missing.
+   make sure it's on your `PATH` (or set `TESSDATA_PREFIX`). Only the language
+   data comes from this install — `tesserocr` bundles the library itself, and
+   on Windows it must come from the prebuilt wheel pinned in
+   `requirements.txt` (pick the `cpXXX` matching your Python).
+
+   Tesseract reads the **match timer**. The **tower HP** numbers are read by
+   EasyOCR, which downloads ~100 MB of models to `~/.EasyOCR` on first use and
+   runs on the GPU. Both recognisers are hard requirements: a missing install
+   raises rather than degrading silently. See the header of
+   [`src/vision/ocr.py`](src/vision/ocr.py) for why the two differ.
 4. Copy `.env.example` to `.env` and set your Roboflow `API_KEY`.
 
 ## Run
@@ -47,43 +84,57 @@ python -m src.main --debug                # show OpenCV overlay window
 python -m src.main --record logs/run.jsonl --episodes 50
 ```
 
-The first run downloads/loads the `troop-counter/7` model; subsequent
-runs are fast.
+The first run downloads/loads the `troop-counter/8` model; subsequent
+runs are fast. Override it with `--model`.
 
 ## Calibration
 
 Several constants are inherently per-machine. Search for ``CALIBRATE``
-in the codebase; the four hot spots are:
+in the codebase; the hot spots are:
 
-1. **Window crop** in [`src/capture.py`](src/capture.py)
+1. **Window crop** (`viewport` phase) in
+   [`src/vision/capture.py`](src/vision/capture.py)
    (`WINDOW_CROP_TOP/LEFT/RIGHT/BOTTOM`).
-2. **Hand card pixel positions** in [`src/actions.py`](src/actions.py)
-   (`HAND_CARD_POSITIONS`).
-3. **Tower HP regions** in [`src/towerHealth.py`](src/towerHealth.py)
-   (`TOWER_HP_REGIONS`).
-4. **Lifecycle pixel samples and template images** in
-   [`src/matchLifecycle.py`](src/matchLifecycle.py) and
-   [`assets/templates/`](assets/templates/).
-5. **Match timer region** in [`src/vision/ocr.py`](src/vision/ocr.py)
+2. **Hand card pixel positions** (`hand` phase) in
+   [`src/env/actions.py`](src/env/actions.py) (`HAND_CARD_POSITIONS`).
+3. **Tower HP regions** (`towers` phase) in
+   [`src/vision/ocr.py`](src/vision/ocr.py) (`TOWER_HP_REGIONS`).
+4. **Match timer region** (`timer` phase) in
+   [`src/vision/ocr.py`](src/vision/ocr.py)
    (`MATCH_TIMER_REGION`) — the `m:ss` countdown, used to anchor the match
    clock. Wrong values here are fatal: the env raises rather than run on a
    simulated clock that is ~5s fast.
+5. **Elixir count region** (`elixir` phase) in
+   [`src/vision/elixir.py`](src/vision/elixir.py) (`ELIXIR_DIGIT_REGION`),
+   plus the 11 reference crops the phase writes to
+   `src/assets/templates/elixir/`. The count is *classified* against those
+   crops rather than OCR'd — it is an 11-way choice at a fixed position, so
+   matching is exact and cannot misread. Re-running this phase restamps the
+   region; the reader refuses templates whose stamp disagrees with the
+   committed constant instead of silently reading nothing.
+6. **Lifecycle pixel samples and template images** in
+   [`src/vision/lifecycle.py`](src/vision/lifecycle.py) and
+   [`src/assets/templates/`](src/assets/templates/). These have **no**
+   wizard phase — tune them by hand.
 
-`python -m src.main --calibrate` walks all of these except the lifecycle
-samples and prints the constants to paste in.
+`python -m src.main --calibrate` walks the five wizard phases (1-5) and
+prints the constants to paste in; the lifecycle samples are not covered.
 
-To redo just one constant, name its phase — `viewport` (1), `hand` (2),
-`towers` (3), `timer` (5) — and only that phase runs and only its constant
-is printed:
+To redo just one constant, name its phase — `viewport`, `hand`, `towers`,
+`timer`, or `elixir` — and only that phase runs and only its constant is
+printed:
 
 ```bash
 python -m src.main --calibrate timer      # just MATCH_TIMER_REGION
 python -m src.main --calibrate hand       # just HAND_CARD_POSITIONS
+python -m src.main --calibrate elixir     # region + the 11 reference crops
 ```
 
-An unknown phase name is an error listing the valid ones. The `towers` and
-`timer` phases box in-match HUD elements, so run them with a live match on
-screen. Skipping the `viewport` phase means the other phases measure
+An unknown phase name is an error listing the valid ones. The `towers`,
+`timer` and `elixir` phases box in-match HUD elements, so run them with a
+live match on screen. The `elixir` phase additionally needs you to play a
+while: it wants one labelled crop for each value 0-10, taken by keypress as
+the counter passes through them. Skipping the `viewport` phase means the other phases measure
 against the committed `WINDOW_CROP_*` crop (the same frame the bot sees at
 runtime), so re-run `viewport` first if the window size or theme changed.
 
@@ -93,11 +144,11 @@ while you tune.
 ## Plug in a custom policy
 
 ```python
-from src.environment import ClashEnv
-from src.actions import Action
+from src.env.environment import ClashEnv
+from src.env.actions import Action
 
 def my_policy(obs):
-    # obs is a dict of numpy arrays. See observation.py for shapes.
+    # obs is a dict of numpy arrays. See src/env/observation.py for shapes.
     # Return: Action(hand_index, tile_x, tile_y), or an int index, or
     # Action.no_op().
     ...
@@ -110,8 +161,28 @@ while not done:
 env.close()
 ```
 
-For imitation learning, record with `--record` (bot play) or
-`--record-human` (your own play); both write the format below.
+## Imitation learning
+
+Record with `--record` (bot play) or `--record-human` (your own play);
+both write the format below.
+
+```bash
+# 1. Record your own play in BlueStacks (drag-style placement only)
+python -m src.main --record-human demos/run.jsonl --episodes 10
+
+# 2. Train the factored-head policy on the demos
+python -m src.imitation.train demos/run.jsonl --out models/imitation.pt
+
+# 3. Run the trained checkpoint
+python -m src.main --policy imitation --weights models/imitation.pt
+```
+
+The model is **not** one 577-way softmax: a shared MLP trunk feeds
+separate play / slot / tile heads, and
+[`src/imitation/policy.py`](src/imitation/policy.py) masks unaffordable
+slots and unplaceable tiles at inference time. Checkpoints carry the
+observation `schema_hash`, so a checkpoint trained on one schema refuses
+to load against another.
 
 ## Observation schema
 
@@ -122,7 +193,7 @@ For imitation learning, record with `--record` (bot play) or
 | `hand`          | (4, V)               | one-hot card identity per slot           |
 | `hand_costs`    | (4,)                 | elixir cost per slot                     |
 | `hand_playable` | (4,)                 | 1 where elixir >= cost, 0 elsewhere      |
-| `elixir`        | scalar               | 0-10                                     |
+| `elixir`        | scalar               | 0-10, read from the HUD count             |
 | `match_time`    | scalar               | seconds elapsed, timer-anchored, cap 300 |
 | `time_norm`     | scalar               | match_time / 300                         |
 | `phase_onehot`  | (4,)                 | normal / double / ot_d / ot_t            |
@@ -169,15 +240,18 @@ one action per step silently drops or mis-attributes the extras.
 
 Discrete: `1 + 4 * 9 * 16 = 577` choices. Index 0 is NO_OP; the rest
 enumerate `(hand_index, tile_y, tile_x)`. Use ``index_to_action`` and
-``action_to_index`` in [`src/actions.py`](src/actions.py) to convert.
+``action_to_index`` in [`src/env/actions.py`](src/env/actions.py) to convert.
 
 ## Roadmap
 
 Items still owned by future iterations (ordered roughly by impact):
 
 - Tighten lifecycle detection with real template assets.
-- Replace OCR tower HP with a fine-tuned digit classifier (faster + more
-  reliable than Tesseract).
+- Replace OCR tower HP with a fine-tuned digit classifier. EasyOCR fixed
+  the *wrong*-value problem that made Tesseract unusable here, but it still
+  only reads a tower's number on roughly a third to a half of frames, and
+  destruction is inferred from a long run of misses rather than observed.
+  A classifier would be both faster and more consistently readable.
 - Detect the "up next" card identity, not just filter it out, so the
   policy can plan ahead.
 - Train a baseline policy (PPO on the flat observation, or behavior
