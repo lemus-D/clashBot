@@ -99,15 +99,29 @@ speculatively generalize for cases that don't exist yet.)
   inference-time masking of unaffordable slots and unplaceable tiles.
   PyTorch; this machine has an RTX 4070 — use the cu128 CUDA build, at the
   torch version torchvision pins (see requirements.txt for the command).
+- Crown score: `src/vision/crowns.py` reads how many crowns each side won off
+  the POSTMATCH screen, once per match, and `GameState.set_final_crowns`
+  overwrites the mid-match inferred tally with it (that tally comes from
+  tower-destruction debouncing and drifts). Crowns are counted as connected
+  GOLD BLOBS, not fixed slot positions, because the winner's row is drawn
+  larger. Rows do NOT move — friendly/blue is always the bottom one — so each
+  region is one fixed side; boxing them in the wrong order during calibration
+  transposes the score. Cushion colour (magenta=enemy, blue=friendly) is
+  checked only to confirm the frame really is the postmatch screen, which is
+  what keeps a crown score from being read off an in-match frame if the
+  lifecycle state is wrong. Terminal reward scales with the crown margin
+  (`TERMINAL_BASE_REWARD` +/- `CROWN_MARGIN_REWARD` per crown): a 3-crown win
+  pays +14, a 1-crown win +10.
 - Entry point: `src/main.py` — CLI driver: `RandomPolicy`, `--debug`,
   `--record`, `--record-human`, `--calibrate`.
 - Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
 - Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
   positions, tower HP-bar regions, match timer region, elixir digit region,
-  lifecycle samples). Keep them centralized there.
-- `src/calibrate.py` has five phases, selectable individually by name
-  (`viewport` / `hand` / `towers` / `timer` / `elixir`); bare `--calibrate`
-  runs all five. Phases 2-5 report fractions of the CROPPED viewport, so when
+  postmatch crown rows, lifecycle samples). Keep them centralized there.
+- `src/calibrate.py` has six phases, selectable individually by name
+  (`viewport` / `hand` / `towers` / `timer` / `crowns` / `elixir`); bare
+  `--calibrate` runs all six. `crowns` is the one phase wanting the POSTMATCH
+  screen rather than a live match. Phases 2-6 report fractions of the CROPPED viewport, so when
   `viewport` is skipped the frame comes from `ScreenCapture` with the committed
   `WINDOW_CROP_*` — never from the raw window grab, or every fraction is wrong.
   `elixir` is the only phase that also WRITES files (the reference crops), and

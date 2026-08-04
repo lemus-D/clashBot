@@ -18,6 +18,7 @@ and match lifecycle.
 | [`src/vision/hud.py`](src/vision/hud.py)           | Shared HUD primitives: fractional crops + glyph isolation   |
 | [`src/vision/elixir.py`](src/vision/elixir.py)     | Elixir count read by matching 11 reference crops (no OCR)   |
 | [`src/vision/towers.py`](src/vision/towers.py)     | Tower HP as HP-bar fill fraction (no OCR)                   |
+| [`src/vision/crowns.py`](src/vision/crowns.py)     | Final crown score read off the postmatch screen             |
 
 **Game model** — what the pixels mean:
 
@@ -111,7 +112,12 @@ in the codebase; the hot spots are:
    (`MATCH_TIMER_REGION`) — the `m:ss` countdown, used to anchor the match
    clock. Wrong values here are fatal: the env raises rather than run on a
    simulated clock that is ~5s fast.
-5. **Elixir count region** (`elixir` phase) in
+5. **Postmatch crown rows** (`crowns` phase) in
+   [`src/vision/crowns.py`](src/vision/crowns.py) (`CROWN_ROW_REGIONS`). Box
+   each row of crown slots snugly — a crown must clear a fraction of the box
+   area, so an oversized box can hide real crowns. This is the one phase that
+   needs the **postmatch** screen rather than a live match.
+6. **Elixir count region** (`elixir` phase) in
    [`src/vision/elixir.py`](src/vision/elixir.py) (`ELIXIR_DIGIT_REGION`),
    plus the 11 reference crops the phase writes to
    `src/assets/templates/elixir/`. The count is *classified* against those
@@ -119,16 +125,16 @@ in the codebase; the hot spots are:
    matching is exact and cannot misread. Re-running this phase restamps the
    region; the reader refuses templates whose stamp disagrees with the
    committed constant instead of silently reading nothing.
-6. **Lifecycle pixel samples and template images** in
+7. **Lifecycle pixel samples and template images** in
    [`src/vision/lifecycle.py`](src/vision/lifecycle.py) and
    [`src/assets/templates/`](src/assets/templates/). These have **no**
    wizard phase — tune them by hand.
 
-`python -m src.main --calibrate` walks the five wizard phases (1-5) and
+`python -m src.main --calibrate` walks the six wizard phases (1-6) and
 prints the constants to paste in; the lifecycle samples are not covered.
 
 To redo just one constant, name its phase — `viewport`, `hand`, `towers`,
-`timer`, or `elixir` — and only that phase runs and only its constant is
+`timer`, `crowns`, or `elixir` — and only that phase runs and only its constant is
 printed:
 
 ```bash

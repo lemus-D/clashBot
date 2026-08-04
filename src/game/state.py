@@ -165,6 +165,15 @@ class GameState:
 
         self.crowns_friendly: int = 0
         self.crowns_enemy: int = 0
+        # Crowns as read off the postmatch screen, once per match. None until
+        # that screen has been read; kept alongside the inferred counts above
+        # rather than replacing them so a recording shows both.
+        self.final_crowns_friendly: Optional[int] = None
+        self.final_crowns_enemy: Optional[int] = None
+        # What tower-destruction inference believed at the moment the
+        # postmatch screen corrected it. None until that happens.
+        self.inferred_crowns_friendly: Optional[int] = None
+        self.inferred_crowns_enemy: Optional[int] = None
         self.match_result: Optional[MatchResult] = None
         self._destroyed_towers: set[str] = set()
         # How many times each tower's HP has been read this match. Absence of a
@@ -196,6 +205,10 @@ class GameState:
         self.match_result = None
         self.crowns_friendly = 0
         self.crowns_enemy = 0
+        self.final_crowns_friendly = None
+        self.final_crowns_enemy = None
+        self.inferred_crowns_friendly = None
+        self.inferred_crowns_enemy = None
         for k in TOWER_KEYS:
             self.tower_hp[k] = DEFAULT_TOWER_HP[k]
             self._missing_reads[k] = 0
@@ -498,6 +511,45 @@ class GameState:
 
     def set_match_result(self, result: MatchResult) -> None:
         self.match_result = result
+
+    def set_final_crowns(self, friendly: int, enemy: int) -> None:
+        """Adopt the crown counts read off the postmatch screen as truth.
+
+        These OVERWRITE ``crowns_friendly`` / ``crowns_enemy``, which until
+        this point are inferred from tower-destruction debouncing and are
+        known to drift: a fight covering a tower's HP bar can register a
+        destruction that is later retracted, and the running tally moves
+        with it. The postmatch screen is the same thing a human reads, so
+        where the two disagree, it wins.
+
+        Recorded separately as well, because "what we believed during the
+        match" and "what actually happened" are different facts and a
+        recording that keeps only the corrected value hides how far the
+        inference was off.
+        """
+        for name, value in (("friendly", friendly), ("enemy", enemy)):
+            if not 0 <= value <= 3:
+                raise ValueError(
+                    f"Final {name} crown count must be 0-3, got {value}; a "
+                    "match cannot award more than three crowns"
+                )
+        self.final_crowns_friendly = friendly
+        self.final_crowns_enemy = enemy
+        # Snapshot what inference believed BEFORE overwriting it. The gap
+        # between the two is the only measure of how far the absence-based
+        # tower destruction logic drifts, and overwriting in place would
+        # destroy it - the record would show the corrected value twice and
+        # look like the inference had been right all along.
+        self.inferred_crowns_friendly = self.crowns_friendly
+        self.inferred_crowns_enemy = self.crowns_enemy
+        if (friendly, enemy) != (self.crowns_friendly, self.crowns_enemy):
+            print(
+                f"Final crowns from the postmatch screen: {friendly}-{enemy} "
+                f"(tower inference had {self.crowns_friendly}-"
+                f"{self.crowns_enemy}) - correcting"
+            )
+        self.crowns_friendly = friendly
+        self.crowns_enemy = enemy
 
     # ----- formatting -----
 

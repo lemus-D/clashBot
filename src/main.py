@@ -148,8 +148,22 @@ def run_episode(env: ClashEnv, policy: Callable[[dict], Action], debug: bool) ->
     print(
         f"Episode complete: reward={total_reward:.2f} | "
         f"result={env.state.match_result} | "
+        f"crowns={_crown_summary(env.state)} | "
         f"steps={info.get('step', '?')}"
     )
+
+
+def _crown_summary(state) -> str:
+    """``"2-1"`` from the postmatch screen, or ``"2-1?"`` when that screen
+    could not be read and the figure is still tower-destruction inference.
+
+    The distinction is worth a character: the inferred count drifts, so a
+    summary that presented both identically would hide which episodes have
+    a trustworthy score.
+    """
+    if state.final_crowns_friendly is not None:
+        return f"{state.final_crowns_friendly}-{state.final_crowns_enemy}"
+    return f"{state.crowns_friendly}-{state.crowns_enemy}?"
 
 
 def run() -> None:

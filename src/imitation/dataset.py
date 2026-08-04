@@ -96,7 +96,11 @@ def _read_streams(path: str, flat_size: int) -> tuple[list[dict], list[dict]]:
                 actions.append(rec)
             # Anything else is an auxiliary stream this trainer has no use
             # for — currently {"type": "diag"} lifecycle diagnostics, which
-            # every --debug run writes. Skipped, not an error: auxiliary
+            # every --debug run writes, and one {"type": "result"} per
+            # episode carrying the final crown score. Skipped, not an error:
+            # note the result line is deliberately NOT training input — its
+            # crowns come from the postmatch screen and so postdate every
+            # observation in the episode. Auxiliary
             # line types are additive by design (they leave obs/act lines
             # untouched, hence no record_format bump), so refusing them
             # would break training on files that are perfectly valid. The

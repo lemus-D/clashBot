@@ -7,14 +7,17 @@ Usage::
     # or directly:
     python -m src.calibrate [PHASE]
 
-Five phases, run in order by default (follow the on-screen prompts;
+Six phases, run in order by default (follow the on-screen prompts;
 rectangles are two clicks, top-left then bottom-right):
   1. ``viewport`` — mark the game viewport rectangle on the raw window.
   2. ``hand``     — click the centre of each of the four hand-card slots.
   3. ``towers``   — mark each tower's HP-BAR rectangle (6 total). The bar,
      not the number: HP is read as the bar's fill fraction.
   4. ``timer``    — mark the "m:ss" match countdown rectangle.
-  5. ``elixir``   — mark the elixir count, then capture one labelled
+  5. ``crowns``   — mark the two crown rows on the POSTMATCH screen, used
+     to read the final crown score. Needs the postmatch screen up, so it
+     is the one phase that does NOT want a live match.
+  6. ``elixir``   — mark the elixir count, then capture one labelled
      reference crop per value (0-10) by keypress. This phase is the only
      one that both prints a constant AND writes files:
      ``src/assets/templates/elixir/``.
@@ -23,11 +26,12 @@ Any single phase can be run on its own by name, so re-calibrating one
 constant does not mean redoing the others. Only the constants for the
 phases actually run are printed.
 
-Phases 3-5 read in-match HUD elements, so they need a live match on
-screen; phases 1 and 2 do not (the hand is visible in-match only, but its
-slots do not move, so the menu is fine for phase 1).
+Phases 3, 4 and 6 read in-match HUD elements, so they need a live match on
+screen. Phase 5 (``crowns``) is the exception: it needs the POSTMATCH
+screen instead. Phases 1 and 2 need neither (the hand is visible in-match
+only, but its slots do not move, so the menu is fine for phase 1).
 
-Phases 2-5 report fractions of the *cropped* game viewport, not of the raw
+Phases 2-6 report fractions of the *cropped* game viewport, not of the raw
 window. When phase 1 runs, that crop is the rectangle just drawn; when it
 is skipped, the frame comes from :class:`ScreenCapture` with the committed
 ``WINDOW_CROP_*`` constants — i.e. byte-for-byte the frame the runtime
@@ -59,7 +63,9 @@ _WIN = "clashBot calibration"
 
 # Phase names accepted by :func:`calibrate`, in run order. "all" is also
 # accepted and means every one of them.
-PHASE_NAMES: tuple[str, ...] = ("viewport", "hand", "towers", "timer", "elixir")
+PHASE_NAMES: tuple[str, ...] = (
+    "viewport", "hand", "towers", "timer", "crowns", "elixir",
+)
 ALL_PHASES = "all"
 
 
@@ -315,7 +321,7 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
         cropped = frame_raw[tl[1]:br[1], tl[0]:br[0]]
 
     if cropped is None and any(
-        p in ("hand", "towers", "timer", "elixir") for p in phases
+        p in ("hand", "towers", "timer", "elixir", "crowns") for p in phases
     ):
         # Phase 1 was skipped: the remaining phases still need the viewport,
         # so take it the way the runtime does.
@@ -331,6 +337,7 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
     tower_regions: dict[str, tuple[float, float, float, float]] | None = None
     timer_region: tuple[float, float, float, float] | None = None
     elixir_region: tuple[float, float, float, float] | None = None
+    crown_regions: dict[str, tuple[float, float, float, float]] | None = None
 
     if cropped is not None:
         ch, cw = cropped.shape[:2]
@@ -371,6 +378,23 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
                 cropped, "Match timer region (m:ss, in-match only)"
             )
             timer_region = _fractions(t_tl, t_br, cw, ch)
+
+        if "crowns" in phases:
+            # Phase 5: the two postmatch crown rows. Needs the POSTMATCH
+            # screen on display, not a live match. The blue/friendly side is
+            # always the bottom row, so the side is fixed per region; boxing
+            # them in the wrong order would transpose the score.
+            print("\nPhase 6 (crowns): drag a box around each row of crown"
+                  " slots on the POSTMATCH screen (top row, then bottom)")
+            print("  Box each row snugly: a crown must clear a fraction of the"
+                  " box area, so an oversized box can hide real crowns.")
+            crown_regions = {}
+            for side, where in (("enemy", "TOP"), ("friendly", "BOTTOM")):
+                c_tl, c_br = _collect_rect(
+                    cropped,
+                    f"Crown row: {side} ({where} row, all 3 slots, snug)",
+                )
+                crown_regions[side] = _fractions(c_tl, c_br, cw, ch)
 
         if "elixir" in phases:
             # Phase 5a: elixir counter region — the box the reference crops
@@ -426,6 +450,14 @@ def calibrate(window_title: str, phase: str = ALL_PHASES) -> None:
             "MATCH_TIMER_REGION: tuple[float, float, float, float] = "
             f"({xf:.4f}, {yf:.4f}, {wf:.4f}, {hf:.4f})"
         )
+
+    if crown_regions is not None:
+        print("# src/vision/crowns.py")
+        print("CROWN_ROW_REGIONS: dict[str, tuple[float, float, float, float]] = {")
+        for key, (xf, yf, wf, hf) in crown_regions.items():
+            print(f'    "{key}": ({xf:.4f}, {yf:.4f}, {wf:.4f}, {hf:.4f}),')
+        print("}")
+        print()
 
     if elixir_region is not None:
         xf, yf, wf, hf = elixir_region

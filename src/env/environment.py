@@ -14,9 +14,9 @@ Each ``step`` does a full perception cycle (capture -> infer -> update
 board, state, lifecycle, towers), executes the action, and returns a
 fresh observation plus a reward.
 
-The default reward is ``delta_enemy_hp - delta_friendly_hp`` per step
-plus ``+10/-10`` on win/loss. Pass a custom ``reward_fn`` if you want
-shaped rewards.
+The default reward is ``delta_enemy_hp - delta_friendly_hp`` per step plus
+a crown-scaled terminal bonus on win/loss (a 3-crown win pays more than a
+1-crown one). Pass a custom ``reward_fn`` if you want shaped rewards.
 
 Optional ``record_path`` writes a JSONL recording suitable for
 imitation learning. Observations and actions are two *separate*
@@ -31,9 +31,15 @@ the nearest observation preceding its timestamp. See
 A recording run also emits one ``{"type": "diag"}`` line per perception
 cycle holding the raw lifecycle decision inputs (elixir magenta
 fraction, template scores, banner pixel and colour distances, and which
-code path produced the verdict). It is a separate line type, not extra
-observation fields, so the observation schema hash stays put; readers
-ignore unknown types, so it needs no ``record_format`` bump.
+code path produced the verdict), and one ``{"type": "result"}`` line per
+episode carrying the match outcome plus the crown score read off the
+postmatch screen. Both are separate line types, not extra observation
+fields, so the observation schema hash stays put; readers ignore unknown
+types, so neither needs a ``record_format`` bump.
+
+``result`` is deliberately not observation data: its crowns come from a
+screen that did not exist when the episode's observations were captured,
+so folding them in would leak hindsight into the policy's inputs.
 """
 
 from __future__ import annotations
@@ -64,6 +70,7 @@ from ..vision.lifecycle import (
     TEMPLATE_MATCH_THRESHOLD,
 )
 from .observation import ObservationBuilder, schema_descriptor, schema_hash
+from ..vision.crowns import PostMatchCrownReader
 from ..vision.elixir import ElixirReader
 from ..vision.ocr import MatchTimerReader
 from ..vision.towers import TowerBarReader
@@ -83,6 +90,18 @@ RewardFn = Callable[
 # tower before HP became a fraction.
 TOWER_HP_REWARD_SCALE = 1.5
 
+# Terminal reward: a flat base for the result, plus a per-crown margin term so
+# a 3-0 win is worth more than a 1-0 one. Previously this was a flat +/-10
+# regardless of how decisive the match was, which gave a policy no reason to
+# prefer closing a match out.
+#
+# Ranges: a 1-crown win pays +10 and a 3-crown win +14; losses mirror that at
+# -10 and -14. Deliberately close to the old flat +/-10 so reward magnitudes
+# stay comparable across runs recorded before and after. A draw is equal
+# crowns by definition, so its margin term is 0.
+TERMINAL_BASE_REWARD = 8.0
+CROWN_MARGIN_REWARD = 2.0
+
 
 def default_reward(
     prev_tower_hp: dict[str, float],
@@ -93,14 +112,24 @@ def default_reward(
     """Reward proportional to normalized tower HP swung this step.
 
     ``TOWER_HP_REWARD_SCALE`` per unit of normalized HP taken off enemy
-    towers, the same per unit lost on friendly ones, +/-10 on win/loss,
-    -0.05 for a failed (non-no-op) action.
+    towers, the same per unit lost on friendly ones, a crown-scaled terminal
+    bonus on win/loss, and -0.05 for a failed (non-no-op) action.
 
-    The scale exists because tower HP became a 0.0-1.0 bar fill rather than
-    a raw HP count. At the old 0.001-per-HP rate, destroying a full 1512-HP
-    princess tower paid 1.512; the scale keeps that worth ~1.5 so reward
-    magnitudes - and the +/-10 terminal bonus that should dominate them -
-    stay comparable to runs recorded before the change.
+    The terminal term is ``TERMINAL_BASE_REWARD`` signed by the result plus
+    ``CROWN_MARGIN_REWARD`` per crown of margin, so how decisively a match
+    was won is visible in the reward. It reads the crown counts off
+    ``state``, and ``resolve_done`` overwrites those from the postmatch
+    screen before this runs, so on a normal episode they are the counts a
+    human would read rather than the drifting tower-destruction inference.
+    If that screen could not be read the inferred counts stand; the margin
+    is bounded to +/-3 by the crown counters either way, so a bad count can
+    distort this term but not dominate the episode.
+
+    ``TOWER_HP_REWARD_SCALE`` exists because tower HP became a 0.0-1.0 bar
+    fill rather than a raw HP count. At the old 0.001-per-HP rate,
+    destroying a full 1512-HP princess tower paid 1.512; the scale keeps
+    that worth ~1.5 so per-step magnitudes - and the terminal bonus that
+    should dominate them - stay comparable to earlier runs.
     """
 
     def total(side: str, tower_hp: dict[str, float]) -> float:
@@ -115,10 +144,13 @@ def default_reward(
 
     reward = TOWER_HP_REWARD_SCALE * (delta_enemy - delta_friendly)
 
-    if result == "win":
-        reward += 10.0
-    elif result == "loss":
-        reward -= 10.0
+    if result in ("win", "loss", "draw"):
+        crown_margin = state.crowns_friendly - state.crowns_enemy
+        if result == "win":
+            reward += TERMINAL_BASE_REWARD
+        elif result == "loss":
+            reward -= TERMINAL_BASE_REWARD
+        reward += CROWN_MARGIN_REWARD * crown_margin
 
     if not action_result.success:
         reward -= 0.05
@@ -275,6 +307,34 @@ def diag_record(*, t: float, step: int, signals: LifecycleSignals) -> dict:
     }
 
 
+def result_record(*, t: float, step: int, state: GameState) -> dict:
+    """One end-of-episode line: the match outcome and its crown score.
+
+    A fourth line type rather than fields on the observation lines, for the
+    same reason ``diag`` is separate - obs lines are hashed into the schema
+    contract and stay byte-identical - and for one more: the crown counts
+    here are POST-HOC. They come from the postmatch screen, which did not
+    exist when the earlier observations were captured. Writing them into an
+    observation would hand a policy information it could not have had at
+    that instant, which is exactly the leak imitation learning has to avoid.
+
+    ``final_crowns_*`` are ``None`` when the postmatch screen could not be
+    read, in which case ``crowns_*`` are still the tower-destruction
+    inference. Both are recorded so a reader can tell a trustworthy score
+    from a guessed one instead of assuming.
+    """
+    return {
+        "type": "result",
+        "t": t,
+        "step": step,
+        "match_result": state.match_result,
+        "final_crowns_friendly": state.final_crowns_friendly,
+        "final_crowns_enemy": state.final_crowns_enemy,
+        "inferred_crowns_friendly": state.inferred_crowns_friendly,
+        "inferred_crowns_enemy": state.inferred_crowns_enemy,
+    }
+
+
 def act_record(
     *,
     t: float,
@@ -327,6 +387,7 @@ class ClashEnv:
         self.tower_reader = TowerBarReader()
         self.timer_reader = MatchTimerReader()
         self.elixir_reader = ElixirReader()
+        self.crown_reader = PostMatchCrownReader()
         self.observer = ObservationBuilder()
         self.executor = ActionExecutor()
 
@@ -451,6 +512,7 @@ class ClashEnv:
         self._write_diag_record(step=self._step_count + 1, signals=signals)
 
         if done:
+            self._write_result_record(step=self._step_count + 1)
             self.state.end_match(self.state.match_result)
 
         self._step_count += 1
@@ -472,10 +534,17 @@ class ClashEnv:
     def resolve_done(self, signals: LifecycleSignals) -> bool:
         """Adopt a lifecycle-reported result and report whether the
         episode is over. Shared by ``step`` and the human demo recorder
-        so both agree on when a match ends."""
+        so both agree on when a match ends.
+
+        Also reads the crown counts off the postmatch screen, once per
+        match. This runs BEFORE ``step`` computes the step's reward, which
+        is what lets the crown-scaled terminal bonus use the true counts
+        rather than the drifting inferred ones.
+        """
         if signals.state == STATE_POSTMATCH:
             if signals.result and self.state.match_result is None:
                 self.state.set_match_result(signals.result)
+            self._read_final_crowns()
             return True
         if self.state.match_result is not None:
             # Only the lifecycle sets this now, so reaching it means the
@@ -496,6 +565,7 @@ class ClashEnv:
         self.tower_reader.close()
         self.timer_reader.close()
         self.elixir_reader.close()
+        self.crown_reader.close()
         if self.capture is not None:
             self.capture.__exit__(None, None, None)
             self.capture = None
@@ -555,6 +625,24 @@ class ClashEnv:
         if not self.state.clock_anchored:
             self._anchor_clock(frame)
 
+    def _read_final_crowns(self) -> None:
+        """Read the postmatch crown counts once per match.
+
+        Gated on ``final_crowns_friendly`` rather than on the lifecycle
+        state, because POSTMATCH persists for many cycles while the banner
+        is up and this only needs to succeed once. A frame that cannot be
+        interpreted leaves the inferred counts in place and is retried on
+        the next cycle, so a single mid-animation frame costs nothing.
+        """
+        if self.state.final_crowns_friendly is not None:
+            return
+        if self._frame is None:
+            return
+        crowns = self.crown_reader.read(self._frame)
+        if crowns is None:
+            return
+        self.state.set_final_crowns(crowns["friendly"], crowns["enemy"])
+
     def _anchor_clock(self, frame: np.ndarray) -> None:
         """Pin the match clock to the on-screen timer, once per match.
 
@@ -610,6 +698,14 @@ class ClashEnv:
             return
         write_record(
             self._record_file, diag_record(t=self.frame_time, step=step, signals=signals)
+        )
+
+    def _write_result_record(self, step: int) -> None:
+        if self._record_file is None:
+            return
+        write_record(
+            self._record_file,
+            result_record(t=self.frame_time, step=step, state=self.state),
         )
 
     def _write_act_record(
