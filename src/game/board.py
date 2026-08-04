@@ -10,10 +10,13 @@ Empty hand slots and arena tiles are ``None``.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from .cards import Card, Troop, normalize_name
 
+logger = logging.getLogger(__name__)
 
 ARENA_COLS = 9
 ARENA_ROWS = 16
@@ -21,12 +24,29 @@ HAND_SIZE = 4
 
 FRIENDLY_HALF_START_ROW = 8
 
+# These MUST match the detector's class names once the blue/red/card prefix
+# is stripped and ``normalize_name`` is applied, or the troop is silently
+# dropped from the arena tensor. Taken from ``troop-counter/8``'s own class
+# list rather than written by hand: the model says "minion", not "minions",
+# and four plural entries here (archers/goblins/minions/speargoblins) were
+# dead channels that never matched anything while the corresponding troops
+# vanished from every observation.
+#
+# The model ALSO emits "king tower" and "princess tower" as arena objects.
+# They are deliberately excluded, for a reason that is not obvious from the
+# class list: TOWER SKINS change how towers look, so those two classes detect
+# unreliably and cannot be trusted. That also rules out the tempting idea of
+# using a princess tower vanishing from detections as a positive
+# destruction signal - it would inherit the same unreliability. Tower state
+# comes from the HP bar instead (``src/vision/towers.py``), and the towers
+# are static anyway, so channels for them would add 4 x 144 values of no new
+# information. See ``_IGNORED_ARENA_CLASSES``.
 TROOP_CLASSES: tuple[str, ...] = (
-    "goblins",
-    "speargoblins",
+    "goblin",
+    "speargoblin",
     "arrows",
-    "archers",
-    "minions",
+    "archer",
+    "minion",
     "knight",
     "goblinhut",
     "goblincage",
@@ -36,6 +56,15 @@ TROOP_CLASSES: tuple[str, ...] = (
     "minipekka",
     "giant",
 )
+
+# Detector arena classes that are real but intentionally not observation
+# channels. Listed explicitly so they do not trip the unknown-troop warning:
+# an unknown name is a bug, these are a decision.
+_IGNORED_ARENA_CLASSES: frozenset[str] = frozenset({"kingtower", "princesstower"})
+
+# Unencodable troop names already reported, so the warning fires once per
+# distinct name instead of once per tile per frame.
+_warned_unknown_troops: set[str] = set()
 
 _TROOP_INDEX: dict[str, int] = {
     normalize_name(n): i for i, n in enumerate(TROOP_CLASSES)
@@ -211,8 +240,16 @@ class GameBoard:
         """One-hot encode the arena as ``(ARENA_ROWS, ARENA_COLS, channels)``.
 
         Channels = ``len(TROOP_CLASSES) * 2`` (blue/friendly first half,
-        red/enemy second half). Unknown troop names are silently ignored
-        rather than crashing - they show up as all-zero tile vectors.
+        red/enemy second half).
+
+        A troop whose name is not in ``TROOP_CLASSES`` cannot be encoded, so
+        it is omitted - but it is WARNED about once per distinct name, not
+        dropped quietly. Silence here hid a real bug: the detector emits
+        singular names ("minion") while this tuple held plurals ("minions"),
+        so four of the most common units never appeared in any observation
+        while the arena - 3744 of the 3963 values in the flattened vector -
+        looked merely empty. Classes in ``_IGNORED_ARENA_CLASSES`` are
+        excluded from the warning because omitting them is a decision.
         """
         n_classes = len(TROOP_CLASSES)
         tensor = np.zeros((ARENA_ROWS, ARENA_COLS, n_classes * 2), dtype=np.float32)
@@ -221,12 +258,28 @@ class GameBoard:
                 troop = self.troops_in_arena[y][x]
                 if troop is None:
                     continue
-                idx = _TROOP_INDEX.get(normalize_name(troop.name))
+                key = normalize_name(troop.name)
+                idx = _TROOP_INDEX.get(key)
                 if idx is None:
+                    self._warn_unknown_troop(troop.name, key)
                     continue
                 offset = 0 if troop.color == "blue" else n_classes
                 tensor[y, x, offset + idx] = 1.0
         return tensor
+
+    @staticmethod
+    def _warn_unknown_troop(name: str, key: str) -> None:
+        """Warn once per distinct unencodable troop name."""
+        if key in _IGNORED_ARENA_CLASSES or key in _warned_unknown_troops:
+            return
+        _warned_unknown_troops.add(key)
+        logger.warning(
+            "Troop '%s' (normalized '%s') is not in TROOP_CLASSES - it is "
+            "being LEFT OUT of the arena observation entirely. The detector "
+            "and TROOP_CLASSES disagree; fix the name list.",
+            name,
+            key,
+        )
 
     def hand_to_tensor(self) -> np.ndarray:
         """One-hot encode the hand as ``(HAND_SIZE, len(TROOP_CLASSES))``."""

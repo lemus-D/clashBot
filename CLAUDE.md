@@ -60,6 +60,18 @@ speculatively generalize for cases that don't exist yet.)
   disagrees with `ELIXIR_DIGIT_REGION` raises rather than reading nothing.
 - Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
   `state.py` (time, elixir, tower HP, crowns), `cards.py`.
+- NAMING CONTRACT: `TROOP_CLASSES` (board.py) and `CARD_COSTS` (cards.py) keys
+  MUST equal the Roboflow model's class names with the `blue`/`red`/`card`
+  prefix stripped and `normalize_name` applied. The model uses SINGULAR names
+  (`card minion`, not `card minions`). A mismatch is silent in effect and was
+  a real bug: four plural entries meant Minions/Archers/Spear Goblins/Goblins
+  never entered the arena tensor at all. Both sides now warn once per distinct
+  unknown name. To re-derive the list, read `get_model(...).class_names` — do
+  not hand-write it. `king tower` / `princess tower` are real model classes
+  deliberately excluded via `_IGNORED_ARENA_CLASSES`: tower SKINS change how
+  towers look, so those two detect unreliably. Don't add them, and don't try
+  to use a princess tower vanishing from detections as a destruction signal —
+  same unreliability. Tower state comes from the HP bar.
 - Match clock: elixir is simulated but time is NOT trusted to simulation. The
   match is detected from the elixir bar, which is already up during the 3-2-1
   countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`

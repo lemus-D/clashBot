@@ -8,7 +8,14 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS
+from ..game.board import (
+    GameBoard,
+    ARENA_COLS,
+    ARENA_ROWS,
+    _IGNORED_ARENA_CLASSES,
+    _TROOP_INDEX,
+)
+from ..game.cards import normalize_name
 from ..game.state import GameState
 
 TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -16,6 +23,14 @@ TEXT_SCALE = 0.6
 TEXT_COLOR = (0, 255, 0)
 TEXT_THICKNESS = 2
 TEXT_LINE_HEIGHT = 24
+
+# Troop markers. Friendly/enemy follow the detector's own blue/red naming.
+# DROPPED is for a troop the detector found but the observation cannot encode
+# - a name missing from TROOP_CLASSES. It should never appear; when it does,
+# that troop is absent from the arena tensor.
+FRIENDLY_TROOP_COLOR = (255, 160, 0)
+ENEMY_TROOP_COLOR = (60, 60, 255)
+DROPPED_COLOR = (0, 255, 255)
 
 # Perceived tower HP, top row first so it reads in screen order (enemy
 # towers are at the top of the frame).
@@ -53,6 +68,42 @@ def draw_tile_grid(frame: np.ndarray, game_board: GameBoard) -> np.ndarray:
                     1,
                 )
     return frame
+
+
+def draw_troops(frame: np.ndarray, board: GameBoard) -> tuple[int, int]:
+    """Mark every detected troop on its tile. Returns (encoded, dropped).
+
+    This exists because the arena tensor is the largest part of the
+    observation and was, until now, completely invisible: a troop whose name
+    the encoder did not recognise was skipped, and the result looked
+    identical to an empty arena. A name that cannot be encoded is drawn in
+    ``DROPPED_COLOR`` with a ``?``, so "the detector sees it but the
+    observation does not" is something you can see rather than infer.
+    """
+    encoded = dropped = 0
+    for y in range(ARENA_ROWS):
+        for x in range(ARENA_COLS):
+            troop = board.troops_in_arena[y][x]
+            if troop is None:
+                continue
+            key = normalize_name(troop.name)
+            if key in _IGNORED_ARENA_CLASSES:
+                continue
+            in_obs = key in _TROOP_INDEX
+            if in_obs:
+                encoded += 1
+                color = FRIENDLY_TROOP_COLOR if troop.color == "blue" else ENEMY_TROOP_COLOR
+                label = key[:6]
+            else:
+                dropped += 1
+                color = DROPPED_COLOR
+                label = f"?{key[:6]}"
+            cx = int((x + 0.5) * board.tile_width)
+            cy = int((y + 0.5) * board.tile_height)
+            cv2.circle(frame, (cx, cy), 5, color, -1)
+            cv2.putText(frame, label, (cx - 18, cy - 8),
+                        TEXT_FONT, 0.35, color, 1)
+    return encoded, dropped
 
 
 def draw_text_lines(frame: np.ndarray, lines: list[str], top_y: int) -> None:
@@ -96,10 +147,18 @@ def render_debug_overlay(
     """Annotate a captured frame with the tile grid and status text."""
     out = frame.copy()
     out = draw_tile_grid(out, board)
+    encoded, dropped = draw_troops(out, board)
 
     lines = [state.get_status_string()]
     if lifecycle_state is not None:
         lines.append(f"Lifecycle: {lifecycle_state}")
+    # Whether the arena tensor is actually being populated. "dropped" above 0
+    # means the detector and TROOP_CLASSES disagree and those troops are
+    # missing from the observation.
+    troop_line = f"Troops: {encoded} in obs"
+    if dropped:
+        troop_line += f"  |  {dropped} DROPPED (not in TROOP_CLASSES)"
+    lines.append(troop_line)
     draw_text_lines(out, lines, top_y=30)
 
     # Bottom-left, above the frame edge: clear of the status stack at the
