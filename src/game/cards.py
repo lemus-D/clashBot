@@ -43,6 +43,33 @@ CARD_COSTS: dict[str, int] = {
 }
 
 
+# Which cards are SPELLS. Like costs, the detector cannot tell us this, so it
+# is hand-maintained and validated against CARD_CLASSES below.
+#
+# It exists because spells obey a different placement rule: a troop may only
+# be deployed on your own half (plus a lane opened by a destroyed tower), but
+# a spell may be cast ANYWHERE in the arena. Without this distinction the
+# single ``playable_mask`` confined Fireball and Arrows to the friendly half,
+# where they can never hit an enemy tower - so a policy would correctly learn
+# that two of its twelve cards are useless.
+SPELL_CARDS: frozenset[str] = frozenset({"arrows", "fireball"})
+
+
+def is_spell(name: str) -> bool:
+    return normalize_name(name) in SPELL_CARDS
+
+
+def _validate_spells() -> None:
+    """Spells must be real cards, or the placement rule keys off nothing."""
+    unknown = sorted(SPELL_CARDS - set(CARD_CLASSES))
+    if unknown:
+        raise ValueError(
+            f"SPELL_CARDS names cards the detector has no class for: "
+            f"{unknown!r}. Either the manifest is stale (regenerate with "
+            f"`python -m src.main --derive-classes`) or these are typos."
+        )
+
+
 def _validate_costs() -> None:
     """Every card the detector can see must have a cost, and vice versa.
 
@@ -68,6 +95,7 @@ def _validate_costs() -> None:
 
 
 _validate_costs()
+_validate_spells()
 
 
 # Unknown names already reported. A card sits in the hand for many seconds

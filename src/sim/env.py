@@ -27,7 +27,7 @@ import numpy as np
 from ..env.actions import Action, ActionResult
 from ..env.observation import ObservationBuilder
 from ..game.board import ARENA_COLS, ARENA_ROWS, GameBoard, HAND_SIZE
-from ..game.cards import Card, Troop, get_card_cost
+from ..game.cards import Card, Troop, get_card_cost, is_spell
 from ..game.classes import CARD_CLASSES
 from ..game.state import TOWER_KEYS
 from . import engine
@@ -327,7 +327,7 @@ class SimEnv:
         name = self._deck.hand[action.hand_index]
         if self.sim.elixir[True] + 1e-6 < get_card_cost(name):
             return ActionResult(success=False, reason="not_enough_elixir")
-        if not self.sim.is_placeable(True, action.tile_x, action.tile_y):
+        if not self.sim.is_placeable(True, action.tile_x, action.tile_y, name=name):
             return ActionResult(success=False, reason="tile_not_placeable")
 
         if not self.sim.deploy(True, name, action.tile_x, action.tile_y):
@@ -346,7 +346,9 @@ class SimEnv:
             elixir=self.sim.elixir[False],
             time=self.sim.time,
             phase=self.sim.phase(),
-            can_place=lambda tx, ty: self.sim.is_placeable(False, *_mirror(tx, ty)),
+            can_place=lambda tx, ty, name=None: self.sim.is_placeable(
+                False, *_mirror(tx, ty), name=name
+            ),
         )
 
     def _apply_opponent(self) -> None:

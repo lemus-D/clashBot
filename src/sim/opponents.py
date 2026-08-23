@@ -53,7 +53,15 @@ class OpponentView:
         return get_card_cost(name)
 
     def affordable(self, *, exclude_spells: bool = True) -> list[int]:
-        """Hand slots this opponent can pay for right now, cheapest first."""
+        """Hand slots this opponent can pay for right now, cheapest first.
+
+        Spells are skipped by DEFAULT because these three bots are
+        deliberately simple, not because spells are unusable - they are
+        castable anywhere as of the placement fix. Aiming one well needs to
+        know where the enemy has clumped, which is more judgement than a
+        fixed yardstick should have. Pass ``exclude_spells=False`` if a
+        future opponent wants them.
+        """
         slots = [
             i for i, name in enumerate(self.hand)
             if self.cost(name) <= self.elixir + 1e-6

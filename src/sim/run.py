@@ -17,7 +17,7 @@ import time
 import numpy as np
 
 from ..env.actions import Action
-from ..game.board import HAND_SIZE
+from ..game.board import ARENA_COLS, ARENA_ROWS, HAND_SIZE
 from .env import STEP_PERIOD_SEC, ObservationNoise, SimEnv
 from .opponents import OPPONENTS, make_opponent
 from .units import stats_confidence_report
@@ -43,11 +43,19 @@ class RandomSimPolicy:
         if self.rng.random() < self.no_op_prob:
             return Action.no_op()
         slots = [i for i in range(HAND_SIZE) if obs["hand_playable"][i] > 0]
+        if not slots:
+            return Action.no_op()
+        slot = self.rng.choice(slots)
+        # Slot first, then the mask it implies - spells are not confined to
+        # the friendly half.
+        if obs["hand_is_spell"][slot] > 0:
+            return Action(slot, self.rng.randrange(ARENA_COLS),
+                          self.rng.randrange(ARENA_ROWS))
         tiles = np.argwhere(obs["playable_mask"] > 0)
-        if not slots or len(tiles) == 0:
+        if len(tiles) == 0:
             return Action.no_op()
         ty, tx = tiles[self.rng.randrange(len(tiles))]
-        return Action(self.rng.choice(slots), int(tx), int(ty))
+        return Action(slot, int(tx), int(ty))
 
 
 def make_env(args) -> SimEnv:

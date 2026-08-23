@@ -58,12 +58,18 @@ class RandomPolicy:
         if not valid_slots:
             return Action.no_op()
 
+        slot = self.rng.choice(valid_slots)
+        # Resolve the slot BEFORE masking tiles: a spell may be cast anywhere,
+        # a troop only where playable_mask allows.
+        if obs["hand_is_spell"][slot] > 0:
+            tile_y = self.rng.randrange(ARENA_ROWS)
+            tile_x = self.rng.randrange(ARENA_COLS)
+            return Action(hand_index=int(slot), tile_x=tile_x, tile_y=tile_y)
+
         mask = obs["playable_mask"]
         valid_tiles = np.argwhere(mask > 0)
         if len(valid_tiles) == 0:
             return Action.no_op()
-
-        slot = self.rng.choice(valid_slots)
         ty, tx = valid_tiles[self.rng.randrange(len(valid_tiles))]
         return Action(hand_index=int(slot), tile_x=int(tx), tile_y=int(ty))
 

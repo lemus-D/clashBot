@@ -24,6 +24,7 @@ from typing import Optional
 
 import pyautogui
 
+from ..game.cards import is_spell
 from ..game.board import GameBoard, ARENA_COLS, ARENA_ROWS, HAND_SIZE
 from ..game.state import GameState
 
@@ -157,6 +158,7 @@ class ActionExecutor:
             enemy_left_tower_alive=state.is_enemy_left_alive(),
             enemy_right_tower_alive=state.is_enemy_right_alive(),
             enemy_king_active=state.is_enemy_king_active(),
+            spell=is_spell(card.name),
         ):
             return ActionResult(success=False, reason="tile not placeable")
 

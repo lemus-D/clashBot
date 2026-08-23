@@ -88,6 +88,21 @@ speculatively generalize for cases that don't exist yet.)
     look, so those two detect unreliably. Don't add them, and don't try to
     use a princess tower vanishing from detections as a destruction signal —
     same unreliability. Tower state comes from the HP bar.
+- SPELL PLACEMENT: troops may only be deployed on the friendly half (plus a
+  lane opened by a destroyed tower); SPELLS may be cast ANYWHERE. The rule
+  lives in `GameBoard.is_placeable(..., spell=...)`, and which cards are
+  spells is hand-maintained in `cards.py` as `SPELL_CARDS` (validated against
+  `CARD_CLASSES` at import) - the detector cannot tell you, same as cost.
+  - The observation carries the TROOP mask plus a per-slot `hand_is_spell`
+    (4,) flag, not four full 144-tile masks: spell-vs-troop is the only
+    card-dependent rule, so 4 floats say what 4x144 would.
+  - Anything that masks tile choices MUST resolve the slot FIRST, then pick
+    the mask. Masking tiles before knowing the slot forbids every legal
+    spell target on the enemy half, which is exactly the bug this replaced:
+    `playable_mask` was the only gate, so Fireball and Arrows could never
+    reach an enemy tower and a policy would correctly have learned that two
+    of its twelve cards were worthless. See `imitation/policy.py` and both
+    RandomPolicy implementations for the ordering.
 - Match clock: elixir is simulated but time is NOT trusted to simulation. The
   match is detected from the elixir bar, which is already up during the 3-2-1
   countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`
@@ -195,14 +210,10 @@ speculatively generalize for cases that don't exist yet.)
     - Self-play and a frozen-checkpoint league are still to come; sample the
       pool per episode rather than graduating through it, or the policy
       forgets how to beat the simple ones.
-  - KNOWN FIDELITY GAP: spells cannot be cast on the enemy half. `deploy`
-    checks `is_placeable`, and `playable_mask` restricts to the friendly
-    half - which is right for troops and WRONG for spells, which in the real
-    game can be aimed anywhere. So Fireball/Arrows can currently only hit
-    your own side, and a policy will correctly learn they are useless.
-    Fixing it means changing `playable_mask` semantics in the REAL env too,
-    so it is a schema change and deliberately not done yet. Scripted
-    opponents skip spells for this reason.
+  - Scripted opponents do not use spells. That is a simplicity choice, not
+    a limitation - aiming one well needs to know where the enemy has
+    clumped, which is more judgement than a fixed yardstick should have.
+    `OpponentView.affordable(exclude_spells=False)` opts in.
   - `python -m src.sim.run --watch` is the visual debugger: TRUTH on the
     left, OBSERVED (post-noise, what the policy actually gets) on the right.
     Noise events are RECORDED by `env.py`, never inferred by comparing the

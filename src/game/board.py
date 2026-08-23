@@ -14,7 +14,7 @@ import logging
 
 import numpy as np
 
-from .cards import Card, Troop
+from .cards import Card, Troop, is_spell
 from .classes import (
     ARENA_CLASSES,
     ARENA_INDEX,
@@ -95,16 +95,23 @@ class GameBoard:
         enemy_left_tower_alive: bool = True,
         enemy_right_tower_alive: bool = True,
         enemy_king_active: bool = False,
+        spell: bool = False,
     ) -> bool:
-        """Whether the friendly side may place a regular ground troop here.
+        """Whether the friendly side may place this card here.
 
-        Default rule: rows 8-15 (friendly half). When an enemy princess
+        Troop rule: rows 8-15 (friendly half). When an enemy princess
         tower falls, the corresponding top quadrant unlocks. Activating
         the enemy king tower unlocks the full enemy half. Bridge row 7 is
         never placeable for ground units.
+
+        SPELL rule: anywhere in the arena. A spell whose only legal targets
+        were on your own half could never hit an enemy tower, which made
+        Fireball and Arrows strictly dead cards.
         """
         if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
             return False
+        if spell:
+            return True
         if tile_y == 7:
             return False
         if tile_y >= FRIENDLY_HALF_START_ROW:
@@ -124,7 +131,13 @@ class GameBoard:
         enemy_left_tower_alive: bool = True,
         enemy_right_tower_alive: bool = True,
         enemy_king_active: bool = False,
+        spell: bool = False,
     ) -> np.ndarray:
+        """Tile mask for TROOPS by default; ``spell=True`` gives the whole
+        arena. The observation carries the troop mask plus a per-slot
+        ``hand_is_spell`` flag rather than four full masks - the only
+        card-dependent rule is spell-vs-troop, so 4 floats say everything
+        that 4x144 would."""
         mask = np.zeros((ARENA_ROWS, ARENA_COLS), dtype=np.uint8)
         for y in range(ARENA_ROWS):
             for x in range(ARENA_COLS):
@@ -134,6 +147,7 @@ class GameBoard:
                     enemy_left_tower_alive,
                     enemy_right_tower_alive,
                     enemy_king_active,
+                    spell=spell,
                 ):
                     mask[y, x] = 1
         return mask
@@ -268,6 +282,18 @@ class GameBoard:
             idx = CARD_INDEX.get(normalize_name(card.name))
             if idx is not None:
                 out[slot, idx] = 1.0
+        return out
+
+    def hand_is_spell(self) -> np.ndarray:
+        """1.0 for each hand slot holding a spell, else 0.0.
+
+        This is what tells a policy that ``playable_mask`` does not apply to
+        that slot - a spell may be cast on any tile.
+        """
+        out = np.zeros((HAND_SIZE,), dtype=np.float32)
+        for i, card in enumerate(self.cards_in_hand):
+            if card is not None and is_spell(card.name):
+                out[i] = 1.0
         return out
 
     def hand_costs(self) -> np.ndarray:

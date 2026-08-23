@@ -9,19 +9,28 @@ Schema (see ``OBSERVATION_SHAPES`` for the canonical key order):
 - ``hand``         (4, V)  one-hot card identity (V = |CARD_CLASSES|)
 - ``hand_costs``   (4,)    elixir cost per slot (0 for empty)
 - ``hand_playable``(4,)    1.0 where elixir is sufficient, else 0.0
+- ``hand_is_spell``(4,)    1.0 where the slot holds a spell
 - ``elixir``       float   0-10
 - ``match_time``   float   seconds elapsed
 - ``time_norm``    float   match_time / MATCH_MAX_DURATION
 - ``phase_onehot`` (4,)    normal / double / overtime_double / overtime_triple
 - ``arena``        (16, 9, C) one-hot per tile (C = 2 * |ARENA_CLASSES|)
+- ``tower_hp``     (6,)    normalized HP per tower (HP-bar fill fraction)
+- ``crowns``       (2,)    [friendly, enemy] crown counts
+- ``playable_mask``(16, 9) 1 where friendly may place a TROOP
+
+``playable_mask`` is the troop rule only. A spell may be cast anywhere in
+the arena, so a slot flagged in ``hand_is_spell`` ignores the mask entirely
+- see ``GameBoard.is_placeable``. Four flags carry that instead of four full
+144-tile masks, because spell-vs-troop is the only card-dependent rule there
+is. Any consumer that masks tile choices MUST resolve the slot first and
+then pick the mask, or every legal spell target on the enemy half is
+forbidden.
 
 ``hand`` and ``arena`` are sized by DIFFERENT class lists - see
 ``game/classes.py``. Spawn-only units (Goblin Brawler and friends) exist in
 the arena but can never be held, so giving the hand a channel for them would
 be a permanently dead input.
-- ``tower_hp``     (6,)    normalized HP per tower (HP-bar fill fraction)
-- ``crowns``       (2,)    [friendly, enemy] crown counts
-- ``playable_mask``(16, 9) 1 where friendly may place
 
 ``flatten`` produces a single 1-D ``np.float32`` vector for MLP-style
 policies.
@@ -52,6 +61,7 @@ OBSERVATION_SHAPES: dict[str, tuple[int, ...]] = {
     "hand": (HAND_SIZE, len(CARD_CLASSES)),
     "hand_costs": (HAND_SIZE,),
     "hand_playable": (HAND_SIZE,),
+    "hand_is_spell": (HAND_SIZE,),
     "elixir": (),
     "match_time": (),
     "time_norm": (),
@@ -125,6 +135,7 @@ class ObservationBuilder:
             "hand": board.hand_to_tensor(),
             "hand_costs": hand_costs,
             "hand_playable": hand_playable,
+            "hand_is_spell": board.hand_is_spell(),
             "elixir": np.float32(elixir),
             "match_time": np.float32(match_time),
             "time_norm": np.float32(match_time / state.MATCH_MAX_DURATION),

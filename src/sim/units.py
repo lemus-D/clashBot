@@ -27,6 +27,7 @@ import random
 from dataclasses import dataclass, replace
 from enum import Enum
 
+from ..game.cards import SPELL_CARDS
 from ..game.classes import ARENA_CLASSES
 
 
@@ -167,6 +168,15 @@ SPELL_DAMAGE: dict[str, tuple[float, float, float]] = {
 }
 
 SPELL_NAMES = frozenset(SPELL_DAMAGE)
+
+if SPELL_NAMES != SPELL_CARDS:
+    raise ValueError(
+        f"Simulator spell effects {sorted(SPELL_NAMES)} do not match the "
+        f"card table's SPELL_CARDS {sorted(SPELL_CARDS)}. Placement legality "
+        f"keys off SPELL_CARDS while damage keys off this table, so a "
+        f"mismatch means a card is castable anywhere and does nothing, or "
+        f"does damage but cannot be aimed."
+    )
 
 
 def validate_against_manifest() -> None:

@@ -20,7 +20,7 @@ import torch
 
 from ..env.actions import Action
 from ..env.observation import ObservationBuilder, schema_hash
-from ..game.board import ARENA_COLS
+from ..game.board import ARENA_COLS, ARENA_ROWS
 from .model import load_checkpoint
 
 
@@ -66,15 +66,25 @@ class ImitationPolicy:
             return Action.no_op()
 
         slot_mask = np.asarray(obs["hand_playable"]) > 0
-        tile_mask = np.asarray(obs["playable_mask"]).reshape(-1) > 0
-        if not slot_mask.any() or not tile_mask.any():
+        if not slot_mask.any():
             return Action.no_op()
 
         slot_np = slot_logits[0].cpu().numpy()
-        tile_np = tile_logits[0].cpu().numpy()
         slot_np[~slot_mask] = -np.inf
-        tile_np[~tile_mask] = -np.inf
-
         slot = int(slot_np.argmax())
+
+        # The legal tile set depends on WHICH slot was chosen, so the slot is
+        # resolved first. A spell may be cast anywhere; a troop is confined to
+        # playable_mask. Masking tiles before knowing the slot would forbid
+        # every legal spell target on the enemy half.
+        if np.asarray(obs["hand_is_spell"])[slot] > 0:
+            tile_mask = np.ones(ARENA_ROWS * ARENA_COLS, dtype=bool)
+        else:
+            tile_mask = np.asarray(obs["playable_mask"]).reshape(-1) > 0
+        if not tile_mask.any():
+            return Action.no_op()
+
+        tile_np = tile_logits[0].cpu().numpy()
+        tile_np[~tile_mask] = -np.inf
         tile_y, tile_x = divmod(int(tile_np.argmax()), ARENA_COLS)
         return Action(hand_index=slot, tile_x=tile_x, tile_y=tile_y)

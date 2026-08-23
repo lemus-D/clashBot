@@ -190,16 +190,26 @@ class Simulation:
             return False
         if self.elixir[friendly] + 1e-6 < get_card_cost(name):
             return False
-        return self.is_placeable(friendly, tile_x, tile_y)
+        return self.is_placeable(friendly, tile_x, tile_y, name=name)
 
-    def is_placeable(self, friendly: bool, tile_x: int, tile_y: int) -> bool:
+    def is_placeable(
+        self, friendly: bool, tile_x: int, tile_y: int, name: str | None = None
+    ) -> bool:
         """Own half only, widening into a lane whose tower has fallen.
 
         Mirrors ``GameBoard.is_placeable`` in effect: a side may deploy on its
         own half, plus the opposing quadrant behind any tower it destroyed.
+
+        SPELLS are exempt - they may be cast anywhere. Pass ``name`` so this
+        can tell which rule applies; without it the troop rule is assumed,
+        which is the safe default for a mask.
         """
+        from ..game.cards import is_spell
+
         if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
             return False
+        if name is not None and is_spell(name):
+            return True
         own_half = tile_y >= arena.FRIENDLY_HALF_START_ROW if friendly else tile_y < arena.FRIENDLY_HALF_START_ROW
         if own_half:
             return True
