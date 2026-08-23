@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from ..game.board import ARENA_COLS, ARENA_ROWS
 from . import arena
 from .arena import TOWERS, TowerSpec
-from .units import SPELL_DAMAGE, UNIT_STATS, Target, UnitStats
+from .units import STANDARD_LEVEL, Target, UnitStats, stats_at_level, tower_combat
 
 # Physics/combat step. 20 Hz: five sub-steps per 0.25s observation cycle.
 TICK_DT = 0.05
@@ -92,17 +92,19 @@ class Entity:
         return max(0.0, self.hp / self.max_hp) if self.max_hp else 0.0
 
 
-def _tower_entity(spec: TowerSpec) -> Entity:
+def _tower_entity(spec: TowerSpec, level: int) -> Entity:
+    c = tower_combat(spec.kind, level)
     stats = UnitStats(
         name="kingtower" if spec.is_king else "princesstower",
-        hp=spec.max_hp, damage=spec.damage, hit_speed=spec.hit_speed,
-        attack_range=spec.attack_range, speed=0.0, targets=Target.BOTH,
-        is_building=True, deploy_time=0.0, aggro_range=spec.attack_range,
+        hp=c["hp"], damage=c["damage"], hit_speed=c["hit_speed"],
+        attack_range=c["attack_range"], speed=0.0, targets=Target.BOTH,
+        is_building=True, deploy_time=0.0, aggro_range=c["attack_range"],
+        collision_radius=c["collision_radius"],
     )
     return Entity(
         uid=next(_uid_counter), name=stats.name, friendly=spec.friendly,
-        x=spec.x, y=spec.y, hp=spec.max_hp, max_hp=spec.max_hp, stats=stats,
-        tower_key=spec.key, radius=spec.radius,
+        x=spec.x, y=spec.y, hp=c["hp"], max_hp=c["hp"], stats=stats,
+        tower_key=spec.key, radius=c["collision_radius"],
         # Kings do not fire until a princess falls or they are hit.
         active=not spec.is_king,
     )
@@ -122,7 +124,19 @@ class Simulation:
     """One match. Advance with :meth:`tick`; read state off the attributes."""
 
     seed: int = 0
-    unit_stats: dict[str, UnitStats] = field(default_factory=lambda: dict(UNIT_STATS))
+    # Per-side card and tower LEVELS. Ladder play does not match players
+    # exactly, so both sides get their own, and towers can differ from troops
+    # (your king tower level and your card levels move independently).
+    # The detector cannot read a level off the screen, so this is hidden
+    # state the policy has to be robust to rather than condition on.
+    friendly_level: int = STANDARD_LEVEL
+    enemy_level: int = STANDARD_LEVEL
+    friendly_tower_level: int = STANDARD_LEVEL
+    enemy_tower_level: int = STANDARD_LEVEL
+    # Optional pre-perturbed stat tables (see units.randomize). None means
+    # "load the table for this side's level".
+    friendly_stats: dict[str, UnitStats] | None = None
+    enemy_stats: dict[str, UnitStats] | None = None
 
     time: float = 0.0
     entities: dict[int, Entity] = field(default_factory=dict)
@@ -137,9 +151,28 @@ class Simulation:
         self.rng = random.Random(self.seed)
         self.elixir = {True: STARTING_ELIXIR, False: STARTING_ELIXIR}
         self.crowns = {True: 0, False: 0}
+
+        f_units, f_spells = stats_at_level(self.friendly_level)
+        e_units, e_spells = stats_at_level(self.enemy_level)
+        self._stats = {
+            True: self.friendly_stats if self.friendly_stats is not None else f_units,
+            False: self.enemy_stats if self.enemy_stats is not None else e_units,
+        }
+        self._spells = {True: f_spells, False: e_spells}
+        self._tower_level = {
+            True: self.friendly_tower_level,
+            False: self.enemy_tower_level,
+        }
+
         for spec in TOWERS:
-            e = _tower_entity(spec)
+            e = _tower_entity(spec, self._tower_level[spec.friendly])
             self.entities[e.uid] = e
+
+    @property
+    def unit_stats(self) -> dict[str, UnitStats]:
+        """The friendly side's table. Convenience for debug and tests; the
+        engine itself always goes through ``self._stats[side]``."""
+        return self._stats[True]
 
     # ----- lookups -----
 
@@ -230,11 +263,11 @@ class Simulation:
         self.elixir[friendly] -= get_card_cost(name)
         px, py = arena.deploy_position(tile_x, tile_y)
 
-        if name in SPELL_DAMAGE:
+        if name in self._spells[friendly]:
             self._cast_spell(friendly, name, px, py)
             return True
 
-        stats = self.unit_stats[name]
+        stats = self._stats[friendly][name]
         for i in range(stats.count):
             # Squads land spread around the point rather than stacked, so
             # splash damage can actually catch more than one of them.
@@ -250,7 +283,7 @@ class Simulation:
         return 0.35 * math.cos(angle), 0.35 * math.sin(angle)
 
     def _spawn(self, name: str, friendly: bool, x: float, y: float) -> Entity:
-        stats = self.unit_stats[name]
+        stats = self._stats[friendly][name]
         x, y = arena.clamp_to_arena(x, y)
         e = Entity(
             uid=next(_uid_counter), name=name, friendly=friendly, x=x, y=y,
@@ -264,7 +297,7 @@ class Simulation:
         return e
 
     def _cast_spell(self, friendly: bool, name: str, x: float, y: float) -> None:
-        damage, radius, building_mult = SPELL_DAMAGE[name]
+        damage, radius, building_mult = self._spells[friendly][name]
         for e in list(self.entities.values()):
             if e.friendly == friendly or not e.alive:
                 continue

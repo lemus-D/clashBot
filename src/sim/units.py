@@ -85,21 +85,40 @@ class UnitStats:
         return self.damage / self.hit_speed
 
 
-def _load() -> tuple[dict[str, UnitStats], dict[str, tuple[float, float, float]]]:
+def _read_manifest() -> dict:
     if not os.path.exists(STATS_PATH):
         raise FileNotFoundError(
             f"{STATS_PATH} is missing. It is generated from real game data, "
             f"not written by hand: run `python tools/derive_unit_stats.py`."
         )
     with open(STATS_PATH, encoding="utf-8") as f:
-        blob = json.load(f)
+        return json.load(f)
+
+
+_MANIFEST = _read_manifest()
+
+LEVELS: tuple[int, ...] = tuple(_MANIFEST["levels"])
+STANDARD_LEVEL: int = int(_MANIFEST["standard_level"])
+
+
+def _level_value(table: dict, level: int, fallback: float) -> float:
+    """HP/damage at a displayed card level, clamped to the emitted band."""
+    if not table:
+        return fallback
+    lv = min(max(level, min(LEVELS)), max(LEVELS))
+    return float(table[str(lv)])
+
+
+def _load(level: int = None):
+    blob = _MANIFEST
+    level = STANDARD_LEVEL if level is None else level
 
     units: dict[str, UnitStats] = {}
     for key, u in blob["units"].items():
         units[key] = UnitStats(
             name=key,
-            hp=float(u["hp"]),
-            damage=float(u["damage"]),
+            hp=_level_value(u.get("hp_by_level"), level, u["hp"]),
+            damage=_level_value(u.get("damage_by_level"), level, u["damage"]),
             hit_speed=float(u["hit_speed"]),
             attack_range=float(u["attack_range"]),
             speed=float(u["speed"]),
@@ -118,20 +137,58 @@ def _load() -> tuple[dict[str, UnitStats], dict[str, tuple[float, float, float]]
         )
 
     spells = {
-        k: (float(s["damage"]), float(s["radius"]), float(s["tower_damage_mult"]))
+        k: (
+            _level_value(s.get("damage_by_level"), level, s["damage"]),
+            float(s["radius"]),
+            float(s["tower_damage_mult"]),
+        )
         for k, s in blob["spells"].items()
     }
     return units, spells
 
 
-UNIT_STATS, SPELL_DAMAGE = _load()
+def _apply_building_targeter_rule(units: dict[str, UnitStats]) -> dict[str, UnitStats]:
+    """Building-only attackers ignore troops, so an aggro radius describes
+    nothing. Zeroed to make that explicit rather than leaving a number that
+    looks like it does something."""
+    for name, u in list(units.items()):
+        if u.targets is Target.BUILDINGS:
+            units[name] = replace(u, aggro_range=0.0)
+    return units
 
-# Building-only attackers ignore troops entirely, so an aggro radius would
-# describe nothing. Zeroed to make that explicit rather than leaving a number
-# that looks like it does something.
-for _name, _u in list(UNIT_STATS.items()):
-    if _u.targets is Target.BUILDINGS:
-        UNIT_STATS[_name] = replace(_u, aggro_range=0.0)
+
+_LEVEL_CACHE: dict[int, tuple] = {}
+
+
+def stats_at_level(level: int) -> tuple[dict[str, UnitStats], dict[str, tuple]]:
+    """``(units, spells)`` at a displayed card level.
+
+    LEVEL IS HIDDEN STATE. The detector reports "knight" with no level, so a
+    policy cannot condition on it and has to be robust to not knowing - which
+    is exactly why the simulator varies it per episode instead of pinning it
+    to tournament standard.
+    """
+    key = min(max(level, min(LEVELS)), max(LEVELS))
+    if key not in _LEVEL_CACHE:
+        units, spells = _load(key)
+        _LEVEL_CACHE[key] = (_apply_building_targeter_rule(units), spells)
+    units, spells = _LEVEL_CACHE[key]
+    return dict(units), dict(spells)
+
+
+def tower_combat(kind: str, level: int) -> dict[str, float]:
+    """Princess/king tower HP, damage and geometry at a displayed level."""
+    t = _MANIFEST["towers"][kind]
+    return {
+        "hp": _level_value(t["hp_by_level"], level, 0.0),
+        "damage": _level_value(t["damage_by_level"], level, 0.0),
+        "hit_speed": float(t["hit_speed"]),
+        "attack_range": float(t["attack_range"]),
+        "collision_radius": float(t["collision_radius"]),
+    }
+
+
+UNIT_STATS, SPELL_DAMAGE = stats_at_level(STANDARD_LEVEL)
 
 SPELL_NAMES = frozenset(SPELL_DAMAGE)
 

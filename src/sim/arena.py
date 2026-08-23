@@ -28,49 +28,31 @@ RIVER_HALF_WIDTH = 0.5
 BRIDGE_X: tuple[float, float] = (1.5, 7.5)
 BRIDGE_HALF_WIDTH = 0.6
 
-# Tournament-standard tower HP. These are the denominators that turn sim
-# damage into the 0.0-1.0 bar fill the observation carries, so they only have
-# to be self-consistent, not exact.
-PRINCESS_TOWER_HP = 2534.0
-KING_TOWER_HP = 4824.0
-
-# Princess: 109 damage @ 0.8s, 7.5 CR tiles. King: 109 @ 1.0s, 7.0 CR tiles.
-# Ranges halved into grid tiles.
-PRINCESS_DAMAGE = 109.0
-PRINCESS_HIT_SPEED = 0.8
-PRINCESS_RANGE = 3.75
-KING_DAMAGE = 109.0
-KING_HIT_SPEED = 1.0
-KING_RANGE = 3.5
+# Tower HP, damage and geometry are NOT constants here - they scale with the
+# tower's level, which the simulator varies per episode. See
+# ``units.tower_combat``. Only position and identity live in this module.
 
 
 @dataclass(frozen=True)
 class TowerSpec:
     key: str          # matches TOWER_KEYS, so it maps straight into tower_hp
+    kind: str         # "princess" | "king", the key into the stat manifest
     x: float
     y: float
-    max_hp: float
-    damage: float
-    hit_speed: float
-    attack_range: float
-    is_king: bool
     friendly: bool
-    radius: float = 0.75  # hitbox, so melee units stop at the wall
+
+    @property
+    def is_king(self) -> bool:
+        return self.kind == "king"
 
 
 TOWERS: tuple[TowerSpec, ...] = (
-    TowerSpec("enemy_left", 2.0, 3.0, PRINCESS_TOWER_HP, PRINCESS_DAMAGE,
-              PRINCESS_HIT_SPEED, PRINCESS_RANGE, False, False),
-    TowerSpec("enemy_right", 7.0, 3.0, PRINCESS_TOWER_HP, PRINCESS_DAMAGE,
-              PRINCESS_HIT_SPEED, PRINCESS_RANGE, False, False),
-    TowerSpec("enemy_king", 4.5, 1.5, KING_TOWER_HP, KING_DAMAGE,
-              KING_HIT_SPEED, KING_RANGE, True, False, radius=1.0),
-    TowerSpec("friendly_left", 2.0, 13.0, PRINCESS_TOWER_HP, PRINCESS_DAMAGE,
-              PRINCESS_HIT_SPEED, PRINCESS_RANGE, False, True),
-    TowerSpec("friendly_right", 7.0, 13.0, PRINCESS_TOWER_HP, PRINCESS_DAMAGE,
-              PRINCESS_HIT_SPEED, PRINCESS_RANGE, False, True),
-    TowerSpec("friendly_king", 4.5, 14.5, KING_TOWER_HP, KING_DAMAGE,
-              KING_HIT_SPEED, KING_RANGE, True, True, radius=1.0),
+    TowerSpec("enemy_left", "princess", 2.0, 3.0, False),
+    TowerSpec("enemy_right", "princess", 7.0, 3.0, False),
+    TowerSpec("enemy_king", "king", 4.5, 1.5, False),
+    TowerSpec("friendly_left", "princess", 2.0, 13.0, True),
+    TowerSpec("friendly_right", "princess", 7.0, 13.0, True),
+    TowerSpec("friendly_king", "king", 4.5, 14.5, True),
 )
 
 TOWERS_BY_KEY: dict[str, TowerSpec] = {t.key: t for t in TOWERS}

@@ -91,7 +91,12 @@ def _draw_towers(panel: np.ndarray, sim: Simulation, hp: dict[str, float]) -> No
     for spec in arena.TOWERS:
         frac = hp.get(spec.key, 0.0)
         px, py = _tile_px(spec.x, spec.y)
-        r = int(spec.radius * TILE)
+        # Radius is a level-dependent stat now, so take it off the live
+        # entity rather than the position-only spec.
+        entity = next(
+            (e for e in sim.entities.values() if e.tower_key == spec.key), None
+        )
+        r = int((entity.radius if entity else 0.5) * TILE)
         col = COL_FRIENDLY if spec.friendly else COL_ENEMY
         if frac <= 0.0:
             cv2.rectangle(panel, (px - r, py - r), (px + r, py + r), (60, 60, 60), -1)
@@ -101,9 +106,6 @@ def _draw_towers(panel: np.ndarray, sim: Simulation, hp: dict[str, float]) -> No
         cv2.rectangle(panel, (px - r, py - r), (px + r, py + r), col, 2)
         _draw_hp_bar(panel, px, py + r + 8, frac, r * 2)
         if spec.is_king:
-            entity = next(
-                (e for e in sim.entities.values() if e.tower_key == spec.key), None
-            )
             if entity is not None and not entity.active:
                 cv2.putText(panel, "zzz", (px - 14, py + 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, COL_DIM, 1)

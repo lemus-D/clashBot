@@ -178,9 +178,10 @@ speculatively generalize for cases that don't exist yet.)
       first level depends on rarity (a Rare's level 1 is displayed level 3).
       Index by rarity — `LEVEL_INDEX` — or you silently mix power levels.
     - This replaced a hand-written table whose numbers were recalled rather
-      than transcribed. They turned out to be roughly LEVEL 1 values while
-      the TOWERS were already correct level-11 figures, so units were ~2.6x
-      too weak against towers and the whole sim was drastically
+      than transcribed. They were roughly LEVEL 1 values (Knight 660 vs a
+      real 1766). The hardcoded TOWER figures were recalled too and also
+      wrong, just less so (princess 2534/109 vs a real 3584/128), so units
+      were ~1.9x too weak *relative to towers* and the sim was heavily
       tower-favoured. Errors also ran 1.03x–2.68x *between* cards, distorting
       which unit beats which. Anything hand-entered here must state its
       provenance.
@@ -194,6 +195,23 @@ speculatively generalize for cases that don't exist yet.)
       as the data says and flagged, not silently overridden.
   - Sim fidelity is the CEILING on everything trained here. `--stats` prints
     how much of the table is actually trusted.
+  - LEVELS vary per episode (`LevelSpread`). Ladder play does not match
+    players exactly, so each side samples a card level around tournament
+    standard and its towers sample again around that - card level and king
+    level progress together but not in lockstep. `unit_stats.json` carries
+    HP/damage tables for displayed levels 9-14; only HP and damage scale in
+    Clash Royale, not speed/range/hit speed.
+    - LEVEL IS HIDDEN STATE and must stay that way. The detector reports
+      "knight" with no level, so it is absent from the observation by
+      construction and the policy has to be robust to not knowing rather
+      than condition on it. `tower_hp` is a normalised FILL FRACTION, which
+      is what keeps a level-14 tower from being distinguishable from a
+      level-9 one at full health. Do not add absolute HP to the observation.
+      Sampled levels appear in `step()`'s `info["levels"]` for debugging
+      only.
+    - Level variation widens the outcome distribution, so it adds variance
+      to any benchmark. TRAIN with it on, EVALUATE with `--no-levels` so
+      runs stay comparable.
   - `ObservationNoise` exists because the sim sees perfectly and the vision
     pipeline does not: detection dropout, position jitter, phantom units,
     and stale tower bars (an occluded bar holds its previous value, exactly

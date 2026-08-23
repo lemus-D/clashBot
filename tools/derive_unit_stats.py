@@ -42,9 +42,19 @@ FILES = {
     "cards": "cards",
 }
 
-# Displayed level 11 in per-level arrays that begin at the card's OWN level 1.
-# A Rare's level 1 is displayed level 3, an Epic's is 6, a Legendary's is 9.
-LEVEL_INDEX = {"Common": 10, "Rare": 8, "Epic": 5, "Legendary": 2, "Champion": 2}
+# Per-level arrays begin at the card's OWN level 1, and which DISPLAYED level
+# that is depends on rarity: a Rare's level 1 is displayed level 3, an Epic's
+# is 6, a Legendary's is 9. index = displayed_level - FIRST_LEVEL[rarity].
+# Mixing this up silently blends power levels across cards, which is the exact
+# bug this script was written to fix.
+FIRST_LEVEL = {"Common": 1, "Rare": 3, "Epic": 6, "Legendary": 9, "Champion": 11}
+
+# Displayed levels emitted into the manifest. Ladder play around tournament
+# standard (11) sees roughly this band, and the simulator samples within it so
+# a policy cannot assume a fixed power level - the detector cannot read levels
+# off the screen, so the policy must be robust to not knowing.
+LEVELS = range(9, 15)
+STANDARD_LEVEL = 11
 
 # 1 CR tile = 1000 range units; 1 grid tile = 2 CR tiles.
 RANGE_TO_GRID = 2000.0
@@ -83,13 +93,22 @@ def fetch(name: str) -> list[dict]:
         return json.load(f)
 
 
-def at_level(entry: dict, field: str, rarity: str):
-    """Tournament-standard value from a per-level array."""
+def at_level(entry: dict, field: str, rarity: str, level: int = STANDARD_LEVEL):
+    """Value of ``field`` at a DISPLAYED card level."""
     arr = entry.get(f"{field}_per_level")
     if not arr:
         return entry.get(field)
-    idx = LEVEL_INDEX.get(rarity, 10)
-    return arr[min(idx, len(arr) - 1)]
+    idx = level - FIRST_LEVEL.get(rarity, 1)
+    return arr[max(0, min(idx, len(arr) - 1))]
+
+
+def by_level(entry: dict, field: str, rarity: str) -> dict[str, int]:
+    """``{displayed_level: value}`` across the emitted band.
+
+    Only HP and damage scale with level in Clash Royale - speed, range and
+    hit speed do not - so those are the only fields that get a table.
+    """
+    return {str(L): at_level(entry, field, rarity, L) for L in LEVELS}
 
 
 def targets_of(entry: dict) -> str:
@@ -124,9 +143,12 @@ def main() -> None:
             if p:
                 damage = at_level(p, "damage", rarity)
 
+        dmg_src = c if at_level(c, "damage", rarity) else pr.get(c.get("projectile"), {})
         units[key] = {
             "hp": at_level(c, "hitpoints", rarity),
             "damage": damage or 0,
+            "hp_by_level": by_level(c, "hitpoints", rarity),
+            "damage_by_level": by_level(dmg_src, "damage", rarity),
             "hit_speed": (c.get("hit_speed") or 1000) / MS,
             "attack_range": round((c.get("range") or 500) / RANGE_TO_GRID, 4),
             "speed": round((c.get("speed") or 60) / SPEED_TO_GRID, 4),
@@ -152,6 +174,8 @@ def main() -> None:
         units[key] = {
             "hp": at_level(b, "hitpoints", rarity),
             "damage": at_level(b, "damage", rarity) or 0,
+            "hp_by_level": by_level(b, "hitpoints", rarity),
+            "damage_by_level": by_level(b, "damage", rarity),
             "hit_speed": (b.get("hit_speed") or 1000) / MS,
             "attack_range": round((b.get("range") or 0) / RANGE_TO_GRID, 4),
             "speed": 0.0,
@@ -189,10 +213,29 @@ def main() -> None:
         mult = 1.0 + (crown / 100.0) if crown is not None else 0.30
         spells[key] = {
             "damage": at_level(p, "damage", rarity),
+            "damage_by_level": by_level(p, "damage", rarity),
             "radius": round((p.get("radius") or 2000) / RANGE_TO_GRID, 4),
             "tower_damage_mult": round(mult, 4),
             "source_name": pname,
             "source_rarity": rarity,
+        }
+
+    towers: dict[str, dict] = {}
+    for key, gname in (("princess", "PrincessTower"), ("king", "KingTower")):
+        b = bd.get(gname)
+        if b is None:
+            raise SystemExit(f"tower {gname!r} not in game data")
+        rarity = b.get("rarity") or "Common"
+        proj = pr.get(b.get("projectile")) or {}
+        towers[key] = {
+            "hp_by_level": by_level(b, "hitpoints", rarity),
+            "damage_by_level": by_level(proj, "damage", rarity),
+            "hit_speed": (b.get("hit_speed") or 1000) / MS,
+            "attack_range": round((b.get("range") or 7000) / RANGE_TO_GRID, 4),
+            "collision_radius": round(
+                (b.get("collision_radius") or 1000) / RANGE_TO_GRID, 4
+            ),
+            "source_name": gname,
         }
 
     blob = {
@@ -204,8 +247,11 @@ def main() -> None:
         ),
         "source": BASE,
         "level": "tournament standard (displayed 11)",
+        "levels": list(LEVELS),
+        "standard_level": STANDARD_LEVEL,
         "units": units,
         "spells": spells,
+        "towers": towers,
     }
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump(blob, f, indent=2, sort_keys=True)
@@ -218,6 +264,10 @@ def main() -> None:
         print(f"{k:16s} {u['hp']:6} {u['damage']:5} {u['hit_speed']:5.2f} "
               f"{u['attack_range']:6.2f} {u['speed']:6.3f} {u['targets']:>9s} "
               f"{u['count']:2}")
+    for k, t in sorted(towers.items()):
+        print(f"{k+' tower':16s} {t['hp_by_level'][str(STANDARD_LEVEL)]:6} hp  "
+              f"{t['damage_by_level'][str(STANDARD_LEVEL)]:4} dmg  "
+              f"(lvl {min(LEVELS)}-{max(LEVELS)} available)")
     for k, s in sorted(spells.items()):
         print(f"{k:16s} {s['damage']:6} dmg  radius {s['radius']:.2f}  "
               f"tower x{s['tower_damage_mult']:.2f}")

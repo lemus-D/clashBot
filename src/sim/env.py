@@ -33,7 +33,7 @@ from ..game.state import TOWER_KEYS
 from . import engine
 from .engine import Simulation
 from .opponents import OpponentView
-from .units import UNIT_STATS, randomize
+from .units import LEVELS, STANDARD_LEVEL, UNIT_STATS, randomize, stats_at_level
 
 # Measured from real recordings: ClashEnv.step_period_sec is 0.25 and the
 # loop holds it (median 0.251s over 2098 in-match cycles). Training at a
@@ -68,6 +68,54 @@ DEFAULT_DECK: tuple[str, ...] = (
     "knight", "archer", "minion", "goblin",
     "musketeer", "minipekka", "giant", "fireball",
 )
+
+
+@dataclass
+class LevelSpread:
+    """Per-episode card and tower LEVEL variation.
+
+    Ladder play does not match players exactly: an opponent may be a level or
+    two above or below you, and your own tower level moves independently of
+    your card levels. Pinning everything to tournament standard would teach a
+    policy exact breakpoints - "two Musketeer volleys kill a Knight" - that
+    are wrong the moment the real opponent is one level off.
+
+    The crucial part is that LEVEL IS HIDDEN. The detector reports "knight"
+    with no level attached, so it is absent from the observation by
+    construction and the policy CANNOT condition on it. It has to learn play
+    that survives not knowing, which is exactly the real situation.
+
+    Towers are sampled relative to their own side's troop level, because in
+    the real game card levels and king level progress together but not in
+    lockstep.
+    """
+
+    base: int = STANDARD_LEVEL
+    troop_spread: int = 1   # +/- levels per side, around base
+    tower_spread: int = 1   # +/- levels for towers, around that side's troops
+    enabled: bool = True
+
+    @classmethod
+    def off(cls) -> "LevelSpread":
+        """Fixed tournament standard, for evaluation runs that must be
+        comparable to each other."""
+        return cls(troop_spread=0, tower_spread=0, enabled=False)
+
+    def sample(self, rng: random.Random) -> dict[str, int]:
+        lo, hi = min(LEVELS), max(LEVELS)
+        clamp = lambda v: max(lo, min(hi, v))
+        if not self.enabled:
+            b = clamp(self.base)
+            return {"friendly": b, "enemy": b,
+                    "friendly_tower": b, "enemy_tower": b}
+        out = {}
+        for side in ("friendly", "enemy"):
+            troop = clamp(self.base + rng.randint(-self.troop_spread, self.troop_spread))
+            out[side] = troop
+            out[f"{side}_tower"] = clamp(
+                troop + rng.randint(-self.tower_spread, self.tower_spread)
+            )
+        return out
 
 
 @dataclass
@@ -177,6 +225,7 @@ class SimEnv:
     seed: int | None = None
     randomize_scale: float = 1.0
     noise: ObservationNoise = field(default_factory=ObservationNoise)
+    levels: LevelSpread = field(default_factory=LevelSpread)
 
     sim: Simulation = field(init=False)
     board: GameBoard = field(init=False)
@@ -196,8 +245,22 @@ class SimEnv:
         self._episode += 1
         self._rng = random.Random(seed)
 
-        stats = randomize(UNIT_STATS, self._rng, self.randomize_scale)
-        self.sim = Simulation(seed=seed, unit_stats=stats)
+        lv = self.levels.sample(self._rng)
+        self.episode_levels = lv
+        # Each side's table is loaded at its own level, then perturbed
+        # independently - two different sources of uncertainty, both hidden
+        # from the policy.
+        f_units, _ = stats_at_level(lv["friendly"])
+        e_units, _ = stats_at_level(lv["enemy"])
+        self.sim = Simulation(
+            seed=seed,
+            friendly_level=lv["friendly"],
+            enemy_level=lv["enemy"],
+            friendly_tower_level=lv["friendly_tower"],
+            enemy_tower_level=lv["enemy_tower"],
+            friendly_stats=randomize(f_units, self._rng, self.randomize_scale),
+            enemy_stats=randomize(e_units, self._rng, self.randomize_scale),
+        )
         self._deck = Deck(self.deck, self._rng)
         self._opp_deck = Deck(self.deck, self._rng)
 
@@ -315,6 +378,10 @@ class SimEnv:
             "crowns": (self.sim.crowns[True], self.sim.crowns[False]),
             "action_ok": result.success,
             "action_reason": result.reason,
+            # Diagnostics only. Deliberately NOT in the observation: the
+            # detector cannot read levels off the screen, so a policy that
+            # could see them here would learn something it cannot use.
+            "levels": dict(self.episode_levels),
         }
         return obs, reward, done, info
 

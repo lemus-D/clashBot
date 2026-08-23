@@ -18,7 +18,7 @@ import numpy as np
 
 from ..env.actions import Action
 from ..game.board import ARENA_COLS, ARENA_ROWS, HAND_SIZE
-from .env import STEP_PERIOD_SEC, ObservationNoise, SimEnv
+from .env import STEP_PERIOD_SEC, LevelSpread, ObservationNoise, SimEnv
 from .opponents import OPPONENTS, make_opponent
 from .units import stats_confidence_report
 
@@ -64,6 +64,9 @@ def make_env(args) -> SimEnv:
         seed=args.seed,
         randomize_scale=0.0 if args.no_randomize else args.randomize,
         noise=noise,
+        levels=LevelSpread.off() if args.no_levels else LevelSpread(
+            troop_spread=args.level_spread, tower_spread=args.level_spread
+        ),
         opponent=make_opponent(args.opponent, seed=args.seed),
     )
 
@@ -88,7 +91,8 @@ def run_headless(args) -> None:
             print(
                 f"ep {ep + 1:3d}  {info['result']:5s}  "
                 f"crowns {info['crowns'][0]}-{info['crowns'][1]}  "
-                f"t={info['match_time']:5.1f}s  reward={reward_sum:7.2f}"
+                f"t={info['match_time']:5.1f}s  reward={reward_sum:7.2f}  "
+                f"lvl f{info['levels']['friendly']}/e{info['levels']['enemy']}"
             )
 
     elapsed = time.perf_counter() - started
@@ -161,6 +165,11 @@ def main() -> None:
                    help="scripted opponent to play against (default: idle, "
                         "which plays nothing - any win rate against it is "
                         "meaningless)")
+    p.add_argument("--no-levels", action="store_true",
+                   help="pin all card/tower levels to tournament standard "
+                        "(evaluation, not training)")
+    p.add_argument("--level-spread", type=int, default=1,
+                   help="+/- card and tower levels sampled per episode")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--stats", action="store_true",
                    help="print how much of the unit table is actually trusted")
