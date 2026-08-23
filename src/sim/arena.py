@@ -86,29 +86,39 @@ def side_of(y: float, friendly: bool) -> bool:
     return y >= RIVER_Y if friendly else y < RIVER_Y
 
 
+def same_side(y_a: float, y_b: float) -> bool:
+    """Whether two points are on the same side of the river."""
+    return (y_a < RIVER_Y) == (y_b < RIVER_Y)
+
+
 def ground_waypoint(
     x: float, y: float, friendly: bool, goal_x: float, goal_y: float
 ) -> tuple[float, float]:
     """Next point a GROUND unit should walk toward.
 
-    Ground units cannot swim, so a unit still on its own side heads for the
-    nearest bridge before anything else; once across it goes straight at its
-    goal. That two-leg path is the standard simplification and reproduces the
-    behaviour that actually matters strategically - lanes are a real
-    constraint, and troops committed to one side cannot trivially answer a
-    push on the other.
+    Ground units cannot swim, so a unit whose goal is ACROSS the river heads
+    for the nearest bridge first and only then at the goal. Lanes are a real
+    strategic constraint - troops committed to one side cannot trivially
+    answer a push on the other - and this reproduces it.
+
+    The test is on the GOAL, not on which half the unit owns. Keying it to
+    ownership was a bug: a defender on its own half would walk to the bridge
+    instead of at an enemy standing next to it, which is the odd behaviour
+    visible in the debug viewer.
 
     Air units bypass this entirely and fly straight at their goal.
     """
-    attacking_up = friendly  # friendly units advance toward y = 0
-    crossed = (y < RIVER_Y) if attacking_up else (y >= RIVER_Y)
-    if crossed:
+    if same_side(y, goal_y):
         return goal_x, goal_y
 
+    attacking_up = goal_y < y
     bridge_x = nearest_bridge_x(x)
     # Aim just past the water so the unit clears it rather than stopping on
     # the boundary and oscillating.
-    beyond = RIVER_Y - RIVER_HALF_WIDTH - 0.1 if attacking_up else RIVER_Y + RIVER_HALF_WIDTH + 0.1
+    beyond = (
+        RIVER_Y - RIVER_HALF_WIDTH - 0.1 if attacking_up
+        else RIVER_Y + RIVER_HALF_WIDTH + 0.1
+    )
 
     # Line up with the bridge mouth first, then cross.
     if abs(x - bridge_x) > BRIDGE_HALF_WIDTH * 0.5:

@@ -70,6 +70,11 @@ class Entity:
     tower_key: str | None = None
     active: bool = True          # kings start inactive
     radius: float = 0.4
+    # Set once this entity actually starts hitting a building or tower. A
+    # troop that has LOCKED ON to a tower keeps hitting it and ignores troops
+    # walking up beside it - which is why forcing a retarget in the real game
+    # needs a stun or a displacement card, not just a distraction unit.
+    locked_on_structure: bool = False
 
     @property
     def is_tower(self) -> bool:
@@ -365,36 +370,92 @@ class Simulation:
 
     # ----- targeting -----
 
-    def _acquire_target(self, e: Entity) -> Entity | None:
-        """Nearest legal enemy within aggro range, else the goal tower.
+    # Hysteresis on the leash: a troop target is dropped only past this
+    # multiple of sight range, so a unit at the boundary does not flip
+    # between chasing and walking away every tick.
+    LEASH_FACTOR = 1.25
 
-        Buildings-only attackers skip the aggro step entirely - that is what
-        makes a Giant walk past a Musketeer shooting it, and it is one of the
-        few behaviours worth getting exactly right, since whole strategies
-        are built on it.
-        """
-        enemies = [
+    def _enemies_of(self, e: Entity) -> list[Entity]:
+        return [
             o for o in self.entities.values()
             if o.alive and o.friendly != e.friendly and can_attack(e, o)
         ]
-        if not enemies:
+
+    def _nearest_troop_in_sight(self, e: Entity) -> Entity | None:
+        """Nearest attackable NON-tower enemy inside sight range.
+
+        Buildings other than towers count: a ground troop can hit a Goblin
+        Hut, so one standing in its path is a legitimate distraction.
+        Building-only attackers have ``aggro_range`` zeroed and so never
+        divert, which is what makes a Giant walk past a Musketeer.
+        """
+        if e.stats.aggro_range <= 0.0:
             return None
-
-        if e.stats.targets is Target.BUILDINGS:
-            return min(enemies, key=lambda o: arena.distance(e.x, e.y, o.x, o.y))
-
-        in_aggro = [
-            o for o in enemies
+        candidates = [
+            o for o in self._enemies_of(e)
             if not o.is_tower
             and arena.distance(e.x, e.y, o.x, o.y) <= e.stats.aggro_range
         ]
-        if in_aggro:
-            return min(in_aggro, key=lambda o: arena.distance(e.x, e.y, o.x, o.y))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda o: arena.distance(e.x, e.y, o.x, o.y))
 
-        towers = [o for o in enemies if o.is_tower]
-        if towers:
-            return min(towers, key=lambda o: arena.distance(e.x, e.y, o.x, o.y))
-        return min(enemies, key=lambda o: arena.distance(e.x, e.y, o.x, o.y))
+    def _default_goal(self, e: Entity) -> Entity | None:
+        """Where this entity heads with nothing else to fight.
+
+        Normal troops advance on the nearest enemy CROWN TOWER. Building-only
+        attackers instead take the nearest building of any kind, which is how
+        a hut placed in front of the towers pulls a Giant off them.
+        """
+        enemies = self._enemies_of(e)
+        if not enemies:
+            return None
+        if e.stats.targets is Target.BUILDINGS:
+            pool = [o for o in enemies if o.is_building]
+        else:
+            pool = [o for o in enemies if o.is_tower]
+        if not pool:
+            pool = enemies
+        return min(pool, key=lambda o: arena.distance(e.x, e.y, o.x, o.y))
+
+    def _acquire_target(self, e: Entity) -> Entity | None:
+        """First target: nearest enemy in sight, else the default goal."""
+        return self._nearest_troop_in_sight(e) or self._default_goal(e)
+
+    def _retarget(self, e: Entity) -> Entity | None:
+        """Per-tick target maintenance.
+
+        The rule this encodes, from how the real game behaves:
+
+        - A troop target is HELD until it dies or runs beyond the leash. Units
+          do not shop around for a better target mid-fight.
+        - A structure target is held only while the unit is still WALKING to
+          it. A troop entering sight range diverts the unit - that is ordinary
+          distraction, and it works.
+        - Once the unit has actually started hitting a structure
+          (``locked_on_structure``), it is committed and no longer diverts.
+          This is why a Royal Giant on your tower keeps hitting the tower and
+          has to be pushed or stunned off it rather than merely distracted.
+        """
+        target = self.entities.get(e.target_uid) if e.target_uid else None
+
+        if target is not None and (not target.alive or not can_attack(e, target)):
+            target = None
+            e.locked_on_structure = False
+
+        if target is not None and not target.is_building:
+            leash = e.stats.aggro_range * self.LEASH_FACTOR
+            if leash > 0 and arena.distance(e.x, e.y, target.x, target.y) > leash:
+                target = None
+
+        if target is None:
+            e.locked_on_structure = False
+            target = self._acquire_target(e)
+        elif target.is_building and not e.locked_on_structure:
+            target = self._nearest_troop_in_sight(e) or target
+
+        e.target_uid = target.uid if target else None
+        return target
 
     # ----- the tick -----
 
@@ -445,14 +506,14 @@ class Simulation:
         if e.is_tower and not e.active:
             return
 
-        target = self.entities.get(e.target_uid) if e.target_uid else None
-        if target is None or not target.alive or not can_attack(e, target):
-            target = self._acquire_target(e)
-            e.target_uid = target.uid if target else None
+        target = self._retarget(e)
         if target is None:
             return
 
-        reach = e.stats.attack_range + target.radius
+        # Range is measured between HITBOX EDGES, not centres, so both radii
+        # come off the gap. Omitting the attacker's radius let melee units
+        # stand inside each other.
+        reach = e.stats.attack_range + target.radius + e.radius
         dist = arena.distance(e.x, e.y, target.x, target.y)
 
         if dist <= reach:
@@ -469,6 +530,9 @@ class Simulation:
 
     def _attack(self, e: Entity, target: Entity) -> None:
         e.attack_cooldown = e.stats.hit_speed
+        if target.is_building:
+            # Committed now: see _retarget.
+            e.locked_on_structure = True
         self._damage(target, e.stats.damage)
         if e.stats.splash_radius > 0.0:
             for other in list(self.entities.values()):
@@ -494,9 +558,13 @@ class Simulation:
         ny = e.y + dy / dist * step
 
         if not e.stats.flying and arena.blocks_ground(nx, ny):
-            # Walked into water: slide along the bank toward the bridge
-            # instead of stopping dead against it.
-            nx = e.x + (arena.nearest_bridge_x(e.x) - e.x) * min(1.0, step)
+            # Walked into water: slide along the bank toward the bridge at
+            # full speed instead of stopping dead. Previously this moved a
+            # FRACTION of the remaining distance per tick, which eased to a
+            # crawl near the bridge and looked broken.
+            bridge_x = arena.nearest_bridge_x(e.x)
+            direction = 1.0 if bridge_x > e.x else -1.0
+            nx = e.x + direction * min(step, abs(bridge_x - e.x))
             ny = e.y
         e.x, e.y = arena.clamp_to_arena(nx, ny)
 

@@ -195,6 +195,24 @@ speculatively generalize for cases that don't exist yet.)
       as the data says and flagged, not silently overridden.
   - Sim fidelity is the CEILING on everything trained here. `--stats` prints
     how much of the table is actually trusted.
+  - TARGETING follows the real game's rules, which are subtler than they
+    look and were got wrong first time:
+    - A troop WALKING toward a tower diverts to an enemy entering sight
+      range - ordinary distraction, and it works.
+    - A troop that has already STARTED HITTING a structure is committed
+      (`Entity.locked_on_structure`) and ignores troops beside it. This is
+      why prising a Royal Giant off your tower in the real game needs a stun
+      or a displacement card, not just a distraction unit.
+    - A troop target is HELD until it dies or passes `LEASH_FACTOR` x sight
+      range. Units do not shop around mid-fight.
+    - Building-only attackers (`aggro_range` 0) never divert at all.
+    - Sight ranges are the game's own `sight_range`; building-targeters
+      genuinely have longer ones, which is why they are pulled from further.
+    - Range is measured between HITBOX EDGES: `attack_range + both radii`.
+  - PATHING routes via a bridge only when the goal is ACROSS the river
+    (`arena.same_side`). Keying it to which half the unit OWNED was a bug -
+    defenders walked to the bridge instead of at an enemy standing next to
+    them, which is what looked wrong in the viewer.
   - LEVELS vary per episode (`LevelSpread`). Ladder play does not match
     players exactly, so each side samples a card level around tournament
     standard and its towers sample again around that - card level and king
@@ -239,14 +257,14 @@ speculatively generalize for cases that don't exist yet.)
     - FREEZE these. They are the only stable yardstick: self-play win rate
       sits at ~50% by construction and measures nothing, so never tune a
       scripted bot to beat the current policy.
-    - RandomPolicy baseline, 100 episodes, noise + randomization on, with
-      real level-11 stats: idle 100% win (3-0, ~73s) / cycler 25% /
-      tankandsupport 23% / bigspender 20%. Beating that ladder is the first
-      milestone. The ladder is COMPRESSED compared to the broken-stats era
-      (2–17%) because units can now actually kill towers; matches run ~70s
-      instead of ~200s. Re-baseline after any sim-fidelity change — the
+    - RandomPolicy baseline, 100 episodes, noise + level/stat randomization
+      on: idle 100% win (2.95-0.00) / bigspender 47% / cycler 45% /
+      tankandsupport 36%, matches ~110-160s. Beating that ladder is the
+      first milestone. Re-baseline after ANY sim-fidelity change — the
       yardstick is the opponents' BEHAVIOUR, which is frozen, not the
-      numbers those behaviours produce.
+      numbers it produces. This has moved a lot as fidelity improved
+      (2-17% with the broken stat table, 18-30% once stats were real,
+      36-47% once defenders stopped walking to the bridge).
     - Self-play and a frozen-checkpoint league are still to come; sample the
       pool per episode rather than graduating through it, or the policy
       forgets how to beat the simple ones.
