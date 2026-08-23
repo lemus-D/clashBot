@@ -279,14 +279,30 @@ speculatively generalize for cases that don't exist yet.)
     - FREEZE these. They are the only stable yardstick: self-play win rate
       sits at ~50% by construction and measures nothing, so never tune a
       scripted bot to beat the current policy.
-    - RandomPolicy baseline, 100 episodes, noise + level/stat randomization
-      on: idle 100% win (2.95-0.00) / bigspender 47% / cycler 45% /
-      tankandsupport 36%, matches ~110-160s. Beating that ladder is the
-      first milestone. Re-baseline after ANY sim-fidelity change — the
-      yardstick is the opponents' BEHAVIOUR, which is frozen, not the
-      numbers it produces. This has moved a lot as fidelity improved
-      (2-17% with the broken stat table, 18-30% once stats were real,
-      36-47% once defenders stopped walking to the bridge).
+    - They DEFEND FIRST (`ScriptedOpponent._defend`): an enemy inside their
+      half is answered by the cheapest affordable non-building-targeter,
+      placed one row in front of the DEEPEST invader. Before this none of
+      them defended at all and a random policy beat them ~47% by walking
+      cards into an empty lane.
+    - Each has a `reaction_s` delay measured from FIRST SIGHTING of an
+      invader, and keeps attacking during it. A frame-perfect defender is
+      not a harder opponent, it is an unrealistic one, and a policy trained
+      against it learns to beat something that is not on ladder. The timer
+      runs until the half is clear, so reinforcements cannot re-delay a
+      response indefinitely.
+    - Placement carries role: defence intercepts the threat, a beatdown tank
+      goes deep (`BACKLINE_ROW`) so the push gathers behind it, chip goes to
+      the bridge (`PUSH_ROW`).
+    - RandomPolicy baseline, 150 episodes, noise + level/stat randomization
+      on: idle 100% win / bigspender 49% / tankandsupport 32% / cycler 31%,
+      matches ~110-185s. NOTE the inversion: bigspender is now the EASIEST
+      rung, because dumping elixir the moment it passes 5 starves its own
+      defence. That is the archetype behaving correctly, not a bug.
+    - Re-baseline after ANY sim-fidelity change — the yardstick is the
+      opponents' BEHAVIOUR, which is frozen, not the numbers it produces.
+      This has moved a lot as fidelity improved: 2-17% with the broken stat
+      table, 18-30% once stats were real, 36-47% once defenders stopped
+      walking to the bridge, 31-49% once they actually defended.
     - Self-play and a frozen-checkpoint league are still to come; sample the
       pool per episode rather than graduating through it, or the policy
       forgets how to beat the simple ones.

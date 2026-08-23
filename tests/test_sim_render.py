@@ -69,6 +69,26 @@ def test_dropped_units_are_reported():
     assert env.observe()["arena"].sum() == 0
 
 
+def test_phantoms_only_use_detectable_classes():
+    """A false positive is the detector mistaking something in its OWN class
+    list. It cannot hallucinate a staged card it was never trained on."""
+    from src.game.classes import ARENA_CLASSES
+    from src.sim.units import STAGED_CLASSES
+
+    env = SimEnv(
+        seed=4, randomize_scale=0.0,
+        noise=ObservationNoise(drop_prob=0.0, position_jitter=0.0,
+                               false_positive_prob=1.0, tower_stale_prob=0.0),
+    )
+    for _ in range(40):
+        env.reset()
+        env.step(Action.no_op())
+        for (tx, ty) in env.phantom_tiles:
+            name = env.board.troops_in_arena[ty][tx].name
+            assert name in ARENA_CLASSES, name
+            assert name not in STAGED_CLASSES, name
+
+
 def test_phantoms_are_reported():
     env = SimEnv(
         seed=4, randomize_scale=0.0,

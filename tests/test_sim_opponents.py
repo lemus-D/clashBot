@@ -15,11 +15,13 @@ from src.env.actions import Action
 from src.game.classes import CARD_CLASSES
 from src.sim.env import ObservationNoise, SimEnv
 from src.sim.opponents import (
+    BACKLINE_ROW,
     DEFEND_ROW,
     LANES,
     OPPONENTS,
     PUSH_ROW,
     SUPPORT_ROW,
+    Threat,
     BigSpender,
     Cycler,
     Idle,
@@ -128,10 +130,12 @@ class TestTankAndSupport:
         assert TankAndSupport(seed=1)(view(["goblin", "knight"], 6.0)) is None
 
     def test_commits_a_tank_when_it_can_follow_up(self):
+        """Deep, not at the bridge: beatdown wants the push to gather."""
         v = view(["giant", "goblin"], 8.0)
         slot, lane, row = TankAndSupport(seed=1)(v)
         assert v.hand[slot] == "giant"
-        assert row == PUSH_ROW and lane in LANES
+        assert row == BACKLINE_ROW and lane in LANES
+        assert BACKLINE_ROW > PUSH_ROW, "tank should start behind the bridge"
 
     def test_holds_the_tank_without_follow_up_elixir(self):
         """A tank walking in alone dies to the first thing it meets."""
@@ -142,8 +146,7 @@ class TestTankAndSupport:
         _, lane, _ = opp(view(["giant", "goblin"], 8.0))
         slot, support_lane, row = opp(view(["giant", "goblin"], 3.0))
         assert support_lane == lane
-        assert row == SUPPORT_ROW
-        assert SUPPORT_ROW > PUSH_ROW, "support must be BEHIND the tank"
+        assert row > BACKLINE_ROW, "support must be BEHIND the tank"
 
     def test_the_push_is_held_until_support_lands(self):
         """Failing to afford support must not abandon the push - otherwise
@@ -152,7 +155,7 @@ class TestTankAndSupport:
         _, lane, _ = opp(view(["giant", "goblin"], 8.0))
         assert opp(view(["giant", "goblin"], 0.0)) is None
         slot, support_lane, row = opp(view(["giant", "goblin"], 4.0))
-        assert support_lane == lane and row == SUPPORT_ROW
+        assert support_lane == lane and row > BACKLINE_ROW
 
     def test_cycles_out_of_a_hand_with_no_tank(self):
         """The deadlock case: all-cheap hand, capped elixir. It must play
@@ -179,6 +182,127 @@ class TestTankAndSupport:
     def test_builds_pushes_in_a_real_match(self):
         info, deployed = play_match(TankAndSupport(seed=5))
         assert deployed > 0
+
+
+def threat(tile_x=4, tile_y=12, name="knight", flying=False) -> Threat:
+    return Threat(name=name, tile_x=tile_x, tile_y=tile_y, flying=flying)
+
+
+def after_reaction(opp, v):
+    """Drive a bot past its reaction delay and return the resulting move.
+
+    The clock starts on FIRST SIGHTING, so one call at a large timestamp
+    never defends - the first call is the sighting. Two calls are needed,
+    which is also how it plays out tick by tick in a real match.
+    """
+    opp(v)
+    v.time += opp.reaction_s + 0.05
+    return opp(v)
+
+
+class TestDefence:
+    """None of these bots defended at all before, which is why a random
+    policy beat them by walking cards into an empty lane."""
+
+    def test_the_defensive_response_waits_for_the_reaction_delay(self):
+        opp = Cycler(seed=1)
+        v = view(["goblin", "knight"], 10.0)
+        v.threats = (threat(),)
+        v.time = 0.0
+        assert opp._defend(v) is None, "reacted on the frame it appeared"
+
+        v.time = opp.reaction_s + 0.05
+        assert opp._defend(v) is not None
+
+    def test_it_keeps_attacking_while_it_has_not_reacted_yet(self):
+        """A human mid-push does not freeze the instant a threat lands. The
+        delay gates the DEFENSIVE response, not the whole bot - and spending
+        elixir on offence in that window is a realistic, punishable mistake."""
+        opp = Cycler(seed=1)
+        v = view(["goblin", "knight"], 10.0)
+        v.threats = (threat(),)
+        v.time = 0.0
+        move = opp(v)
+        assert move is not None and move[2] == PUSH_ROW
+
+    def test_defence_answers_the_threats_lane(self):
+        opp = Cycler(seed=1)
+        v = view(["goblin", "knight"], 10.0)
+        v.threats = (threat(tile_x=7),)
+        _, tx, _ = after_reaction(opp, v)
+        assert tx == 7
+
+    def test_defence_is_placed_in_the_invaders_path(self):
+        opp = Cycler(seed=1)
+        v = view(["goblin"], 10.0)
+        v.threats = (threat(tile_y=11),)
+        _, _, row = after_reaction(opp, v)
+        assert row == 12, "should intercept between the threat and the king"
+
+    def test_the_deepest_invader_is_answered_first(self):
+        """The deepest one is about to hit a tower; the near one is not."""
+        opp = Cycler(seed=1)
+        v = view(["goblin"], 10.0)
+        v.threats = (threat(tile_x=1, tile_y=9), threat(tile_x=7, tile_y=13))
+        _, tx, _ = after_reaction(opp, v)
+        assert tx == 7
+
+    def test_enemies_on_their_own_half_are_not_invaders(self):
+        v = view(["goblin"], 10.0)
+        v.threats = (threat(tile_y=3),)
+        assert v.invaders() == []
+
+    def test_building_targeters_are_not_used_to_defend(self):
+        """A Giant walks past whatever is attacking you."""
+        v = view(["giant"], 10.0)
+        assert v.defenders() == []
+        assert v.affordable() == [0], "giant should still be affordable"
+
+    def test_defence_takes_priority_over_attacking(self):
+        opp = BigSpender(seed=1)
+        v = view(["goblin", "giant"], 10.0)
+        v.threats = (threat(tile_y=13),)
+        _, _, row = after_reaction(opp, v)
+        assert row > PUSH_ROW, "pushed instead of defending"
+
+    def test_the_delay_resets_once_the_half_is_clear(self):
+        opp = Cycler(seed=1)
+        v = view(["goblin"], 10.0)
+        v.threats = (threat(),)
+        v.time = 0.0
+        opp(v)
+
+        v.threats = ()
+        v.time = 5.0
+        opp(v)
+
+        v.threats = (threat(),)
+        v.time = 5.05
+        assert opp._defend(v) is None, "timer did not reset when the half cleared"
+
+    def test_a_sustained_push_is_answered_once_not_re_delayed(self):
+        """Reinforcements arriving must not restart the clock, or a steady
+        stream of units would keep the bot permanently unable to respond."""
+        opp = Cycler(seed=1)
+        v = view(["goblin"], 10.0)
+        v.threats = (threat(tile_x=1),)
+        v.time = 0.0
+        opp(v)
+        v.threats = (threat(tile_x=1), threat(tile_x=2))
+        v.time = opp.reaction_s + 0.05
+        assert opp._defend(v) is not None
+
+    @pytest.mark.parametrize("cls", [BigSpender, Cycler, TankAndSupport])
+    def test_every_bot_defends(self, cls):
+        opp = cls(seed=1)
+        v = view(["goblin", "knight", "giant"], 10.0)
+        v.threats = (threat(tile_y=13),)
+        move = after_reaction(opp, v)
+        assert move is not None and move[2] > PUSH_ROW
+
+    @pytest.mark.parametrize("cls", [BigSpender, Cycler, TankAndSupport])
+    def test_reaction_delays_are_human_scale(self, cls):
+        assert 0.3 <= cls.reaction_s <= 2.0
 
 
 class TestRegistry:

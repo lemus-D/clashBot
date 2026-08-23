@@ -28,11 +28,11 @@ from ..env.actions import Action, ActionResult
 from ..env.observation import ObservationBuilder
 from ..game.board import ARENA_COLS, ARENA_ROWS, GameBoard, HAND_SIZE
 from ..game.cards import Card, Troop, get_card_cost, is_spell
-from ..game.classes import CARD_CLASSES
+from ..game.classes import ARENA_CLASSES, CARD_CLASSES
 from ..game.state import TOWER_KEYS
 from . import engine
 from .engine import Simulation
-from .opponents import OpponentView
+from .opponents import OpponentView, Threat
 from .units import LEVELS, STANDARD_LEVEL, UNIT_STATS, randomize, stats_at_level
 
 # Measured from real recordings: ClashEnv.step_period_sec is 0.25 and the
@@ -63,6 +63,10 @@ def _mirror(tile_x: int, tile_y: int) -> tuple[int, int]:
     """Reflect a tile through the arena centre (own frame -> real coords)."""
     return ARENA_COLS - 1 - tile_x, ARENA_ROWS - 1 - tile_y
 
+
+# Names a false-positive detection may take. Staged units are excluded: the
+# detector has never seen them, so it cannot invent one.
+_PHANTOM_NAMES: tuple[str, ...] = tuple(ARENA_CLASSES)
 
 DEFAULT_DECK: tuple[str, ...] = (
     "knight", "archer", "minion", "goblin",
@@ -330,7 +334,11 @@ class SimEnv:
             tx = self._rng.randrange(ARENA_COLS)
             ty = self._rng.randrange(ARENA_ROWS)
             if self.board.troops_in_arena[ty][tx] is None:
-                ghost = self._rng.choice(list(UNIT_STATS))
+                # Drawn from what the DETECTOR can report, not from every unit
+                # the sim models. A false positive is the detector being
+                # wrong about something in its own class list; it cannot
+                # hallucinate a staged card it has never been trained on.
+                ghost = self._rng.choice(_PHANTOM_NAMES)
                 self.board.troops_in_arena[ty][tx] = Troop(
                     ghost, self._rng.choice(("blue", "red")), tx, ty
                 )
@@ -408,11 +416,24 @@ class SimEnv:
         Handing over ``self`` would let an opponent inspect the policy's hand
         and elixir. A benchmark that can cheat is not a benchmark.
         """
+        # Enemy (i.e. the policy's) units, mirrored into the opponent's own
+        # frame so it reasons in one coordinate system throughout.
+        threats = tuple(
+            Threat(
+                name=u.name,
+                tile_x=ARENA_COLS - 1 - int(u.x),
+                tile_y=ARENA_ROWS - 1 - int(u.y),
+                flying=u.stats.flying,
+            )
+            for u in self.sim.units(True)
+            if u.deployed
+        )
         return OpponentView(
             hand=list(self._opp_deck.hand),
             elixir=self.sim.elixir[False],
             time=self.sim.time,
             phase=self.sim.phase(),
+            threats=threats,
             can_place=lambda tx, ty, name=None: self.sim.is_placeable(
                 False, *_mirror(tx, ty), name=name
             ),
