@@ -59,19 +59,35 @@ speculatively generalize for cases that don't exist yet.)
   are stamped with the region they were captured against; a stamp that
   disagrees with `ELIXIR_DIGIT_REGION` raises rather than reading nothing.
 - Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
-  `state.py` (time, elixir, tower HP, crowns), `cards.py`.
-- NAMING CONTRACT: `TROOP_CLASSES` (board.py) and `CARD_COSTS` (cards.py) keys
-  MUST equal the Roboflow model's class names with the `blue`/`red`/`card`
-  prefix stripped and `normalize_name` applied. The model uses SINGULAR names
-  (`card minion`, not `card minions`). A mismatch is silent in effect and was
-  a real bug: four plural entries meant Minions/Archers/Spear Goblins/Goblins
-  never entered the arena tensor at all. Both sides now warn once per distinct
-  unknown name. To re-derive the list, read `get_model(...).class_names` — do
-  not hand-write it. `king tower` / `princess tower` are real model classes
-  deliberately excluded via `_IGNORED_ARENA_CLASSES`: tower SKINS change how
-  towers look, so those two detect unreliably. Don't add them, and don't try
-  to use a princess tower vanishing from detections as a destruction signal —
-  same unreliability. Tower state comes from the HP bar.
+  `state.py` (time, elixir, tower HP, crowns), `cards.py`, `classes.py`.
+- NAMING CONTRACT — `src/game/classes.py` owns it, and it is GENERATED, not
+  hand-written. `class_manifest.json` comes from `get_model(...).class_names`
+  via `python -m src.main --derive-classes`; runtime reads the manifest (no
+  network at import) and `ClashEnv._load_model` calls `verify_against_model`
+  to raise if it has gone stale. A hand-written list broke this twice: plural
+  entries blanked Minions/Archers/Spear Goblins/Goblins out of the arena
+  tensor entirely, and later eight arena-2 names the model cannot emit made
+  2304 observation values permanently zero. Do not reintroduce one.
+  - TWO index spaces, not one. `ARENA_CLASSES` (13) and `CARD_CLASSES` (12)
+    are overlapping sets where neither contains the other: Goblin Brawler is
+    an arena unit with no card because it spawns from Goblin Cage, and every
+    spawn-only unit (Lava Pups, Golemites, …) is the same. `arena` is sized
+    `2 * |ARENA_CLASSES|`, `hand` is `|CARD_CLASSES|`. A future spawn-only
+    unit needs no special-casing — it lands in one list and not the other.
+  - Order is APPEND-ONLY (`merge_preserving_order`). Class order is channel
+    order; old index i must stay new index i or a trained checkpoint cannot
+    be migrated by scattering its input-layer columns, and adding one arena
+    class shifts the entire enemy channel half. A class that disappears from
+    the model is KEPT as a dead channel rather than dropped, for the same
+    reason. Never sort the manifest, and never trust the model's own order.
+  - `CARD_COSTS` keys are validated against `CARD_CLASSES` at import and
+    raise on mismatch; the costs themselves stay hand-written, since a
+    detector knows what a card looks like and not what it costs.
+  - `king tower` / `princess tower` are real model classes deliberately
+    excluded via `IGNORED_ARENA_CLASSES`: tower SKINS change how towers
+    look, so those two detect unreliably. Don't add them, and don't try to
+    use a princess tower vanishing from detections as a destruction signal —
+    same unreliability. Tower state comes from the HP bar.
 - Match clock: elixir is simulated but time is NOT trusted to simulation. The
   match is detected from the elixir bar, which is already up during the 3-2-1
   countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`
@@ -160,7 +176,11 @@ speculatively generalize for cases that don't exist yet.)
 - Train imitation policy: `python -m src.imitation.train demos/run.jsonl
   --out models/imitation.pt`; run it:
   `python -m src.main --policy imitation --weights models/imitation.pt`.
-- Build: none yet. Tests: none yet. (Flag if you think one is needed.)
+- Regenerate the class manifest: `python -m src.main --derive-classes`
+  (needs API_KEY; announces any schema change it causes).
+- Tests: `pip install -r requirements-dev.txt` then `pytest`. Covers the
+  class manifest, observation encoding and the simulator - everything
+  that runs without a screen or an emulator. Build: none yet.
 
 ## Coding Practices
 

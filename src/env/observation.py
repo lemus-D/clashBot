@@ -6,14 +6,19 @@ downstream tensors are stable across frames.
 
 Schema (see ``OBSERVATION_SHAPES`` for the canonical key order):
 
-- ``hand``         (4, V)  one-hot card identity (V = |TROOP_CLASSES|)
+- ``hand``         (4, V)  one-hot card identity (V = |CARD_CLASSES|)
 - ``hand_costs``   (4,)    elixir cost per slot (0 for empty)
 - ``hand_playable``(4,)    1.0 where elixir is sufficient, else 0.0
 - ``elixir``       float   0-10
 - ``match_time``   float   seconds elapsed
 - ``time_norm``    float   match_time / MATCH_MAX_DURATION
 - ``phase_onehot`` (4,)    normal / double / overtime_double / overtime_triple
-- ``arena``        (16, 9, C) one-hot per tile (C = 2 * |TROOP_CLASSES|)
+- ``arena``        (16, 9, C) one-hot per tile (C = 2 * |ARENA_CLASSES|)
+
+``hand`` and ``arena`` are sized by DIFFERENT class lists - see
+``game/classes.py``. Spawn-only units (Goblin Brawler and friends) exist in
+the arena but can never be held, so giving the hand a channel for them would
+be a permanently dead input.
 - ``tower_hp``     (6,)    normalized HP per tower (HP-bar fill fraction)
 - ``crowns``       (2,)    [friendly, enemy] crown counts
 - ``playable_mask``(16, 9) 1 where friendly may place
@@ -34,8 +39,8 @@ from ..game.board import (
     HAND_SIZE,
     ARENA_COLS,
     ARENA_ROWS,
-    TROOP_CLASSES,
 )
+from ..game.classes import ARENA_CLASSES, CARD_CLASSES, MODEL_ID
 from ..game.state import GameState, TOWER_KEYS
 
 PHASES = ("normal", "double", "overtime_double", "overtime_triple")
@@ -44,14 +49,14 @@ PHASE_INDEX = {p: i for i, p in enumerate(PHASES)}
 # Canonical schema: key order here is the flatten() order. Scalars have
 # shape ().
 OBSERVATION_SHAPES: dict[str, tuple[int, ...]] = {
-    "hand": (HAND_SIZE, len(TROOP_CLASSES)),
+    "hand": (HAND_SIZE, len(CARD_CLASSES)),
     "hand_costs": (HAND_SIZE,),
     "hand_playable": (HAND_SIZE,),
     "elixir": (),
     "match_time": (),
     "time_norm": (),
     "phase_onehot": (len(PHASES),),
-    "arena": (ARENA_ROWS, ARENA_COLS, len(TROOP_CLASSES) * 2),
+    "arena": (ARENA_ROWS, ARENA_COLS, len(ARENA_CLASSES) * 2),
     "tower_hp": (len(TOWER_KEYS),),
     "crowns": (2,),
     "playable_mask": (ARENA_ROWS, ARENA_COLS),
@@ -60,13 +65,18 @@ OBSERVATION_SHAPES: dict[str, tuple[int, ...]] = {
 
 def schema_descriptor() -> dict:
     """Everything needed to interpret — or later migrate — a flattened
-    observation: the troop class list (one-hot channel meanings) and the
-    field shapes in flatten order."""
+    observation: both class lists (the one-hot channel meanings) and the
+    field shapes in flatten order.
+
+    ``model_id`` is recorded too, so a recording says which detector its
+    channel meanings came from rather than leaving that to be inferred."""
     return {
         "obs_flat_size": sum(
             int(np.prod(shape)) for shape in OBSERVATION_SHAPES.values()
         ),
-        "troop_classes": list(TROOP_CLASSES),
+        "model_id": MODEL_ID,
+        "arena_classes": list(ARENA_CLASSES),
+        "card_classes": list(CARD_CLASSES),
         "observation_shapes": {
             k: list(v) for k, v in OBSERVATION_SHAPES.items()
         },

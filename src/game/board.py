@@ -14,7 +14,15 @@ import logging
 
 import numpy as np
 
-from .cards import Card, Troop, normalize_name
+from .cards import Card, Troop
+from .classes import (
+    ARENA_CLASSES,
+    ARENA_INDEX,
+    CARD_CLASSES,
+    CARD_INDEX,
+    IGNORED_ARENA_CLASSES,
+    normalize_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,51 +32,15 @@ HAND_SIZE = 4
 
 FRIENDLY_HALF_START_ROW = 8
 
-# These MUST match the detector's class names once the blue/red/card prefix
-# is stripped and ``normalize_name`` is applied, or the troop is silently
-# dropped from the arena tensor. Taken from ``troop-counter/8``'s own class
-# list rather than written by hand: the model says "minion", not "minions",
-# and four plural entries here (archers/goblins/minions/speargoblins) were
-# dead channels that never matched anything while the corresponding troops
-# vanished from every observation.
-#
-# The model ALSO emits "king tower" and "princess tower" as arena objects.
-# They are deliberately excluded, for a reason that is not obvious from the
-# class list: TOWER SKINS change how towers look, so those two classes detect
-# unreliably and cannot be trusted. That also rules out the tempting idea of
-# using a princess tower vanishing from detections as a positive
-# destruction signal - it would inherit the same unreliability. Tower state
-# comes from the HP bar instead (``src/vision/towers.py``), and the towers
-# are static anyway, so channels for them would add 4 x 144 values of no new
-# information. See ``_IGNORED_ARENA_CLASSES``.
-TROOP_CLASSES: tuple[str, ...] = (
-    "goblin",
-    "speargoblin",
-    "arrows",
-    "archer",
-    "minion",
-    "knight",
-    "goblinhut",
-    "goblincage",
-    "goblinbrawler",
-    "musketeer",
-    "fireball",
-    "minipekka",
-    "giant",
-)
-
-# Detector arena classes that are real but intentionally not observation
-# channels. Listed explicitly so they do not trip the unknown-troop warning:
-# an unknown name is a bug, these are a decision.
-_IGNORED_ARENA_CLASSES: frozenset[str] = frozenset({"kingtower", "princesstower"})
+# The arena and the hand use SEPARATE class lists, both generated from the
+# detector - see ``classes.py`` for why they are not one list. Briefly:
+# Goblin Brawler is an arena unit with no card, so a shared list gives the
+# hand a channel that can never fire, and every spawn-only unit added later
+# would do the same.
 
 # Unencodable troop names already reported, so the warning fires once per
 # distinct name instead of once per tile per frame.
 _warned_unknown_troops: set[str] = set()
-
-_TROOP_INDEX: dict[str, int] = {
-    normalize_name(n): i for i, n in enumerate(TROOP_CLASSES)
-}
 
 
 class GameBoard:
@@ -239,19 +211,19 @@ class GameBoard:
     def to_tensor(self) -> np.ndarray:
         """One-hot encode the arena as ``(ARENA_ROWS, ARENA_COLS, channels)``.
 
-        Channels = ``len(TROOP_CLASSES) * 2`` (blue/friendly first half,
+        Channels = ``len(ARENA_CLASSES) * 2`` (blue/friendly first half,
         red/enemy second half).
 
-        A troop whose name is not in ``TROOP_CLASSES`` cannot be encoded, so
+        A troop whose name is not in ``ARENA_CLASSES`` cannot be encoded, so
         it is omitted - but it is WARNED about once per distinct name, not
         dropped quietly. Silence here hid a real bug: the detector emits
-        singular names ("minion") while this tuple held plurals ("minions"),
-        so four of the most common units never appeared in any observation
-        while the arena - 3744 of the 3963 values in the flattened vector -
-        looked merely empty. Classes in ``_IGNORED_ARENA_CLASSES`` are
-        excluded from the warning because omitting them is a decision.
+        singular names ("minion") while the hand-written list held plurals
+        ("minions"), so four of the most common units never appeared in any
+        observation while the arena - the large majority of the flattened
+        vector - looked merely empty. Classes in ``IGNORED_ARENA_CLASSES``
+        are excluded from the warning because omitting them is a decision.
         """
-        n_classes = len(TROOP_CLASSES)
+        n_classes = len(ARENA_CLASSES)
         tensor = np.zeros((ARENA_ROWS, ARENA_COLS, n_classes * 2), dtype=np.float32)
         for y in range(ARENA_ROWS):
             for x in range(ARENA_COLS):
@@ -259,7 +231,7 @@ class GameBoard:
                 if troop is None:
                     continue
                 key = normalize_name(troop.name)
-                idx = _TROOP_INDEX.get(key)
+                idx = ARENA_INDEX.get(key)
                 if idx is None:
                     self._warn_unknown_troop(troop.name, key)
                     continue
@@ -270,24 +242,30 @@ class GameBoard:
     @staticmethod
     def _warn_unknown_troop(name: str, key: str) -> None:
         """Warn once per distinct unencodable troop name."""
-        if key in _IGNORED_ARENA_CLASSES or key in _warned_unknown_troops:
+        if key in IGNORED_ARENA_CLASSES or key in _warned_unknown_troops:
             return
         _warned_unknown_troops.add(key)
         logger.warning(
-            "Troop '%s' (normalized '%s') is not in TROOP_CLASSES - it is "
-            "being LEFT OUT of the arena observation entirely. The detector "
-            "and TROOP_CLASSES disagree; fix the name list.",
+            "Troop '%s' (normalized '%s') is not in ARENA_CLASSES - it is "
+            "being LEFT OUT of the arena observation entirely. The class "
+            "manifest and the detector disagree; regenerate with "
+            "`python -m src.main --derive-classes`.",
             name,
             key,
         )
 
     def hand_to_tensor(self) -> np.ndarray:
-        """One-hot encode the hand as ``(HAND_SIZE, len(TROOP_CLASSES))``."""
-        out = np.zeros((HAND_SIZE, len(TROOP_CLASSES)), dtype=np.float32)
+        """One-hot encode the hand as ``(HAND_SIZE, len(CARD_CLASSES))``.
+
+        Keyed on CARD_CLASSES, not the arena list: a card that cannot be
+        held (Goblin Brawler, and every spawn-only unit after it) has no
+        slot here at all.
+        """
+        out = np.zeros((HAND_SIZE, len(CARD_CLASSES)), dtype=np.float32)
         for slot, card in enumerate(self.cards_in_hand):
             if card is None:
                 continue
-            idx = _TROOP_INDEX.get(normalize_name(card.name))
+            idx = CARD_INDEX.get(normalize_name(card.name))
             if idx is not None:
                 out[slot, idx] = 1.0
         return out

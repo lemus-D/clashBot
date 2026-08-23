@@ -14,6 +14,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import time
 from datetime import datetime
@@ -96,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         help="run the interactive calibration wizard and exit; with no value "
              f"runs every phase, or name one of: {', '.join(PHASE_NAMES)}",
     )
+    p.add_argument(
+        "--derive-classes", action="store_true",
+        help="regenerate game/class_manifest.json from the detector's own "
+             "class names and exit; CHANGES THE OBSERVATION SCHEMA if the "
+             "model gained classes",
+    )
     args = p.parse_args()
     if args.policy == "imitation" and not args.weights:
         p.error("--policy imitation requires --weights")
@@ -166,9 +173,66 @@ def _crown_summary(state) -> str:
     return f"{state.crowns_friendly}-{state.crowns_enemy}?"
 
 
+def derive_classes(model_id: str) -> None:
+    """Regenerate the class manifest from the detector's own class names.
+
+    Order is append-only, so re-running this on an unchanged model rewrites
+    the file byte-identically and re-running it on a model that gained
+    classes appends them at the end - never reshuffling existing channel
+    indices, which is what lets a trained network's input layer be grown
+    instead of retrained.
+    """
+    from inference import get_model
+    from .game import classes as cls
+
+    api_key = os.getenv("API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "API_KEY is not set (put it in .env); the class manifest is "
+            "derived from the live model and cannot be generated offline."
+        )
+
+    model = get_model(model_id=model_id, api_key=api_key)
+    class_names = list(model.class_names)
+    arena, cards = cls.derive_from_class_names(class_names)
+
+    old = cls.load_manifest()
+    merged_arena = cls.merge_preserving_order(old["arena_classes"], arena)
+    merged_cards = cls.merge_preserving_order(old["card_classes"], cards)
+
+    added_arena = [n for n in merged_arena if n not in old["arena_classes"]]
+    added_cards = [n for n in merged_cards if n not in old["card_classes"]]
+    gone_arena = [n for n in merged_arena if n not in arena]
+    gone_cards = [n for n in merged_cards if n not in cards]
+
+    cls.write_manifest(model_id, merged_arena, merged_cards)
+
+    print(f"Model {model_id}: {len(class_names)} raw classes")
+    print(f"  arena: {len(merged_arena)}  cards: {len(merged_cards)}")
+    if added_arena or added_cards:
+        print(f"  ADDED arena={added_arena} cards={added_cards}")
+    if gone_arena or gone_cards:
+        # Kept deliberately: dropping them would shift every later index.
+        print(
+            f"  GONE FROM MODEL but kept as dead channels for index "
+            f"stability: arena={gone_arena} cards={gone_cards}"
+        )
+    if not (added_arena or added_cards or gone_arena or gone_cards):
+        print("  unchanged")
+    else:
+        print(
+            "  SCHEMA CHANGED: existing recordings and checkpoints will be "
+            "refused. Add elixir costs for any new card in game/cards.py."
+        )
+
+
 def run() -> None:
     args = parse_args()
     load_dotenv()
+
+    if args.derive_classes:
+        derive_classes(args.model)
+        return
 
     if args.calibrate is not None:
         from .calibrate import calibrate

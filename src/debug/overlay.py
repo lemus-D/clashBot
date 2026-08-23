@@ -12,10 +12,8 @@ from ..game.board import (
     GameBoard,
     ARENA_COLS,
     ARENA_ROWS,
-    _IGNORED_ARENA_CLASSES,
-    _TROOP_INDEX,
 )
-from ..game.cards import normalize_name
+from ..game.classes import ARENA_INDEX, IGNORED_ARENA_CLASSES, normalize_name
 from ..game.state import GameState
 
 TEXT_FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -26,7 +24,7 @@ TEXT_LINE_HEIGHT = 24
 
 # Troop markers. Friendly/enemy follow the detector's own blue/red naming.
 # DROPPED is for a troop the detector found but the observation cannot encode
-# - a name missing from TROOP_CLASSES. It should never appear; when it does,
+# - a name missing from ARENA_CLASSES. It should never appear; when it does,
 # that troop is absent from the arena tensor.
 FRIENDLY_TROOP_COLOR = (255, 160, 0)
 ENEMY_TROOP_COLOR = (60, 60, 255)
@@ -87,9 +85,9 @@ def draw_troops(frame: np.ndarray, board: GameBoard) -> tuple[int, int]:
             if troop is None:
                 continue
             key = normalize_name(troop.name)
-            if key in _IGNORED_ARENA_CLASSES:
+            if key in IGNORED_ARENA_CLASSES:
                 continue
-            in_obs = key in _TROOP_INDEX
+            in_obs = key in ARENA_INDEX
             if in_obs:
                 encoded += 1
                 color = FRIENDLY_TROOP_COLOR if troop.color == "blue" else ENEMY_TROOP_COLOR
@@ -153,11 +151,11 @@ def render_debug_overlay(
     if lifecycle_state is not None:
         lines.append(f"Lifecycle: {lifecycle_state}")
     # Whether the arena tensor is actually being populated. "dropped" above 0
-    # means the detector and TROOP_CLASSES disagree and those troops are
+    # means the detector and ARENA_CLASSES disagree and those troops are
     # missing from the observation.
     troop_line = f"Troops: {encoded} in obs"
     if dropped:
-        troop_line += f"  |  {dropped} DROPPED (not in TROOP_CLASSES)"
+        troop_line += f"  |  {dropped} DROPPED (not in ARENA_CLASSES)"
     lines.append(troop_line)
     draw_text_lines(out, lines, top_y=30)
 

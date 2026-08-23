@@ -69,6 +69,7 @@ from ..vision.lifecycle import (
     STATE_POSTMATCH,
     TEMPLATE_MATCH_THRESHOLD,
 )
+from ..game.classes import verify_against_model
 from .observation import ObservationBuilder, schema_descriptor, schema_hash
 from ..vision.crowns import PostMatchCrownReader
 from ..vision.elixir import ElixirReader
@@ -430,6 +431,12 @@ class ClashEnv:
         api_key = self.api_key or os.getenv("API_KEY")
         self._model = get_model(model_id=self.model_id, api_key=api_key)
         self._supervision = sv
+
+        # Close the loop on the class manifest. It is generated from the
+        # model rather than hand-written, but "generated once, long ago"
+        # is just a hand-written list with extra steps - this is the check
+        # that makes drift impossible rather than merely unlikely.
+        verify_against_model(self._model.class_names, self.model_id)
 
     # ----- spaces -----
 
