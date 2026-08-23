@@ -78,6 +78,20 @@ class UnitStats:
     spawn_period: float = 0.0  # seconds between spawn batches
     spawn_count: int = 1
     spawn_on_death: int = 0    # units released when destroyed
+    # Dies immediately after landing one attack (spirits, Battle Ram).
+    kamikaze: bool = False
+    # Charge: after travelling this far toward a target, speed is multiplied.
+    charge_range: float = 0.0
+    charge_speed_mult: float = 0.0
+    # Area damage on death (Bomb Tower's bomb).
+    death_damage: float = 0.0
+    death_damage_radius: float = 0.0
+    # Inferno-style ramp: [(seconds_at_this_stage, damage), ...]. Damage steps
+    # up while firing continuously at the SAME target and resets on a switch.
+    ramp: tuple[tuple[float, float], ...] = ()
+    # True for cards the detector cannot yet emit - modelled ahead of the
+    # vision model so a model bump needs no simulator work.
+    staged: bool = False
     confidence: Confidence = Confidence.WIKI
 
     @property
@@ -104,9 +118,9 @@ STANDARD_LEVEL: int = int(_MANIFEST["standard_level"])
 def _level_value(table: dict, level: int, fallback: float) -> float:
     """HP/damage at a displayed card level, clamped to the emitted band."""
     if not table:
-        return fallback
+        return float(fallback or 0.0)
     lv = min(max(level, min(LEVELS)), max(LEVELS))
-    return float(table[str(lv)])
+    return float(table.get(str(lv)) or fallback or 0.0)
 
 
 def _load(level: int = None):
@@ -134,6 +148,14 @@ def _load(level: int = None):
             spawn_period=float(u.get("spawn_period", 0.0)),
             spawn_count=int(u.get("spawn_count") or 1),
             spawn_on_death=int(u.get("spawn_on_death", 0)),
+            splash_radius=float(u.get("splash_radius", 0.0)),
+            kamikaze=bool(u.get("kamikaze", False)),
+            charge_range=float(u.get("charge_range", 0.0)),
+            charge_speed_mult=float(u.get("charge_speed_mult", 0.0)),
+            death_damage=float(u.get("death_damage", 0.0)),
+            death_damage_radius=float(u.get("death_damage_radius", 0.0)),
+            ramp=tuple(tuple(x) for x in (u.get("ramp") or [])),
+            staged=bool(u.get("staged", False)),
         )
 
     spells = {
@@ -202,25 +224,38 @@ if SPELL_NAMES != SPELL_CARDS:
     )
 
 
-def validate_against_manifest() -> None:
-    """Every arena class must be either a unit or a spell, and vice versa.
+STAGED_CLASSES: frozenset[str] = frozenset(
+    n for n, u in UNIT_STATS.items() if u.staged
+)
 
-    The simulator has to cover exactly what the detector can see. A unit the
-    sim knows but the detector cannot report is a policy input that will be
-    permanently zero on real hardware - a silent transfer failure, which is
-    the specific thing this check exists to prevent.
+
+def validate_against_manifest() -> None:
+    """Every arena class the DETECTOR can see must have stats.
+
+    The reverse is deliberately allowed: the table may describe more units
+    than the manifest knows. Those are STAGED - modelled ahead of the vision
+    model so a model bump is a one-command update rather than a research
+    project. They are inert until `--derive-classes` puts them in the
+    manifest, because decks are validated against CARD_CLASSES.
+
+    What is NOT allowed is the other direction. A class the detector emits
+    with no stats behind it would be a unit the simulator cannot represent,
+    so a policy trained here would meet something it has never seen.
     """
     described = set(UNIT_STATS) | SPELL_NAMES
-    known = set(ARENA_CLASSES)
-    missing = sorted(known - described)
-    extra = sorted(described - known)
-    if missing or extra:
+    missing = sorted(set(ARENA_CLASSES) - described)
+    if missing:
         raise ValueError(
-            f"Simulator unit table does not match ARENA_CLASSES: no stats "
-            f"for {missing!r}, stats for non-existent {extra!r}. The sim must "
-            f"model exactly what the detector can see, or a policy trained "
-            f"here reads inputs that real play can never produce. Add the "
-            f"missing units to tools/derive_unit_stats.py and regenerate."
+            f"Simulator has no stats for detector classes {missing!r}. The "
+            f"sim must model everything the detector can see. Add them to "
+            f"tools/derive_unit_stats.py and regenerate."
+        )
+    unstaged_extra = sorted(described - set(ARENA_CLASSES) - STAGED_CLASSES)
+    if unstaged_extra:
+        raise ValueError(
+            f"Simulator models {unstaged_extra!r}, which are neither detector "
+            f"classes nor marked staged. Either the manifest is out of date "
+            f"or these should be in tools/derive_unit_stats.py's STAGED set."
         )
 
 
@@ -300,4 +335,17 @@ def stats_confidence_report() -> str:
         "  NOTE: 'wiki' means the NUMBERS are real, not that the simulation "
         "built on them has been validated against actual play."
     )
+    if STAGED_CLASSES:
+        live = sorted(set(UNIT_STATS) - STAGED_CLASSES)
+        lines.append(f"  LIVE   {len(live):2d}  {', '.join(live)}")
+        lines.append(
+            f"  STAGED {len(STAGED_CLASSES):2d}  "
+            f"{', '.join(sorted(STAGED_CLASSES))}"
+        )
+        lines.append(
+            "    Modelled but INERT: the detector cannot emit these yet, so "
+            "they have no observation channel and decks reject them. They go "
+            "live when the vision model gains them and the manifest is "
+            "regenerated."
+        )
     return "\n".join(lines)

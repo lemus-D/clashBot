@@ -75,6 +75,17 @@ class Entity:
     # walking up beside it - which is why forcing a retarget in the real game
     # needs a stun or a displacement card, not just a distraction unit.
     locked_on_structure: bool = False
+    # Distance walked while pursuing the current target, for charge units.
+    charge_distance: float = 0.0
+    # Seconds spent firing continuously at the SAME target, for damage ramps.
+    fire_time: float = 0.0
+
+    @property
+    def charging(self) -> bool:
+        return (
+            self.stats.charge_range > 0.0
+            and self.charge_distance >= self.stats.charge_range
+        )
 
     @property
     def is_tower(self) -> bool:
@@ -113,6 +124,22 @@ def _tower_entity(spec: TowerSpec, level: int) -> Entity:
         # Kings do not fire until a princess falls or they are hit.
         active=not spec.is_king,
     )
+
+
+def current_damage(e: Entity) -> float:
+    """Damage for this swing, accounting for an Inferno-style ramp.
+
+    Stages are cumulative durations of CONTINUOUS fire at one target. Without
+    a ramp this is just the flat damage.
+    """
+    if not e.stats.ramp:
+        return e.stats.damage
+    elapsed = 0.0
+    for duration, damage in e.stats.ramp:
+        elapsed += duration
+        if e.fire_time < elapsed:
+            return damage
+    return e.stats.ramp[-1][1]
 
 
 def can_attack(attacker: Entity, defender: Entity) -> bool:
@@ -329,6 +356,13 @@ class Simulation:
         if e.is_tower:
             self._on_tower_destroyed(e)
             return
+        if e.stats.death_damage > 0.0:
+            # Bomb Tower drops a bomb rather than leaving a unit behind.
+            for other in list(self.entities.values()):
+                if not other.alive or other.friendly == e.friendly:
+                    continue
+                if arena.distance(e.x, e.y, other.x, other.y) <= e.stats.death_damage_radius:
+                    self._damage(other, e.stats.death_damage)
         if e.stats.spawn_on_death:
             for i in range(e.stats.spawn_on_death):
                 ox, oy = self._squad_offset(i, max(2, e.stats.spawn_on_death))
@@ -454,6 +488,12 @@ class Simulation:
         elif target.is_building and not e.locked_on_structure:
             target = self._nearest_troop_in_sight(e) or target
 
+        if target is not None and target.uid != e.target_uid:
+            # A ramp is earned against ONE target and resets on a switch -
+            # that is the whole counterplay to Inferno Tower. Charge resets
+            # too: a unit that turns has to build its run up again.
+            e.fire_time = 0.0
+            e.charge_distance = 0.0
         e.target_uid = target.uid if target else None
         return target
 
@@ -517,9 +557,13 @@ class Simulation:
         dist = arena.distance(e.x, e.y, target.x, target.y)
 
         if dist <= reach:
+            e.fire_time += dt
             if e.attack_cooldown <= 0.0 and e.stats.damage > 0.0:
                 self._attack(e, target)
             return
+
+        # Out of reach: not firing, so a ramp decays back to its first stage.
+        e.fire_time = 0.0
 
         if e.stats.speed > 0.0:
             self._move_toward(e, target, dt)
@@ -533,7 +577,9 @@ class Simulation:
         if target.is_building:
             # Committed now: see _retarget.
             e.locked_on_structure = True
-        self._damage(target, e.stats.damage)
+
+        damage = current_damage(e)
+        self._damage(target, damage)
         if e.stats.splash_radius > 0.0:
             for other in list(self.entities.values()):
                 if other.uid == target.uid or not other.alive:
@@ -541,7 +587,16 @@ class Simulation:
                 if other.friendly == e.friendly or not can_attack(e, other):
                     continue
                 if arena.distance(target.x, target.y, other.x, other.y) <= e.stats.splash_radius:
-                    self._damage(other, e.stats.damage)
+                    self._damage(other, damage)
+
+        # A charge is spent on impact; the unit has to build another run up.
+        e.charge_distance = 0.0
+
+        if e.stats.kamikaze:
+            # Spirits and the Battle Ram land one hit and are gone. Routed
+            # through _on_death so their death spawn still fires - that is
+            # how a Battle Ram becomes two Barbarians.
+            self._on_death(e)
 
     def _move_toward(self, e: Entity, target: Entity, dt: float) -> None:
         if e.stats.flying:
@@ -554,6 +609,10 @@ class Simulation:
         if dist < 1e-6:
             return
         step = e.stats.speed * dt
+        if e.stats.charge_range > 0.0:
+            if e.charging:
+                step *= e.stats.charge_speed_mult or 1.0
+            e.charge_distance += step
         nx = e.x + dx / dist * step
         ny = e.y + dy / dist * step
 

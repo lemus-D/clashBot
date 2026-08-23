@@ -62,8 +62,16 @@ RANGE_TO_GRID = 2000.0
 SPEED_TO_GRID = 120.0
 MS = 1000.0
 
-# our ARENA_CLASSES key -> game-data character name
+# our key -> game-data character name.
+#
+# Cards beyond arena 1 are STAGED: modelled here so the simulator is ready,
+# but NOT added to the detector's class manifest, because troop-counter/8
+# cannot emit them. Putting them in the manifest early is precisely the bug
+# that was reverted in 309117a - every one becomes a permanently-zero
+# observation channel. When the model gains them, `--derive-classes` picks
+# them up and these stats are already waiting.
 UNITS = {
+    # TrainingCamp + Arena 1: what the detector can see today.
     "knight": "Knight",
     "archer": "Archer",
     "minion": "Minion",
@@ -73,13 +81,53 @@ UNITS = {
     "minipekka": "MiniPekka",
     "giant": "Giant",
     "goblinbrawler": "GoblinBrawler",
+    # Arena 2
+    "skeleton": "Skeleton",
+    "valkyrie": "Valkyrie",
+    "bomber": "Bomber",
+    # Arena 3
+    "barbarian": "Barbarian",
+    "battleram": "BattleRam",
+    "megaminion": "MegaMinion",
+    # Arena 4
+    "wizard": "Wizard",
+    "firespirit": "FireSpirits",
+    "electrospirit": "ElectroSpirit",
+    "skeletondragon": "SkeletonDragon",
 }
-BUILDINGS = {"goblincage": "GoblinCage", "goblinhut": "GoblinHut"}
+BUILDINGS = {
+    "goblincage": "GoblinCage",
+    "goblinhut": "GoblinHut",
+    # Arena 2-4
+    "tombstone": "Tombstone",
+    "cannon": "Cannon",
+    "infernotower": "InfernoTower",
+    "bombtower": "BombTower",
+}
 SPELLS = {"arrows": "ArrowsSpell", "fireball": "FireballSpell"}
 
-# Squad sizes. summon_number in the card data is unreliable for these, so they
-# are stated here and asserted against the deployed-count behaviour in tests.
-COUNTS = {"archer": 2, "minion": 3, "goblin": 3, "speargoblin": 3}
+# Everything the current detector CANNOT emit. Kept out of the manifest.
+STAGED = {
+    "skeleton", "valkyrie", "bomber", "tombstone",
+    "barbarian", "battleram", "megaminion", "cannon",
+    "wizard", "firespirit", "electrospirit", "skeletondragon",
+    "infernotower", "bombtower",
+}
+
+# Squad sizes, from the card entries' summon_number (0 means 1).
+COUNTS = {
+    "archer": 2, "minion": 3, "goblin": 3, "speargoblin": 3,
+    "skeleton": 3, "barbarian": 5, "skeletondragon": 2,
+}
+
+# Units whose death releases something, where the spawned character is not
+# one of ours under the same name.
+DEATH_SPAWN_MAP = {
+    "SpearGoblin": "speargoblin",
+    "GoblinBrawler": "goblinbrawler",
+    "Barbarian": "barbarian",
+    "Skeleton": "skeleton",
+}
 
 
 def fetch(name: str) -> list[dict]:
@@ -108,7 +156,47 @@ def by_level(entry: dict, field: str, rarity: str) -> dict[str, int]:
     Only HP and damage scale with level in Clash Royale - speed, range and
     hit speed do not - so those are the only fields that get a table.
     """
-    return {str(L): at_level(entry, field, rarity, L) for L in LEVELS}
+    # 0 rather than None for things that simply do not have the stat - a
+    # spawner has no damage, and a null would have to be special-cased by
+    # every reader.
+    return {str(L): (at_level(entry, field, rarity, L) or 0) for L in LEVELS}
+
+
+def splash_of(entry: dict, proj: dict) -> float:
+    """Area-damage radius in grid tiles, 0 for single-target.
+
+    Melee splashers (Valkyrie) carry it on the character as
+    ``area_damage_radius``; ranged ones (Bomber, Wizard) carry it on their
+    projectile's ``radius``. A projectile with no radius is a single-target
+    shot, not an area one - Mega Minion and Cannon land here.
+    """
+    r = entry.get("area_damage_radius")
+    if not r and proj:
+        r = proj.get("radius")
+    return round((r or 0) / RANGE_TO_GRID, 4)
+
+
+def ramp_of(entry: dict, rarity: str) -> list:
+    """Inferno-style damage ramp as ``[[seconds, damage], ...]``.
+
+    The game data gives the later stages only at level 1
+    (``variable_damage2``/``3``), so they are scaled by the same factor the
+    base damage moves by. Derived, not measured - flagged in the output.
+    """
+    t1 = entry.get("variable_damage_time1")
+    if not t1:
+        return []
+    base1 = entry.get("damage") or 0
+    scaled = at_level(entry, "damage", rarity) or 0
+    factor = (scaled / base1) if base1 else 1.0
+    stages = [[t1 / MS, scaled]]
+    for n in (2, 3):
+        d = entry.get(f"variable_damage{n}")
+        if not d:
+            break
+        dur = entry.get(f"variable_damage_time{n}", 0) / MS
+        stages.append([dur, round(d * factor, 1)])
+    return stages
 
 
 def targets_of(entry: dict) -> str:
@@ -161,6 +249,13 @@ def main() -> None:
                 (c.get("collision_radius") or 500) / RANGE_TO_GRID, 4
             ),
             "is_building": False,
+            "splash_radius": splash_of(c, pr.get(c.get("projectile")) or {}),
+            "kamikaze": bool(c.get("kamikaze")),
+            "charge_range": round((c.get("charge_range") or 0) / RANGE_TO_GRID, 4),
+            "charge_speed_mult": (c.get("charge_speed_multiplier") or 0) / 100.0,
+            "spawn_on_death": c.get("death_spawn_count") or 0,
+            "spawns": DEATH_SPAWN_MAP.get(c.get("death_spawn_character")),
+            "staged": key in STAGED,
             "source_name": gname,
             "source_rarity": rarity,
         }
@@ -171,11 +266,31 @@ def main() -> None:
             raise SystemExit(f"building {gname!r} not in game data")
         rarity = b.get("rarity") or "Rare"
         spawn = b.get("spawn_character")
+        # Defensive buildings carry their damage on a projectile, exactly as
+        # ranged troops do; spawners genuinely have none.
+        bproj = pr.get(b.get("projectile")) or {}
+        dmg_src = b if at_level(b, "damage", rarity) else bproj
+
+        # A death "spawn" that is not a real unit is an explosion. Bomb Tower
+        # drops a BombTowerBomb, which is a one-off area hit rather than
+        # something that walks around, so it is modelled as death damage.
+        death_char = b.get("death_spawn_character")
+        bomb = bd.get(death_char) if death_char else None
+        death_damage = death_damage_radius = 0.0
+        if bomb and bomb.get("death_damage"):
+            death_damage = at_level(bomb, "death_damage", rarity) or bomb["death_damage"]
+            death_damage_radius = round(
+                (bomb.get("death_damage_radius") or 0) / RANGE_TO_GRID, 4
+            )
+            death_char = None  # consumed as damage, not as a spawn
+
         units[key] = {
             "hp": at_level(b, "hitpoints", rarity),
-            "damage": at_level(b, "damage", rarity) or 0,
+            "damage": at_level(dmg_src, "damage", rarity) or 0,
             "hp_by_level": by_level(b, "hitpoints", rarity),
-            "damage_by_level": by_level(b, "damage", rarity),
+            "damage_by_level": by_level(dmg_src, "damage", rarity),
+            "death_damage": death_damage,
+            "death_damage_radius": death_damage_radius,
             "hit_speed": (b.get("hit_speed") or 1000) / MS,
             "attack_range": round((b.get("range") or 0) / RANGE_TO_GRID, 4),
             "speed": 0.0,
@@ -193,10 +308,14 @@ def main() -> None:
             # the gap WITHIN a batch, which this sim does not model.
             "spawn_period": (b.get("spawn_pause_time") or 0) / MS,
             "spawn_count": b.get("spawn_number") or 0,
-            "spawn_on_death": b.get("death_spawn_count") or 0,
-            "spawns": {"SpearGoblin": "speargoblin",
-                       "GoblinBrawler": "goblinbrawler"}.get(
-                           b.get("death_spawn_character") or spawn),
+            "spawn_on_death": (b.get("death_spawn_count") or 0) if death_char else 0,
+            "spawns": DEATH_SPAWN_MAP.get(death_char or spawn),
+            "splash_radius": splash_of(b, pr.get(b.get("projectile")) or {}),
+            "kamikaze": False,
+            "charge_range": 0.0,
+            "charge_speed_mult": 0.0,
+            "ramp": ramp_of(b, rarity),
+            "staged": key in STAGED,
             "source_name": gname,
             "source_rarity": rarity,
         }

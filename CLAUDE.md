@@ -195,6 +195,28 @@ speculatively generalize for cases that don't exist yet.)
       as the data says and flagged, not silently overridden.
   - Sim fidelity is the CEILING on everything trained here. `--stats` prints
     how much of the table is actually trusted.
+  - STAGED CARDS: `unit_stats.json` models 14 cards the detector CANNOT
+    emit yet - arena 2 (skeleton, valkyrie, bomber, tombstone), arena 3
+    (barbarian, battleram, megaminion, cannon) and arena 4 (wizard,
+    firespirit, electrospirit, skeletondragon, infernotower, bombtower).
+    They carry `staged: true` and are deliberately ABSENT from the class
+    manifest, so they have no observation channel and `Deck` rejects them.
+    Adding them to the manifest early is the bug reverted in 309117a: every
+    one becomes a permanently-zero input. When the vision model gains them,
+    `--derive-classes` promotes them and no simulator work is needed.
+    `validate_against_manifest` therefore checks ONE direction - every
+    detector class needs stats; extra staged stats are fine.
+  - Mechanics behind those cards, all read from game data rather than
+    invented: `splash_radius` (Valkyrie carries it on the character as
+    `area_damage_radius`, ranged units on their projectile's `radius`),
+    `kamikaze` (spirits AND Battle Ram die after one hit - routed through
+    `_on_death` so the Ram still becomes two Barbarians), `charge_range` /
+    `charge_speed_mult` (Battle Ram; charge only multiplies SPEED, the
+    impact is normal damage plus kamikaze, and it resets on impact or a
+    target switch), `ramp` (Inferno Tower's three stages, which reset when
+    the target changes - that reset IS the counterplay), and `death_damage`
+    (Bomb Tower's bomb, modelled as an explosion rather than a spawned
+    unit).
   - TARGETING follows the real game's rules, which are subtler than they
     look and were got wrong first time:
     - A troop WALKING toward a tower diverts to an enemy entering sight
