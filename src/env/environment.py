@@ -30,7 +30,7 @@ the nearest observation preceding its timestamp. See
 
 A recording run also emits one ``{"type": "diag"}`` line per perception
 cycle holding the raw lifecycle decision inputs (elixir magenta
-fraction, template scores, banner pixel and colour distances, and which
+fraction, template scores, the winner label's colour shares, and which
 code path produced the verdict), and one ``{"type": "result"}`` line per
 episode carrying the match outcome plus the crown score read off the
 postmatch screen. Both are separate line types, not extra observation
@@ -175,6 +175,15 @@ RECORD_FORMAT = 2
 # is exactly the ~5s-fast simulation this anchoring exists to remove.
 CLOCK_ANCHOR_GRACE_SEC = 20.0
 
+# How long to keep perceiving postmatch frames before ending the episode.
+# POSTMATCH is declared as soon as the OK button matches, which happens
+# while the "Winner!" label and the crown rows are still animating in, so
+# the first such frame answers neither "who won" nor "by how much". Two
+# seconds is ~6 perception cycles at the default step period; the episode
+# ends earlier than that the moment both the outcome and the crowns are
+# read, so a clean postmatch screen costs nothing.
+POSTMATCH_SETTLE_SEC = 2.0
+
 
 def check_record_meta(meta: dict, path: str) -> None:
     """Raise unless ``meta`` declares the current record framing version.
@@ -286,11 +295,11 @@ def diag_record(*, t: float, step: int, signals: LifecycleSignals) -> dict:
     leaves every existing obs/act line byte-identical and readers that
     don't know it skip it (see ``src/imitation/dataset.py``).
 
-    ``template_hits`` is ``{}`` and the banner fields are ``None`` when
-    the elixir gate short-circuited before those signals were computed —
-    absence here is itself the diagnosis.
+    ``template_hits`` is ``{}`` and the winner-label fields are ``None``
+    when the elixir gate short-circuited before those signals were
+    computed — absence here is itself the diagnosis.
     """
-    banner = signals.banner
+    label = signals.winner_label
     return {
         "type": "diag",
         "t": t,
@@ -301,9 +310,8 @@ def diag_record(*, t: float, step: int, signals: LifecycleSignals) -> dict:
         "elixir_magenta_frac": signals.elixir_magenta_frac,
         "elixir_bar_visible": signals.elixir_bar_visible,
         "template_hits": signals.template_hits,
-        "banner_bgr": list(banner.bgr) if banner is not None else None,
-        "banner_dist_victory": banner.dist_victory if banner is not None else None,
-        "banner_dist_defeat": banner.dist_defeat if banner is not None else None,
+        "winner_label_cyan_frac": label.cyan_frac if label is not None else None,
+        "winner_label_pink_frac": label.pink_frac if label is not None else None,
     }
 
 
@@ -400,6 +408,10 @@ class ClashEnv:
         self._last_step_time: float = 0.0
         self._record_file = None
         self._step_count: int = 0
+        # Frame time of the first POSTMATCH frame of the current match, or
+        # None while the match is still live. Drives the settle window in
+        # ``resolve_done`` and suppresses placements once it is set.
+        self._postmatch_since: Optional[float] = None
 
     # ----- model bootstrap -----
 
@@ -443,6 +455,7 @@ class ClashEnv:
             self._open_record_file()
 
         self._step_count = 0
+        self._postmatch_since = None
 
         # Perceive before returning: without this the first observation
         # of every episode is a blank arena with an empty hand, and the
@@ -473,6 +486,11 @@ class ClashEnv:
         # (s_t, a_t) — the state the policy actually acted on — even
         # though the observation returned below is s_{t+1}.
         assert self.capture is not None and self.board is not None
+        # Inside the postmatch settle window the match is already over and
+        # the arena is gone; executing the policy's placement would click
+        # around the postmatch screen. Downgrade it to a no-op instead.
+        if self._postmatch_since is not None:
+            action_obj = Action.no_op()
         action_time = time.time()
         action_result = self.executor.execute(
             action_obj, self.board, self.state, self.capture.monitor
@@ -485,8 +503,17 @@ class ClashEnv:
 
         done = self.resolve_done(signals)
 
+        # The terminal term is paid once, on the step that ends the episode,
+        # and from the result the env actually adopted — which may have come
+        # from an earlier frame of the settle window or from the crown score
+        # rather than from this frame's signals.
         reward = float(
-            self.reward_fn(prev_tower_hp, self.state, signals.result, action_result)
+            self.reward_fn(
+                prev_tower_hp,
+                self.state,
+                self.state.match_result if done else None,
+                action_result,
+            )
         )
 
         info: dict[str, Any] = {
@@ -540,17 +567,41 @@ class ClashEnv:
         match. This runs BEFORE ``step`` computes the step's reward, which
         is what lets the crown-scaled terminal bonus use the true counts
         rather than the drifting inferred ones.
+
+        The episode does NOT end on the first POSTMATCH frame. That frame
+        is whichever one the OK button first matched on, and the OK button
+        renders while the "Winner!" label is still animating in, so the
+        outcome and the crowns are both unreadable there — the first demo
+        session labelled three won matches ``None`` / ``loss`` / ``None``
+        for exactly this reason. Perception continues for up to
+        ``POSTMATCH_SETTLE_SEC`` and ends as soon as both land.
         """
         if signals.state == STATE_POSTMATCH:
+            if self._postmatch_since is None:
+                self._postmatch_since = self.frame_time
             if signals.result and self.state.match_result is None:
                 self.state.set_match_result(signals.result)
             self._read_final_crowns()
+            self._infer_result_from_crowns()
+            if (
+                self.state.match_result is not None
+                and self.state.final_crowns_friendly is not None
+            ):
+                return True
+            return (
+                self.frame_time - self._postmatch_since >= POSTMATCH_SETTLE_SEC
+            )
+        if self._postmatch_since is not None:
+            # The postmatch screen came and went inside the settle window
+            # (dismissed, or a single frame of it was noise). Nothing more
+            # is coming, so stop rather than run out the match timeout.
             return True
         if self.state.match_result is not None:
-            # Only the lifecycle sets this now, so reaching it means the
-            # banner was seen on an earlier frame. It used to be reachable
-            # from a single bad tower-HP reading, which ended matches
-            # mid-play while this very check said the state was IN_MATCH.
+            # Only the postmatch screen sets this — the lifecycle label or
+            # the crown score, both above — so reaching it on a non-postmatch
+            # frame means that screen was seen earlier. It used to be
+            # reachable from a single bad tower-HP reading, which ended
+            # matches mid-play while this very check said IN_MATCH.
             return True
         # Uncapped elapsed, not get_current_match_time(): that saturates at
         # MATCH_MAX_DURATION (300s), so comparing it against a longer
@@ -629,10 +680,10 @@ class ClashEnv:
         """Read the postmatch crown counts once per match.
 
         Gated on ``final_crowns_friendly`` rather than on the lifecycle
-        state, because POSTMATCH persists for many cycles while the banner
-        is up and this only needs to succeed once. A frame that cannot be
-        interpreted leaves the inferred counts in place and is retried on
-        the next cycle, so a single mid-animation frame costs nothing.
+        state, because this only needs to succeed once. A frame that cannot
+        be interpreted leaves the inferred counts in place and is retried on
+        the next cycle of the settle window, so a single mid-animation frame
+        costs nothing.
         """
         if self.state.final_crowns_friendly is not None:
             return
@@ -642,6 +693,28 @@ class ClashEnv:
         if crowns is None:
             return
         self.state.set_final_crowns(crowns["friendly"], crowns["enemy"])
+
+    def _infer_result_from_crowns(self) -> None:
+        """Fall back to the crown score when the label never resolved.
+
+        The crown reader is the more trustworthy of the two postmatch
+        signals — it refuses a frame whose rows don't show their own
+        cushion colour, so a count it returns came off a real postmatch
+        screen. If it produced a score while the "Winner!" label stayed
+        unreadable, the score already says who won.
+        """
+        if self.state.match_result is not None:
+            return
+        friendly = self.state.final_crowns_friendly
+        enemy = self.state.final_crowns_enemy
+        if friendly is None or enemy is None:
+            return
+        if friendly > enemy:
+            self.state.set_match_result("win")
+        elif friendly < enemy:
+            self.state.set_match_result("loss")
+        else:
+            self.state.set_match_result("draw")
 
     def _anchor_clock(self, frame: np.ndarray) -> None:
         """Pin the match clock to the on-screen timer, once per match.

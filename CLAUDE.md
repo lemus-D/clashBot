@@ -99,6 +99,23 @@ speculatively generalize for cases that don't exist yet.)
   inference-time masking of unaffordable slots and unplaceable tiles.
   PyTorch; this machine has an RTX 4070 — use the cu128 CUDA build, at the
   torch version torchvision pins (see requirements.txt for the command).
+- Postmatch verdict: the episode does NOT end on the first POSTMATCH frame.
+  POSTMATCH is declared as soon as the OK button matches, and the OK button
+  renders while the "Winner!" label and the crown rows are still animating in,
+  so that frame answers neither who won nor by how much — the first human demo
+  session labelled three won matches `None`/`loss`/`None` this way.
+  `resolve_done` keeps perceiving for up to `POSTMATCH_SETTLE_SEC` (2s) and
+  ends as soon as BOTH the outcome and the crowns are read; `step` downgrades
+  placements to no-ops inside that window so the policy can't click the
+  postmatch screen. The terminal reward is paid once, on the closing step,
+  from `state.match_result` rather than that frame's `signals.result`.
+  Win/loss is decided by the COLOUR of the matched label, not by template
+  score: `victory.png` and `defeat.png` are the SAME word ("Winner!") drawn
+  cyan over the friendly row and pink over the enemy one, so each scores high
+  on the other's label (0.897 vs 0.750 measured, around a 0.80 threshold)
+  while the colours are 45% vs 0%. Scores are only the mid-animation
+  tiebreak, compared — never `if/elif` priority, which handed every double
+  hit to "win". If the label never resolves, the crown score decides.
 - Crown score: `src/vision/crowns.py` reads how many crowns each side won off
   the POSTMATCH screen, once per match, and `GameState.set_final_crowns`
   overwrites the mid-match inferred tally with it (that tally comes from

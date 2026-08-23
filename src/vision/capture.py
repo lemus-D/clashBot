@@ -16,10 +16,16 @@ import numpy as np
 import pywinctl as gw
 
 
-WINDOW_CROP_TOP    = 47
-WINDOW_CROP_LEFT   = 384
-WINDOW_CROP_RIGHT  = 51
-WINDOW_CROP_BOTTOM = 2
+# The left crop tracks the BlueStacks ad sidebar, which is NOT always
+# present: with it up the window is ~1045 wide and the game starts at
+# x=384, without it the window is 659 wide and the game starts at x=0.
+# When it toggles, the only symptom is reset() timing out after 60s with
+# nothing recognizable in frame, so re-run `--calibrate viewport`.
+# src/vision/capture.py
+WINDOW_CROP_TOP    = 48
+WINDOW_CROP_LEFT   = 1
+WINDOW_CROP_RIGHT  = 56
+WINDOW_CROP_BOTTOM = 3
 
 
 class ScreenCapture:
