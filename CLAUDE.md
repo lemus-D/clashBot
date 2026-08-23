@@ -145,6 +145,51 @@ speculatively generalize for cases that don't exist yet.)
   lifecycle state is wrong. Terminal reward scales with the crown margin
   (`TERMINAL_BASE_REWARD` +/- `CROWN_MARGIN_REWARD` per crown): a 3-crown win
   pays +14, a 1-crown win +10.
+- Simulator (`src/sim/`): a headless Clash Royale model that produces the
+  SAME observation schema as `ClashEnv`, so a policy trained in sim runs on
+  BlueStacks unchanged. ~650x real time, ~11k matches/hour vs ~18 on
+  hardware. This is the RL training backend; the vision pipeline is the
+  deployment backend.
+  - `env.py` does NOT build observations. It fills a real `GameBoard` and a
+    `_SimStateAdapter` and calls the real `ObservationBuilder`. One encoder,
+    two backends - duplicating it would drift immediately. That adapter is
+    the seam; keep it.
+  - `units.py` is the stat table, and NONE of it is measured. Every entry
+    carries a `Confidence` (`measured`/`wiki`/`guess`) and `randomize()`
+    perturbs each stat per episode with spread scaled by how little it is
+    trusted. RL exploits a confidently-wrong constant as if it were a
+    mechanic, so a stat you cannot validate must be randomized, not guessed
+    once. `--no-randomize` is for evaluation only.
+  - Sim fidelity is the CEILING on everything trained here. `--stats` prints
+    how much of the table is actually trusted.
+  - `ObservationNoise` exists because the sim sees perfectly and the vision
+    pipeline does not: detection dropout, position jitter, phantom units,
+    and stale tower bars (an occluded bar holds its previous value, exactly
+    as `GameState` does). Defaults are GUESSES - they should be replaced
+    with rates measured off recorded detections.
+  - Step cadence is 0.25s (4 Hz), MEASURED: `ClashEnv.step_period_sec` is
+    0.25 and real recordings hold it (median 0.251s, p10 0.250 over 2098
+    in-match cycles; p90 0.523 is a missed slot). Do not change it
+    independently of the real loop - matched timing is the whole point.
+  - Engine ticks at 20 Hz (`TICK_DT`), five sub-steps per observation. At
+    4 Hz a fast unit would skip past its own attack range between frames.
+  - Units, buildings and towers are all one `Entity` type; towers are
+    immobile entities with a `tower_key` matching `TOWER_KEYS`.
+  - Reward adds to the real env's shaping: explicit `TOWER_DESTROYED_REWARD`
+    / `TOWER_LOST_PENALTY` on top of the HP swing, and a small per-step
+    `ELIXIR_CAP_PENALTY` for sitting at 10 (wasted regeneration).
+  - Opponent is a pluggable `env.opponent` callable that reasons in its OWN
+    frame and is mirrored at placement, so there is one coordinate
+    convention. The opponent POOL (scripted + self-play + frozen league) is
+    NOT built yet - `opponent=None` means the enemy never plays, so a 100%
+    win rate right now means nothing. Keep some scripted opponents frozen
+    as a benchmark: self-play win rate is ~50% by construction and measures
+    nothing.
+  - `python -m src.sim.run --watch` is the visual debugger: TRUTH on the
+    left, OBSERVED (post-noise, what the policy actually gets) on the right.
+    Noise events are RECORDED by `env.py`, never inferred by comparing the
+    two panels - jitter moves a unit to a neighbouring tile and would be
+    mislabelled a phantom.
 - Entry point: `src/main.py` — CLI driver: `RandomPolicy`, `--debug`,
   `--record`, `--record-human`, `--calibrate`.
 - Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
