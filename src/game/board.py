@@ -42,14 +42,6 @@ FRIENDLY_HALF_START_ROW = 8
 # are static anyway, so channels for them would add 4 x 144 values of no new
 # information. See ``_IGNORED_ARENA_CLASSES``.
 TROOP_CLASSES: tuple[str, ...] = (
-    "skeletons",
-    "bomber",
-    "cannon",
-    "tombstone",
-    "megaminion",
-    "battleram",
-    "valkyrie",
-    "barbarians",
     "goblin",
     "speargoblin",
     "arrows",
