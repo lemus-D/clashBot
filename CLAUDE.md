@@ -335,6 +335,40 @@ speculatively generalize for cases that don't exist yet.)
     Noise events are RECORDED by `env.py`, never inferred by comparing the
     two panels - jitter moves a unit to a neighbouring tile and would be
     mislabelled a phantom.
+- RL training (`src/rl/`): PPO against the scripted opponent pool.
+  `python -m src.rl.train --total-steps 2000000 --out models/ppo.pt`,
+  `--smoke` for a wiring check, `--eval-only CKPT` to benchmark. ~660
+  steps/sec on the 4070, so 2M steps is under an hour.
+  - `policy.py` is an actor-critic over the FACTORED action (play / slot /
+    tile) with a value head. MASKING is the part to be careful with:
+    - the tile mask DEPENDS ON THE SLOT (a spell may be aimed anywhere, a
+      troop may not), so the slot is sampled FIRST and the mask built from
+      it. Anything that masks tiles before knowing the slot re-creates the
+      dead-spell bug.
+    - masks are STORED with the rollout, not rebuilt at update time; two
+      implementations of the same rule would drift.
+    - masked logits use a large FINITE negative, not `-inf`, which NaNs
+      through a softmax if a row is fully masked.
+    - entropy sums the component entropies UNWEIGHTED. Weighting slot/tile
+      by P(play) is more correct and was measurably wrong: the policy plays
+      on ~4% of steps, so the placement heads got 4% of the exploration
+      bonus - effectively `ent_coef` 0.0004 against a 144-way choice.
+      Entropy went from 0.2 to 5.7 (max ~7.05) on the fix.
+  - `vec_env.py` batches SimEnvs. Synchronous - it buys one batched forward
+    pass, not parallel simulation. Envs AUTO-RESET, and each gets its OWN
+    opponent instance (a shared bot would have one committed lane driven by
+    N matches). GAE must not bootstrap through a reset; there is a test.
+  - `evaluate.py` is the benchmark: fixed `EVAL_SEED` distinct from training
+    seeds, same distribution as training by default (`clean=True` pins
+    sampling off). Batched - one env at a time made evaluation dominate
+    training wall-clock. The headline number EXCLUDES `idle`, which any
+    working policy beats.
+  - Checkpoints carry the observation `schema_hash` and refuse to load
+    across a change. The schema has moved four times; a silent load would
+    read the wrong channels while appearing to work.
+  - `play_rate` is logged every update. ~0.026 is the sustainable rate given
+    elixir regen, so a value far below that is no-op collapse and a value
+    far above it means the affordability mask is broken.
 - Entry point: `src/main.py` — CLI driver: `RandomPolicy`, `--debug`,
   `--record`, `--record-human`, `--calibrate`.
 - Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
@@ -368,9 +402,12 @@ speculatively generalize for cases that don't exist yet.)
   `python -m src.main --policy imitation --weights models/imitation.pt`.
 - Regenerate the class manifest: `python -m src.main --derive-classes`
   (needs API_KEY; announces any schema change it causes).
+- Train a policy: `python -m src.rl.train --total-steps 2000000
+  --out models/ppo.pt` (add `--smoke` for a fast wiring check).
+  Benchmark one: `python -m src.rl.train --eval-only models/ppo.pt`.
 - Tests: `pip install -r requirements-dev.txt` then `pytest`. Covers the
-  class manifest, observation encoding and the simulator - everything
-  that runs without a screen or an emulator. Build: none yet.
+  class manifest, observation encoding, the simulator and the RL stack -
+  everything that runs without a screen or an emulator. Build: none yet.
 
 ## Coding Practices
 
