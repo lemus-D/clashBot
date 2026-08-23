@@ -38,15 +38,50 @@ LAST_DITCH_ROW = ARENA_ROWS - 2
 
 
 @dataclass(frozen=True)
-class Threat:
-    """An enemy unit, in the opponent's OWN frame - already mirrored, so a
-    threat inside its half reads ``tile_y >= FRIENDLY_HALF_START_ROW`` just
-    like everything else the opponent reasons about."""
+class UnitView:
+    """A unit on the field, in the opponent's OWN frame - already mirrored,
+    so anything inside its half reads ``tile_y >= FRIENDLY_HALF_START_ROW``
+    just like everything else the opponent reasons about."""
 
     name: str
     tile_x: int
     tile_y: int
     flying: bool
+
+
+#: Enemy units are the same shape; the name reads better at the call site.
+Threat = UnitView
+
+
+@dataclass(frozen=True)
+class Style:
+    """Per-archetype knobs. Collapsing these out of the bot bodies is what
+    lets a new archetype be a table entry rather than a new class."""
+
+    name: str
+    reaction_s: float
+    #: Elixir held back for defence; offence only spends above this.
+    reserve: float
+    #: Where this style's offence lands by default.
+    push_row: int
+    #: Where a heavy unit starts, if the style commits one.
+    tank_row: int
+
+
+STYLES: dict[str, Style] = {
+    # Cheap hand, answers fast, chips constantly at the bridge.
+    "cycle": Style("cycle", reaction_s=0.6, reserve=0.0,
+                   push_row=PUSH_ROW, tank_row=PUSH_ROW),
+    # Holds elixir for defence and converts a won defence into a push.
+    "control": Style("control", reaction_s=0.7, reserve=4.0,
+                     push_row=PUSH_ROW, tank_row=SUPPORT_ROW),
+    # Saves to near-full, then commits a tank deep so the push gathers.
+    "beatdown": Style("beatdown", reaction_s=0.8, reserve=0.0,
+                      push_row=PUSH_ROW, tank_row=BACKLINE_ROW),
+    # Not a real archetype - a stress test. Spends everything, immediately.
+    "dump": Style("dump", reaction_s=1.0, reserve=0.0,
+                  push_row=PUSH_ROW, tank_row=PUSH_ROW),
+}
 
 
 @dataclass
@@ -63,7 +98,8 @@ class OpponentView:
     time: float
     phase: str
     can_place: object  # (tile_x, tile_y) -> bool, own frame
-    threats: tuple[Threat, ...] = ()
+    threats: tuple[UnitView, ...] = ()
+    own_units: tuple[UnitView, ...] = ()
 
     def cost(self, name: str) -> int:
         return get_card_cost(name)
@@ -77,6 +113,16 @@ class OpponentView:
         """
         inside = [t for t in self.threats if t.tile_y >= FRIENDLY_HALF_START_ROW]
         return sorted(inside, key=lambda t: -t.tile_y)
+
+    def survivors(self) -> list[UnitView]:
+        """Own units still standing on own ground, deepest-advanced first.
+
+        These are what a control player counter-pushes WITH: the defenders
+        that won the exchange and are now free to walk the other way.
+        """
+        mine = [u for u in self.own_units
+                if u.tile_y >= FRIENDLY_HALF_START_ROW]
+        return sorted(mine, key=lambda u: u.tile_y)
 
     def defenders(self) -> list[int]:
         """Affordable hand slots that can actually DEFEND, cheapest first.
@@ -127,12 +173,17 @@ class ScriptedOpponent:
     FIRST seeing an invader before it responds.
     """
 
-    #: Seconds between an invader appearing and this bot reacting to it.
-    reaction_s: float = 0.8
+    #: Which entry in ``STYLES`` supplies this bot's knobs.
+    style_name: str = "cycle"
 
     def __init__(self, seed: int | None = None):
         self.rng = random.Random(seed)
+        self.style = STYLES[self.style_name]
         self._threat_since: float | None = None
+
+    @property
+    def reaction_s(self) -> float:
+        return self.style.reaction_s
 
     def __call__(self, view: OpponentView):
         move = self._defend(view)
@@ -196,7 +247,7 @@ class BigSpender(ScriptedOpponent):
     """
 
     name = "bigspender"
-    reaction_s = 1.0  # slowest to react: it would rather be spending
+    style_name = "dump"  # slowest to react: it would rather be spending
 
     def __init__(self, seed: int | None = None, spend_above: float = 5.0):
         super().__init__(seed)
@@ -224,7 +275,7 @@ class Cycler(ScriptedOpponent):
     """
 
     name = "cycler"
-    reaction_s = 0.6  # cheap cards in hand means it can answer fast
+    style_name = "cycle"  # cheap cards in hand means it can answer fast
 
     def attack(self, view: OpponentView):
         slots = view.affordable()
@@ -252,7 +303,7 @@ class TankAndSupport(ScriptedOpponent):
     """
 
     name = "tankandsupport"
-    reaction_s = 0.8
+    style_name = "beatdown"
 
     # Elixir at which a hand holding no tank cycles a cheap card instead of
     # waiting. Without this the bot DEADLOCKS: four cheap cards in hand means
@@ -288,10 +339,11 @@ class TankAndSupport(ScriptedOpponent):
             return None
 
         lane = self.rng.choice(LANES)
-        if not view.can_place(lane, BACKLINE_ROW):
+        row = self.style.tank_row
+        if not view.can_place(lane, row):
             return None
         self._lane = lane
-        return slot, lane, BACKLINE_ROW
+        return slot, lane, row
 
     def _cycle(self, view: OpponentView, affordable: list[int]):
         """No tank in hand: dump a cheap card at the back to rotate toward one."""
@@ -315,7 +367,7 @@ class TankAndSupport(ScriptedOpponent):
             return None
         slot = slots[0]
         lane = self._lane
-        row = min(BACKLINE_ROW + 1, LAST_DITCH_ROW)
+        row = min(self.style.tank_row + 1, LAST_DITCH_ROW)
         if not view.can_place(lane, row):
             self._lane = None
             return None
@@ -323,11 +375,68 @@ class TankAndSupport(ScriptedOpponent):
         return slot, lane, row
 
 
+class Control(ScriptedOpponent):
+    """Defends efficiently, then turns a won defence into a push.
+
+    The hardest of the scripted set, and the one that plays most like a real
+    ladder opponent. Three behaviours, in priority order:
+
+    1. DEFEND (inherited) - answer whatever is in its half.
+    2. COUNTER-PUSH - once the half is clear, the units that WON that
+       defence are still standing and already paid for. Adding support
+       behind them converts a defensive trade into an attack for a fraction
+       of the elixir a fresh push would cost. This is the core of control
+       play and the thing the other three bots cannot do at all.
+    3. CHIP - only when elixir would otherwise overflow. Otherwise it sits
+       on a ``reserve`` so it can always answer the next push.
+
+    A policy that beats BigSpender has learned to punish over-commitment.
+    Beating this one requires not over-committing yourself, because anything
+    that survives your attack comes straight back at you.
+    """
+
+    name = "control"
+    style_name = "control"
+
+    def attack(self, view: OpponentView):
+        return self._counter_push(view) or self._chip(view)
+
+    def _counter_push(self, view: OpponentView):
+        survivors = view.survivors()
+        if not survivors:
+            return None
+        # Most advanced survivor: the one already walking the right way.
+        lead = survivors[0]
+        budget = view.elixir - self.style.reserve
+        slots = [i for i in view.affordable() if view.cost(view.hand[i]) <= budget]
+        if not slots:
+            return None
+        slot = slots[-1]  # heaviest that still leaves the defensive reserve
+        row = min(lead.tile_y + 1, LAST_DITCH_ROW)
+        if not view.can_place(lead.tile_x, row):
+            return None
+        return slot, lead.tile_x, row
+
+    def _chip(self, view: OpponentView):
+        """Only spend spare elixir. Sitting at the cap wastes regeneration,
+        but spending the reserve means the next push goes unanswered."""
+        if view.elixir < 9.0:
+            return None
+        slots = view.affordable()
+        if not slots:
+            return None
+        lane = self.rng.choice(LANES)
+        if not view.can_place(lane, self.style.push_row):
+            return None
+        return slots[0], lane, self.style.push_row
+
+
 OPPONENTS: dict[str, type] = {
     "idle": Idle,
     "bigspender": BigSpender,
     "cycler": Cycler,
     "tankandsupport": TankAndSupport,
+    "control": Control,
 }
 
 

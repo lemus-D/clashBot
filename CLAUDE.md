@@ -235,6 +235,12 @@ speculatively generalize for cases that don't exist yet.)
     (`arena.same_side`). Keying it to which half the unit OWNED was a bug -
     defenders walked to the bridge instead of at an enemy standing next to
     them, which is what looked wrong in the viewer.
+  - DECKS are sampled per episode from `CARD_CLASSES` (`DeckSpread`), both
+    sides independently. A policy trained on one fixed eight learns that
+    eight, not the game. This is survivable only because hand identity is IN
+    the observation, so the policy can see what it holds. `min_troops` stops
+    an all-spell sample. The pool grows on its own when the vision model
+    gains cards. Evaluate with `--no-decks` so runs stay comparable.
   - LEVELS vary per episode (`LevelSpread`). Ladder play does not match
     players exactly, so each side samples a card level around tournament
     standard and its towers sample again around that - card level and king
@@ -293,11 +299,25 @@ speculatively generalize for cases that don't exist yet.)
     - Placement carries role: defence intercepts the threat, a beatdown tank
       goes deep (`BACKLINE_ROW`) so the push gathers behind it, chip goes to
       the bridge (`PUSH_ROW`).
-    - RandomPolicy baseline, 150 episodes, noise + level/stat randomization
-      on: idle 100% win / bigspender 49% / tankandsupport 32% / cycler 31%,
-      matches ~110-185s. NOTE the inversion: bigspender is now the EASIEST
-      rung, because dumping elixir the moment it passes 5 starves its own
-      defence. That is the archetype behaving correctly, not a bug.
+    - Four archetypes, driven by a `STYLES` table rather than bespoke code:
+      `cycle`, `control`, `beatdown` and `dump` (the last is a stress test,
+      not a real archetype). A style sets reaction delay, defensive reserve
+      and where offence lands, so a new archetype is a table entry.
+    - `control` is the only one that converts a won defence into an attack:
+      once its half is clear, the defenders that SURVIVED are already paid
+      for, so it adds support behind the most advanced one. It also holds a
+      `reserve` and chips only above 9 elixir.
+    - RandomPolicy baseline, 80 episodes, sampled decks + noise + levels
+      (the training condition): idle 100% win / bigspender 32% /
+      control 24% / cycler 20% / tankandsupport 19%, matches ~130-190s.
+      At n=80 the middle three are within noise of each other.
+    - Control concedes the FEWEST crowns (1.27 vs 1.49-1.64) but does not
+      win most - it defends well and closes badly, because the reserve and
+      the 9-elixir chip gate make it passive. Honest characterisation, not a
+      bug; tune it only with a re-baseline.
+    - `bigspender` stays the EASIEST rung: dumping elixir the moment it
+      passes 5 starves its own defence. That is the archetype behaving
+      correctly.
     - Re-baseline after ANY sim-fidelity change — the yardstick is the
       opponents' BEHAVIOUR, which is frozen, not the numbers it produces.
       This has moved a lot as fidelity improved: 2-17% with the broken stat

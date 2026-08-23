@@ -27,12 +27,12 @@ import numpy as np
 from ..env.actions import Action, ActionResult
 from ..env.observation import ObservationBuilder
 from ..game.board import ARENA_COLS, ARENA_ROWS, GameBoard, HAND_SIZE
-from ..game.cards import Card, Troop, get_card_cost, is_spell
+from ..game.cards import SPELL_CARDS, Card, Troop, get_card_cost, is_spell
 from ..game.classes import ARENA_CLASSES, CARD_CLASSES
 from ..game.state import TOWER_KEYS
 from . import engine
 from .engine import Simulation
-from .opponents import OpponentView, Threat
+from .opponents import OpponentView, UnitView
 from .units import LEVELS, STANDARD_LEVEL, UNIT_STATS, randomize, stats_at_level
 
 # Measured from real recordings: ClashEnv.step_period_sec is 0.25 and the
@@ -72,6 +72,42 @@ DEFAULT_DECK: tuple[str, ...] = (
     "knight", "archer", "minion", "goblin",
     "musketeer", "minipekka", "giant", "fireball",
 )
+
+
+@dataclass
+class DeckSpread:
+    """Per-episode deck sampling from the detectable card pool.
+
+    A policy trained on one fixed eight learns that eight, not the game. It
+    would then meet an unfamiliar hand the moment the deck changed - and the
+    hand is part of the observation, so it has everything it needs to
+    generalise if it is made to.
+
+    The pool is CARD_CLASSES, so it grows on its own when the vision model
+    gains cards. ``min_troops`` stops a sample that is mostly spells, which
+    would be unplayable rather than merely different.
+    """
+
+    enabled: bool = True
+    size: int = 8
+    min_troops: int = 5
+
+    @classmethod
+    def off(cls) -> "DeckSpread":
+        """Fixed DEFAULT_DECK, for evaluation runs that must be comparable."""
+        return cls(enabled=False)
+
+    def sample(self, rng: random.Random) -> tuple[str, ...]:
+        if not self.enabled:
+            return DEFAULT_DECK
+        pool = list(CARD_CLASSES)
+        size = min(self.size, len(pool))
+        for _ in range(50):
+            pick = rng.sample(pool, size)
+            if sum(1 for c in pick if c not in SPELL_CARDS) >= self.min_troops:
+                return tuple(pick)
+        # Pathological pool (almost all spells): fall back rather than spin.
+        return DEFAULT_DECK
 
 
 @dataclass
@@ -230,6 +266,7 @@ class SimEnv:
     randomize_scale: float = 1.0
     noise: ObservationNoise = field(default_factory=ObservationNoise)
     levels: LevelSpread = field(default_factory=LevelSpread)
+    decks: DeckSpread = field(default_factory=DeckSpread)
 
     sim: Simulation = field(init=False)
     board: GameBoard = field(init=False)
@@ -265,8 +302,9 @@ class SimEnv:
             friendly_stats=randomize(f_units, self._rng, self.randomize_scale),
             enemy_stats=randomize(e_units, self._rng, self.randomize_scale),
         )
-        self._deck = Deck(self.deck, self._rng)
-        self._opp_deck = Deck(self.deck, self._rng)
+        # Both sides draw independently - ladder does not mirror decks.
+        self._deck = Deck(self.decks.sample(self._rng), self._rng)
+        self._opp_deck = Deck(self.decks.sample(self._rng), self._rng)
 
         # Pixel dimensions are irrelevant here - the sim works in tiles and
         # never converts. GameBoard just needs non-degenerate values.
@@ -390,6 +428,7 @@ class SimEnv:
             # detector cannot read levels off the screen, so a policy that
             # could see them here would learn something it cannot use.
             "levels": dict(self.episode_levels),
+            "decks": (list(self._deck._order), list(self._opp_deck._order)),
         }
         return obs, reward, done, info
 
@@ -418,22 +457,27 @@ class SimEnv:
         """
         # Enemy (i.e. the policy's) units, mirrored into the opponent's own
         # frame so it reasons in one coordinate system throughout.
-        threats = tuple(
-            Threat(
-                name=u.name,
-                tile_x=ARENA_COLS - 1 - int(u.x),
-                tile_y=ARENA_ROWS - 1 - int(u.y),
-                flying=u.stats.flying,
+        def seen(units):
+            return tuple(
+                UnitView(
+                    name=u.name,
+                    tile_x=ARENA_COLS - 1 - int(u.x),
+                    tile_y=ARENA_ROWS - 1 - int(u.y),
+                    flying=u.stats.flying,
+                )
+                for u in units
+                if u.deployed
             )
-            for u in self.sim.units(True)
-            if u.deployed
-        )
+
+        threats = seen(self.sim.units(True))
+        own_units = seen(self.sim.units(False))
         return OpponentView(
             hand=list(self._opp_deck.hand),
             elixir=self.sim.elixir[False],
             time=self.sim.time,
             phase=self.sim.phase(),
             threats=threats,
+            own_units=own_units,
             can_place=lambda tx, ty, name=None: self.sim.is_placeable(
                 False, *_mirror(tx, ty), name=name
             ),

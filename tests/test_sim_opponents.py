@@ -302,7 +302,7 @@ class TestDefence:
 
     @pytest.mark.parametrize("cls", [BigSpender, Cycler, TankAndSupport])
     def test_reaction_delays_are_human_scale(self, cls):
-        assert 0.3 <= cls.reaction_s <= 2.0
+        assert 0.3 <= cls(seed=1).reaction_s <= 2.0
 
 
 class TestRegistry:

@@ -18,7 +18,7 @@ import numpy as np
 
 from ..env.actions import Action
 from ..game.board import ARENA_COLS, ARENA_ROWS, HAND_SIZE
-from .env import STEP_PERIOD_SEC, LevelSpread, ObservationNoise, SimEnv
+from .env import DeckSpread, STEP_PERIOD_SEC, LevelSpread, ObservationNoise, SimEnv
 from .opponents import OPPONENTS, make_opponent
 from .units import stats_confidence_report
 
@@ -67,6 +67,7 @@ def make_env(args) -> SimEnv:
         levels=LevelSpread.off() if args.no_levels else LevelSpread(
             troop_spread=args.level_spread, tower_spread=args.level_spread
         ),
+        decks=DeckSpread.off() if args.no_decks else DeckSpread(),
         opponent=make_opponent(args.opponent, seed=args.seed),
     )
 
@@ -170,6 +171,9 @@ def main() -> None:
                         "(evaluation, not training)")
     p.add_argument("--level-spread", type=int, default=1,
                    help="+/- card and tower levels sampled per episode")
+    p.add_argument("--no-decks", action="store_true",
+                   help="fixed default deck instead of sampling one per "
+                        "episode (evaluation, not training)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--stats", action="store_true",
                    help="print how much of the unit table is actually trusted")
