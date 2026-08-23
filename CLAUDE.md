@@ -169,12 +169,29 @@ speculatively generalize for cases that don't exist yet.)
     `_SimStateAdapter` and calls the real `ObservationBuilder`. One encoder,
     two backends - duplicating it would drift immediately. That adapter is
     the seam; keep it.
-  - `units.py` is the stat table, and NONE of it is measured. Every entry
-    carries a `Confidence` (`measured`/`wiki`/`guess`) and `randomize()`
-    perturbs each stat per episode with spread scaled by how little it is
-    trusted. RL exploits a confidently-wrong constant as if it were a
-    mechanic, so a stat you cannot validate must be randomized, not guessed
-    once. `--no-randomize` is for evaluation only.
+  - `units.py` is GENERATED from real game data. `unit_stats.json` comes
+    from `tools/derive_unit_stats.py`, which reads RoyaleAPI's cr-api-data
+    (extracted from the game client) and normalises to TOURNAMENT STANDARD =
+    displayed level 11. Adding a unit means editing that script and
+    regenerating, not hand-editing the JSON.
+    - The per-level arrays start at each card's OWN level 1, and a card's
+      first level depends on rarity (a Rare's level 1 is displayed level 3).
+      Index by rarity — `LEVEL_INDEX` — or you silently mix power levels.
+    - This replaced a hand-written table whose numbers were recalled rather
+      than transcribed. They turned out to be roughly LEVEL 1 values while
+      the TOWERS were already correct level-11 figures, so units were ~2.6x
+      too weak against towers and the whole sim was drastically
+      tower-favoured. Errors also ran 1.03x–2.68x *between* cards, distorting
+      which unit beats which. Anything hand-entered here must state its
+      provenance.
+    - `Confidence` is still per-stat (`measured`/`wiki`/`guess`) and
+      `randomize()` perturbs by it. Everything is `wiki` now, which means the
+      NUMBERS are real — not that the simulation built on them has been
+      validated against actual play. `--no-randomize` is for evaluation only.
+    - Arrows' radius comes out at 1.4 real-game tiles against a commonly
+      cited 4.0; Fireball's 2.5 matches exactly, so the conversion is right
+      and the Arrows field likely describes one arrow, not the volley. Left
+      as the data says and flagged, not silently overridden.
   - Sim fidelity is the CEILING on everything trained here. `--stats` prints
     how much of the table is actually trusted.
   - `ObservationNoise` exists because the sim sees perfectly and the vision
@@ -204,9 +221,14 @@ speculatively generalize for cases that don't exist yet.)
     - FREEZE these. They are the only stable yardstick: self-play win rate
       sits at ~50% by construction and measures nothing, so never tune a
       scripted bot to beat the current policy.
-    - RandomPolicy baseline, 100 episodes, noise + randomization on:
-      idle 100% win / cycler 17% / tankandsupport 6% / bigspender 2%.
-      Beating that ladder is the first real milestone.
+    - RandomPolicy baseline, 100 episodes, noise + randomization on, with
+      real level-11 stats: idle 100% win (3-0, ~73s) / cycler 25% /
+      tankandsupport 23% / bigspender 20%. Beating that ladder is the first
+      milestone. The ladder is COMPRESSED compared to the broken-stats era
+      (2–17%) because units can now actually kill towers; matches run ~70s
+      instead of ~200s. Re-baseline after any sim-fidelity change — the
+      yardstick is the opponents' BEHAVIOUR, which is frozen, not the
+      numbers those behaviours produce.
     - Self-play and a frozen-checkpoint league are still to come; sample the
       pool per episode rather than graduating through it, or the policy
       forgets how to beat the simple ones.

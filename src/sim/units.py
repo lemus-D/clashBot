@@ -1,28 +1,37 @@
-"""Unit stats for the simulator, and the ranges they may be randomized over.
+"""Unit stats for the simulator, loaded from real Clash Royale game data.
 
-EVERY NUMBER HERE IS APPROXIMATE. They are hand-transcribed tournament-level
-values, not measured against the real game, and several (aggro radius, deploy
-time, spawner periods) are educated guesses. That matters more than usual:
-reinforcement learning will find and exploit whatever this file says, so a
-number that is confidently wrong gets baked into the policy and then fails on
-transfer.
+The table is GENERATED, not written by hand - ``unit_stats.json`` comes from
+``tools/derive_unit_stats.py``, which reads RoyaleAPI's cr-api-data (extracted
+from the game client) and normalises everything to tournament standard
+(displayed level 11).
 
-Two defences:
+This replaced a hand-written table, and the way that table was wrong is worth
+recording. Its numbers were recalled rather than transcribed, and they turned
+out to be approximately LEVEL 1 values - Knight 660 against a real 1766,
+Archer damage 42 against a real 107. Level 1 is also not comparable across
+rarities (a Rare's level 1 is displayed level 3), so the errors ran from 1.03x
+to 2.68x depending on the card. A uniform scale error would have been nearly
+harmless, since time-to-kill ratios survive it. A non-uniform one silently
+distorts which units beat which, which is exactly what a policy learns.
 
-1. ``confidence`` marks how much each stat is trusted. ``MEASURED`` means it
-   came from real observation, ``WIKI`` from transcribed game data, ``GUESS``
-   from nothing better than judgement. Nothing is MEASURED yet.
-2. ``randomize`` perturbs the table per-episode. A stat the policy cannot
-   pin down cannot be exploited to the decimal, so it has to learn something
-   robust instead. Spread scales with how little the stat is trusted.
+Distances are GRID TILES: the real game's 18x32 arena halved to this project's
+9x16. Times are seconds.
 
-Distances are in GRID TILES - this project's 9x16 arena, which is half the
-resolution of the real game's 18x32. Wiki numbers in "tiles" are therefore
-HALVED here; the raw value is kept in a comment so it stays auditable.
+Two things still guard against the numbers being wrong:
+
+1. ``confidence`` per stat. ``MEASURED`` means checked against real gameplay,
+   ``WIKI`` transcribed from real game data, ``GUESS`` recalled or judged.
+   Everything is WIKI now; nothing has been validated against actual play, so
+   the mapping from these numbers to observed behaviour is still unproven.
+2. ``randomize`` perturbs the table per episode. Reinforcement learning will
+   exploit a constant it can pin down, so a stat that moves cannot become the
+   foundation of a strategy that only works in here.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import random
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -30,11 +39,13 @@ from enum import Enum
 from ..game.cards import SPELL_CARDS
 from ..game.classes import ARENA_CLASSES
 
+STATS_PATH = os.path.join(os.path.dirname(__file__), "unit_stats.json")
+
 
 class Confidence(str, Enum):
     MEASURED = "measured"  # checked against real gameplay
-    WIKI = "wiki"          # transcribed game data, not verified here
-    GUESS = "guess"        # judgement call, most likely wrong
+    WIKI = "wiki"          # transcribed from real game data
+    GUESS = "guess"        # recalled or judged, unverified
 
 
 class Target(str, Enum):
@@ -44,19 +55,6 @@ class Target(str, Enum):
     BUILDINGS = "buildings"
 
 
-# Movement speeds in grid tiles/sec. Wiki values are CR tiles/sec: slow 0.71,
-# medium 1.0, fast 1.33, very fast 1.5.
-SPEED_SLOW = 0.355
-SPEED_MEDIUM = 0.5
-SPEED_FAST = 0.665
-SPEED_VERY_FAST = 0.75
-
-# Melee "range" is not zero - a unit stops when its hitbox touches. Half a
-# grid tile is the stand-off that keeps two melee units from occupying the
-# same point.
-MELEE_RANGE = 0.5
-
-
 @dataclass(frozen=True)
 class UnitStats:
     """One arena unit. ``count`` > 1 means the card deploys a squad."""
@@ -64,21 +62,22 @@ class UnitStats:
     name: str
     hp: float
     damage: float
-    hit_speed: float          # seconds between attacks
-    attack_range: float       # grid tiles, MELEE_RANGE for melee
-    speed: float              # grid tiles/sec, 0 for buildings
+    hit_speed: float           # seconds between attacks
+    attack_range: float        # grid tiles
+    speed: float               # grid tiles/sec, 0 for buildings
     targets: Target
     flying: bool = False
-    count: int = 1            # units deployed per card
-    deploy_time: float = 1.0  # seconds before it can act
+    count: int = 1             # units deployed per card
+    deploy_time: float = 1.0   # seconds before it can act
     splash_radius: float = 0.0
     aggro_range: float = 2.75  # grid tiles it will divert to attack within
+    collision_radius: float = 0.25
     is_building: bool = False
-    lifetime: float = 0.0     # buildings only; 0 = permanent
-    spawns: str | None = None       # unit name this building produces
-    spawn_period: float = 0.0       # seconds between spawns
+    lifetime: float = 0.0      # buildings only; 0 = permanent
+    spawns: str | None = None  # unit name this building produces
+    spawn_period: float = 0.0  # seconds between spawn batches
     spawn_count: int = 1
-    spawn_on_death: int = 0         # units released when destroyed
+    spawn_on_death: int = 0    # units released when destroyed
     confidence: Confidence = Confidence.WIKI
 
     @property
@@ -86,86 +85,53 @@ class UnitStats:
         return self.damage / self.hit_speed
 
 
-# ---------------------------------------------------------------------------
-# The table. Keyed by the detector's own normalized class names, so it cannot
-# describe a unit the vision pipeline could never report - see
-# ``validate_against_manifest``.
-# ---------------------------------------------------------------------------
+def _load() -> tuple[dict[str, UnitStats], dict[str, tuple[float, float, float]]]:
+    if not os.path.exists(STATS_PATH):
+        raise FileNotFoundError(
+            f"{STATS_PATH} is missing. It is generated from real game data, "
+            f"not written by hand: run `python tools/derive_unit_stats.py`."
+        )
+    with open(STATS_PATH, encoding="utf-8") as f:
+        blob = json.load(f)
 
-UNIT_STATS: dict[str, UnitStats] = {
-    "knight": UnitStats(
-        name="knight", hp=660, damage=75, hit_speed=1.2,
-        attack_range=MELEE_RANGE, speed=SPEED_MEDIUM, targets=Target.GROUND,
-    ),
-    "archer": UnitStats(
-        name="archer", hp=125, damage=42, hit_speed=1.2,
-        attack_range=2.5,  # 5.0 CR tiles
-        speed=SPEED_MEDIUM, targets=Target.BOTH, count=2,
-    ),
-    "minion": UnitStats(
-        name="minion", hp=90, damage=39, hit_speed=1.0,
-        attack_range=1.0,  # 2.0 CR tiles
-        speed=SPEED_FAST, targets=Target.BOTH, flying=True, count=3,
-    ),
-    "goblin": UnitStats(
-        name="goblin", hp=79, damage=47, hit_speed=1.1,
-        attack_range=MELEE_RANGE, speed=SPEED_VERY_FAST,
-        targets=Target.GROUND, count=3,
-    ),
-    "speargoblin": UnitStats(
-        name="speargoblin", hp=52, damage=32, hit_speed=1.7,
-        attack_range=2.5,  # 5.0 CR tiles
-        speed=SPEED_VERY_FAST, targets=Target.BOTH, count=3,
-    ),
-    "musketeer": UnitStats(
-        name="musketeer", hp=340, damage=100, hit_speed=1.1,
-        attack_range=3.0,  # 6.0 CR tiles
-        speed=SPEED_MEDIUM, targets=Target.BOTH,
-    ),
-    "minipekka": UnitStats(
-        name="minipekka", hp=600, damage=325, hit_speed=1.8,
-        attack_range=MELEE_RANGE, speed=SPEED_FAST, targets=Target.GROUND,
-    ),
-    "giant": UnitStats(
-        name="giant", hp=2000, damage=126, hit_speed=1.5,
-        attack_range=MELEE_RANGE, speed=SPEED_SLOW, targets=Target.BUILDINGS,
-        # Building-targeters ignore everything else, so aggro range is
-        # meaningless for them - it is set to 0 to make that explicit rather
-        # than leaving a value that looks like it does something.
-        aggro_range=0.0,
-    ),
-    # Goblin Brawler is spawn-only: it comes out of a dying Goblin Cage and
-    # has no card. It is the reason ARENA_CLASSES and CARD_CLASSES are
-    # separate lists.
-    "goblinbrawler": UnitStats(
-        name="goblinbrawler", hp=800, damage=159, hit_speed=1.4,
-        attack_range=MELEE_RANGE, speed=SPEED_MEDIUM, targets=Target.GROUND,
-        confidence=Confidence.GUESS,
-    ),
-    "goblincage": UnitStats(
-        name="goblincage", hp=720, damage=0, hit_speed=1.0,
-        attack_range=0.0, speed=0.0, targets=Target.GROUND,
-        is_building=True, lifetime=30.0,
-        spawns="goblinbrawler", spawn_on_death=1,
-        confidence=Confidence.GUESS,
-    ),
-    "goblinhut": UnitStats(
-        name="goblinhut", hp=800, damage=0, hit_speed=1.0,
-        attack_range=0.0, speed=0.0, targets=Target.GROUND,
-        is_building=True, lifetime=30.0,
-        spawns="speargoblin", spawn_period=4.9, spawn_count=1,
-        confidence=Confidence.GUESS,
-    ),
-}
+    units: dict[str, UnitStats] = {}
+    for key, u in blob["units"].items():
+        units[key] = UnitStats(
+            name=key,
+            hp=float(u["hp"]),
+            damage=float(u["damage"]),
+            hit_speed=float(u["hit_speed"]),
+            attack_range=float(u["attack_range"]),
+            speed=float(u["speed"]),
+            targets=Target(u["targets"]),
+            flying=bool(u["flying"]),
+            count=int(u["count"]),
+            deploy_time=float(u["deploy_time"]),
+            aggro_range=float(u["aggro_range"]),
+            collision_radius=float(u["collision_radius"]),
+            is_building=bool(u["is_building"]),
+            lifetime=float(u.get("lifetime", 0.0)),
+            spawns=u.get("spawns"),
+            spawn_period=float(u.get("spawn_period", 0.0)),
+            spawn_count=int(u.get("spawn_count") or 1),
+            spawn_on_death=int(u.get("spawn_on_death", 0)),
+        )
 
-# Spells are not units - they resolve instantly at a point and then are gone.
-# They still appear in ARENA_CLASSES because the detector sees their visual
-# effect on the field.
-SPELL_DAMAGE: dict[str, tuple[float, float, float]] = {
-    # name: (damage, radius in grid tiles, damage multiplier vs buildings)
-    "arrows": (144, 2.0, 0.35),    # 4.0 CR tiles
-    "fireball": (325, 1.25, 0.35),  # 2.5 CR tiles
-}
+    spells = {
+        k: (float(s["damage"]), float(s["radius"]), float(s["tower_damage_mult"]))
+        for k, s in blob["spells"].items()
+    }
+    return units, spells
+
+
+UNIT_STATS, SPELL_DAMAGE = _load()
+
+# Building-only attackers ignore troops entirely, so an aggro radius would
+# describe nothing. Zeroed to make that explicit rather than leaving a number
+# that looks like it does something.
+for _name, _u in list(UNIT_STATS.items()):
+    if _u.targets is Target.BUILDINGS:
+        UNIT_STATS[_name] = replace(_u, aggro_range=0.0)
 
 SPELL_NAMES = frozenset(SPELL_DAMAGE)
 
@@ -196,7 +162,8 @@ def validate_against_manifest() -> None:
             f"Simulator unit table does not match ARENA_CLASSES: no stats "
             f"for {missing!r}, stats for non-existent {extra!r}. The sim must "
             f"model exactly what the detector can see, or a policy trained "
-            f"here reads inputs that real play can never produce."
+            f"here reads inputs that real play can never produce. Add the "
+            f"missing units to tools/derive_unit_stats.py and regenerate."
         )
 
 
@@ -207,9 +174,9 @@ validate_against_manifest()
 # Randomization
 # ---------------------------------------------------------------------------
 
-# Fractional spread per confidence level. A GUESS moves a lot because we have
-# no reason to believe the written value; WIKI still moves, because
-# transcription errors and balance patches are both real.
+# Fractional spread per confidence level. WIKI still moves: the numbers are
+# real, but the MAPPING from them to this sim's behaviour is unvalidated, and
+# balance patches move them anyway.
 _SPREAD: dict[Confidence, float] = {
     Confidence.MEASURED: 0.02,
     Confidence.WIKI: 0.08,
@@ -236,9 +203,9 @@ def randomize(
     for evaluation, so runs are comparable), 1.0 the configured spread.
 
     Randomizing is not noise for its own sake. A policy trained against one
-    fixed set of wrong numbers learns timings that hold only for those
-    numbers; trained across a range, it has to learn something that survives
-    being wrong, which is the situation it will actually be deployed into.
+    fixed set of numbers learns timings that hold only for those numbers;
+    trained across a range, it has to learn something that survives being
+    wrong, which is the situation it will actually be deployed into.
     """
     if scale <= 0.0:
         return dict(stats)
@@ -259,14 +226,21 @@ def stats_confidence_report() -> str:
     """Human-readable summary of how much of the table is actually trusted.
 
     Printed by the sim CLI. Sim fidelity is the ceiling on everything trained
-    here, so "none of this is measured" should be visible rather than buried
-    in a docstring.
+    here, so the provenance should be visible rather than buried in a
+    docstring.
     """
     by_level: dict[str, list[str]] = {}
     for name, unit in sorted(UNIT_STATS.items()):
         by_level.setdefault(unit.confidence.value, []).append(name)
-    lines = ["Unit stat confidence:"]
+    lines = [
+        "Unit stat confidence "
+        "(source: RoyaleAPI cr-api-data, tournament standard / level 11):"
+    ]
     for level in ("measured", "wiki", "guess"):
         names = by_level.get(level, [])
         lines.append(f"  {level:9s} {len(names):2d}  {', '.join(names) or '-'}")
+    lines.append(
+        "  NOTE: 'wiki' means the NUMBERS are real, not that the simulation "
+        "built on them has been validated against actual play."
+    )
     return "\n".join(lines)

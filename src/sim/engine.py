@@ -255,6 +255,7 @@ class Simulation:
         e = Entity(
             uid=next(_uid_counter), name=name, friendly=friendly, x=x, y=y,
             hp=stats.hp, max_hp=stats.hp, stats=stats,
+            radius=stats.collision_radius,
             deploy_remaining=stats.deploy_time,
             lifetime_remaining=stats.lifetime,
             spawn_cooldown=stats.spawn_period,

@@ -19,3 +19,7 @@ Thumbs.db
 logs/
 demos/
 models/
+
+# Upstream Clash Royale game data, re-downloaded by
+# tools/derive_unit_stats.py. Only the derived manifest is checked in.
+.crdata/
