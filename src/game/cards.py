@@ -29,18 +29,26 @@ def normalize_name(name: str) -> str:
 # purpose - it spawns from Goblin Cage and is not a playable card, which is
 # why the model has no ``card goblin brawler`` either.
 CARD_COSTS: dict[str, int] = {
+    "skeletons":1,
     "goblin": 2,
     "speargoblin": 2,
+    "bomber": 2,
     "arrows": 3,
     "archer": 3,
+    "cannon": 3,
     "minion": 3,
+    "tombstone": 3,
+    "megaminion": 3,
     "knight": 3,
     "goblinhut": 4,
     "goblincage": 4,
+    "battleram": 4,
     "musketeer": 4,
+    "valkyrie": 4,
     "fireball": 4,
     "minipekka": 4,
     "giant": 5,
+    "barbarians": 5
 }
 
 
