@@ -32,6 +32,7 @@ from ..game.classes import CARD_CLASSES
 from ..game.state import TOWER_KEYS
 from . import engine
 from .engine import Simulation
+from .opponents import OpponentView
 from .units import UNIT_STATS, randomize
 
 # Measured from real recordings: ClashEnv.step_period_sec is 0.25 and the
@@ -57,6 +58,11 @@ TOWER_LOST_PENALTY = 3.0
 # teach "spend something" without prescribing what.
 ELIXIR_CAP_PENALTY = 0.02
 INVALID_ACTION_PENALTY = 0.05
+
+def _mirror(tile_x: int, tile_y: int) -> tuple[int, int]:
+    """Reflect a tile through the arena centre (own frame -> real coords)."""
+    return ARENA_COLS - 1 - tile_x, ARENA_ROWS - 1 - tile_y
+
 
 DEFAULT_DECK: tuple[str, ...] = (
     "knight", "archer", "minion", "goblin",
@@ -329,6 +335,20 @@ class SimEnv:
         self._deck.play(action.hand_index)
         return ActionResult(success=True, reason="placed")
 
+    def _opponent_view(self) -> OpponentView:
+        """The narrow slice of state a scripted opponent may read.
+
+        Handing over ``self`` would let an opponent inspect the policy's hand
+        and elixir. A benchmark that can cheat is not a benchmark.
+        """
+        return OpponentView(
+            hand=list(self._opp_deck.hand),
+            elixir=self.sim.elixir[False],
+            time=self.sim.time,
+            phase=self.sim.phase(),
+            can_place=lambda tx, ty: self.sim.is_placeable(False, *_mirror(tx, ty)),
+        )
+
     def _apply_opponent(self) -> None:
         """Ask the opponent for a placement, in ITS own coordinate frame.
 
@@ -338,13 +358,14 @@ class SimEnv:
         """
         if self.opponent is None:
             return
-        move = self.opponent(self)
+        move = self.opponent(self._opponent_view())
         if move is None:
             return
         slot, tile_x, tile_y = move
+        if not (0 <= slot < HAND_SIZE):
+            return
         name = self._opp_deck.hand[slot]
-        mx, my = ARENA_COLS - 1 - tile_x, ARENA_ROWS - 1 - tile_y
-        if self.sim.deploy(False, name, mx, my):
+        if self.sim.deploy(False, name, *_mirror(tile_x, tile_y)):
             self._opp_deck.play(slot)
 
     # ----- reward -----

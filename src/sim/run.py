@@ -19,6 +19,7 @@ import numpy as np
 from ..env.actions import Action
 from ..game.board import HAND_SIZE
 from .env import STEP_PERIOD_SEC, ObservationNoise, SimEnv
+from .opponents import OPPONENTS, make_opponent
 from .units import stats_confidence_report
 
 # Real play manages roughly this many matches an hour: ~3 min a match plus
@@ -55,6 +56,7 @@ def make_env(args) -> SimEnv:
         seed=args.seed,
         randomize_scale=0.0 if args.no_randomize else args.randomize,
         noise=noise,
+        opponent=make_opponent(args.opponent, seed=args.seed),
     )
 
 
@@ -147,6 +149,10 @@ def main() -> None:
                    help="stat randomization scale")
     p.add_argument("--benchmark", action="store_true",
                    help="throughput run: 50 episodes, headless")
+    p.add_argument("--opponent", default="idle", choices=sorted(OPPONENTS),
+                   help="scripted opponent to play against (default: idle, "
+                        "which plays nothing - any win rate against it is "
+                        "meaningless)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--stats", action="store_true",
                    help="print how much of the unit table is actually trusted")

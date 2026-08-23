@@ -178,13 +178,31 @@ speculatively generalize for cases that don't exist yet.)
   - Reward adds to the real env's shaping: explicit `TOWER_DESTROYED_REWARD`
     / `TOWER_LOST_PENALTY` on top of the HP swing, and a small per-step
     `ELIXIR_CAP_PENALTY` for sitting at 10 (wasted regeneration).
-  - Opponent is a pluggable `env.opponent` callable that reasons in its OWN
-    frame and is mirrored at placement, so there is one coordinate
-    convention. The opponent POOL (scripted + self-play + frozen league) is
-    NOT built yet - `opponent=None` means the enemy never plays, so a 100%
-    win rate right now means nothing. Keep some scripted opponents frozen
-    as a benchmark: self-play win rate is ~50% by construction and measures
-    nothing.
+  - Opponents (`opponents.py`) are callables taking an `OpponentView` - a
+    deliberately narrow view that CANNOT see the policy's hand or elixir,
+    because a benchmark that can cheat is not a benchmark. They reason in
+    their OWN frame and are mirrored at placement, so there is one
+    coordinate convention. Three scripted ones exist: `bigspender` (dumps
+    the priciest affordable card above 5 elixir), `cycler` (cheapest card
+    as often as possible), `tankandsupport` (saves for a tank at the bridge,
+    then a cheap unit BEHIND it). Plus `idle`, which plays nothing.
+    - FREEZE these. They are the only stable yardstick: self-play win rate
+      sits at ~50% by construction and measures nothing, so never tune a
+      scripted bot to beat the current policy.
+    - RandomPolicy baseline, 100 episodes, noise + randomization on:
+      idle 100% win / cycler 17% / tankandsupport 6% / bigspender 2%.
+      Beating that ladder is the first real milestone.
+    - Self-play and a frozen-checkpoint league are still to come; sample the
+      pool per episode rather than graduating through it, or the policy
+      forgets how to beat the simple ones.
+  - KNOWN FIDELITY GAP: spells cannot be cast on the enemy half. `deploy`
+    checks `is_placeable`, and `playable_mask` restricts to the friendly
+    half - which is right for troops and WRONG for spells, which in the real
+    game can be aimed anywhere. So Fireball/Arrows can currently only hit
+    your own side, and a policy will correctly learn they are useless.
+    Fixing it means changing `playable_mask` semantics in the REAL env too,
+    so it is a schema change and deliberately not done yet. Scripted
+    opponents skip spells for this reason.
   - `python -m src.sim.run --watch` is the visual debugger: TRUTH on the
     left, OBSERVED (post-noise, what the policy actually gets) on the right.
     Noise events are RECORDED by `env.py`, never inferred by comparing the
