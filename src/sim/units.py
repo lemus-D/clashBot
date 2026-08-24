@@ -314,6 +314,31 @@ def randomize(
     return out
 
 
+#: What one spawn-only unit is worth. It cost no elixir directly - it came
+#: out of a building someone did pay for - but killing one is still progress,
+#: and valuing it at zero would make Goblin Cage and Tombstone free to ignore.
+SPAWN_ONLY_VALUE = 0.5
+
+
+def unit_elixir_value(name: str) -> float:
+    """Elixir value of ONE unit of this type.
+
+    A card's cost divided across the squad it deploys, so killing one of
+    three Goblins is worth a third of the card. This is what lets a
+    defensive exchange be scored: trading a 3-elixir Knight for a 5-elixir
+    push is a win even when no tower HP changes hands.
+    """
+    from ..game.cards import CARD_COSTS
+
+    stats = UNIT_STATS.get(name)
+    if stats is None:
+        return 0.0
+    cost = CARD_COSTS.get(name)
+    if cost is None:
+        return SPAWN_ONLY_VALUE
+    return cost / max(1, stats.count)
+
+
 def stats_confidence_report() -> str:
     """Human-readable summary of how much of the table is actually trusted.
 

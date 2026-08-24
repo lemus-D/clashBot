@@ -27,7 +27,10 @@ from dataclasses import dataclass, field
 from ..game.board import ARENA_COLS, ARENA_ROWS
 from . import arena
 from .arena import TOWERS, TowerSpec
-from .units import STANDARD_LEVEL, Target, UnitStats, stats_at_level, tower_combat
+from .units import (
+    STANDARD_LEVEL, Target, UnitStats, stats_at_level, tower_combat,
+    unit_elixir_value,
+)
 
 # Physics/combat step. 20 Hz: five sub-steps per 0.25s observation cycle.
 TICK_DT = 0.05
@@ -175,6 +178,9 @@ class Simulation:
     elixir: dict[bool, float] = field(default_factory=dict)
     crowns: dict[bool, int] = field(default_factory=dict)
     destroyed_towers: set[str] = field(default_factory=set)
+    # Elixir value of THIS side's units that have died. A running total the
+    # env diffs per step; it is what makes winning a defensive exchange pay.
+    losses: dict[bool, float] = field(default_factory=dict)
     finished: bool = False
     result: str | None = None  # "win" / "loss" / "draw", from friendly's view
     rng: random.Random = field(default_factory=random.Random)
@@ -183,6 +189,7 @@ class Simulation:
         self.rng = random.Random(self.seed)
         self.elixir = {True: STARTING_ELIXIR, False: STARTING_ELIXIR}
         self.crowns = {True: 0, False: 0}
+        self.losses = {True: 0.0, False: 0.0}
 
         f_units, f_spells = stats_at_level(self.friendly_level)
         e_units, e_spells = stats_at_level(self.enemy_level)
@@ -351,11 +358,16 @@ class Simulation:
         if target.hp <= 0.0:
             self._on_death(target)
 
-    def _on_death(self, e: Entity) -> None:
+    def _on_death(self, e: Entity, expired: bool = False) -> None:
         e.hp = 0.0
         if e.is_tower:
             self._on_tower_destroyed(e)
             return
+        if not expired:
+            # Expiry is not a kill. A building reaching the end of its
+            # lifetime would otherwise hand the other side free reward for
+            # doing nothing.
+            self.losses[e.friendly] += unit_elixir_value(e.name)
         if e.stats.death_damage > 0.0:
             # Bomb Tower drops a bomb rather than leaving a unit behind.
             for other in list(self.entities.values()):
@@ -532,7 +544,7 @@ class Simulation:
         if e.stats.lifetime:
             e.lifetime_remaining -= dt
             if e.lifetime_remaining <= 0.0:
-                self._on_death(e)
+                self._on_death(e, expired=True)
                 return
         if e.stats.spawn_period and e.stats.spawns:
             e.spawn_cooldown -= dt

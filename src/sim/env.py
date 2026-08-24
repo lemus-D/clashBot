@@ -54,8 +54,23 @@ CROWN_MARGIN_REWARD = 2.0
 TOWER_DESTROYED_REWARD = 3.0
 TOWER_LOST_PENALTY = 3.0
 
-# Sitting at 10 elixir wastes regeneration. Small and per-step: it should
-# teach "spend something" without prescribing what.
+# Elixir value of units killed, minus your own lost. THIS IS THE DEFENSIVE
+# SIGNAL. Without it, winning a defensive exchange pays nothing at all: it
+# shows up only as damage you did NOT take, and a counterfactual cannot be
+# rewarded. Measured before adding it, 91% of steps produced exactly zero
+# reward and 52% of an episode's entire signal was the win/loss bit at the
+# end of ~700 steps.
+#
+# Scale is deliberately small. A 4-elixir kill pays 0.4 against ~4.5 for a
+# tower, so roughly eleven clean trades equal one tower. Any larger and the
+# policy would rationally farm kills instead of winning - a reward it can
+# satisfy without playing the game is worse than a sparse one.
+ELIXIR_TRADE_SCALE = 0.1
+
+# Sitting on max elixir wastes regeneration. Fires from 9.5 rather than at
+# the cap itself: at the cap exactly, the measurement showed it never
+# triggered once in 14,400 steps, so the term was dead weight.
+ELIXIR_CAP_THRESHOLD = 9.5
 ELIXIR_CAP_PENALTY = 0.02
 INVALID_ACTION_PENALTY = 0.05
 
@@ -313,6 +328,7 @@ class SimEnv:
         self._reported_tower_hp = self.sim.tower_hp_fractions()
         self._prev_tower_hp = dict(self._reported_tower_hp)
         self._prev_destroyed: set[str] = set()
+        self._prev_losses = dict(self.sim.losses)
         self.step_count = 0
         return self.observe()
 
@@ -401,6 +417,7 @@ class SimEnv:
     def step(self, action: Action) -> tuple[dict, float, bool, dict]:
         self._prev_tower_hp = dict(self.sim.tower_hp_fractions())
         self._prev_destroyed = set(self.sim.destroyed_towers)
+        self._prev_losses = dict(self.sim.losses)
 
         result = self._apply_action(action)
         self._apply_opponent()
@@ -424,6 +441,7 @@ class SimEnv:
             "crowns": (self.sim.crowns[True], self.sim.crowns[False]),
             "action_ok": result.success,
             "action_reason": result.reason,
+            "reward_parts": dict(self.last_reward_parts),
             # Diagnostics only. Deliberately NOT in the observation: the
             # detector cannot read levels off the screen, so a policy that
             # could see them here would learn something it cannot use.
@@ -505,6 +523,17 @@ class SimEnv:
     # ----- reward -----
 
     def _reward(self, action_result: ActionResult) -> float:
+        parts = self.reward_parts(action_result)
+        self.last_reward_parts = parts
+        return sum(parts.values())
+
+    def reward_parts(self, action_result: ActionResult) -> dict[str, float]:
+        """Reward split by SOURCE, so the shaping can be audited.
+
+        A single scalar hides whether the policy is learning from steady
+        chip damage or from one win/loss bit at the end of ~700 steps. Those
+        are very different learning problems and the average looks the same.
+        """
         now = self.sim.tower_hp_fractions()
 
         def total(side: str, hp: dict[str, float]) -> float:
@@ -512,30 +541,45 @@ class SimEnv:
 
         dealt = total("enemy", self._prev_tower_hp) - total("enemy", now)
         taken = total("friendly", self._prev_tower_hp) - total("friendly", now)
-        reward = TOWER_HP_REWARD_SCALE * (dealt - taken)
 
-        newly = self.sim.destroyed_towers - self._prev_destroyed
-        for key in newly:
+        parts = {
+            "tower_damage_dealt": TOWER_HP_REWARD_SCALE * dealt,
+            "tower_damage_taken": -TOWER_HP_REWARD_SCALE * taken,
+            "tower_destroyed": 0.0,
+            "tower_lost": 0.0,
+            "units_killed": ELIXIR_TRADE_SCALE * (
+                self.sim.losses[False] - self._prev_losses.get(False, 0.0)
+            ),
+            "units_lost": -ELIXIR_TRADE_SCALE * (
+                self.sim.losses[True] - self._prev_losses.get(True, 0.0)
+            ),
+            "elixir_cap": 0.0,
+            "terminal": 0.0,
+            "invalid_action": 0.0,
+        }
+
+        for key in self.sim.destroyed_towers - self._prev_destroyed:
             if key.startswith("enemy"):
-                reward += TOWER_DESTROYED_REWARD
+                parts["tower_destroyed"] += TOWER_DESTROYED_REWARD
             else:
-                reward -= TOWER_LOST_PENALTY
+                parts["tower_lost"] -= TOWER_LOST_PENALTY
 
-        if self.sim.elixir[True] >= engine.MAX_ELIXIR - 1e-6:
-            reward -= ELIXIR_CAP_PENALTY
+        if self.sim.elixir[True] >= ELIXIR_CAP_THRESHOLD:
+            parts["elixir_cap"] = -ELIXIR_CAP_PENALTY
 
         if self.sim.finished:
             margin = self.sim.crowns[True] - self.sim.crowns[False]
+            terminal = CROWN_MARGIN_REWARD * margin
             if self.sim.result == "win":
-                reward += TERMINAL_BASE_REWARD
+                terminal += TERMINAL_BASE_REWARD
             elif self.sim.result == "loss":
-                reward -= TERMINAL_BASE_REWARD
-            reward += CROWN_MARGIN_REWARD * margin
+                terminal -= TERMINAL_BASE_REWARD
+            parts["terminal"] = terminal
 
         if not action_result.success:
-            reward -= INVALID_ACTION_PENALTY
+            parts["invalid_action"] = -INVALID_ACTION_PENALTY
 
-        return reward
+        return parts
 
     # ----- convenience -----
 
