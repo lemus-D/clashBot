@@ -56,20 +56,67 @@ def _masked_categorical(logits: torch.Tensor, mask: torch.Tensor) -> Categorical
     return Categorical(logits=logits.masked_fill(~safe, NEG))
 
 
+class RunningNorm(nn.Module):
+    """Running mean/std over observations, frozen outside training.
+
+    The observation mixes scales badly: almost everything is a 0/1 one-hot,
+    but ``match_time`` runs to 300 and ``elixir`` to 10. Feeding that into a
+    tanh trunk lets a handful of features dominate the first layer and
+    saturate it. Normalising is cheaper and more general than special-casing
+    the offending fields, and it keeps the observation SCHEMA untouched -
+    that is a contract shared with the vision pipeline.
+
+    State is saved with the checkpoint; a policy restored without its
+    normaliser would be reading differently-scaled inputs.
+    """
+
+    def __init__(self, size: int, eps: float = 1e-4):
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(size))
+        self.register_buffer("var", torch.ones(size))
+        self.register_buffer("count", torch.tensor(eps))
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        bmean, bvar, bcount = x.mean(0), x.var(0, unbiased=False), x.shape[0]
+        delta = bmean - self.mean
+        tot = self.count + bcount
+        self.mean += delta * bcount / tot
+        m_a = self.var * self.count
+        m_b = bvar * bcount
+        self.var = (m_a + m_b + delta ** 2 * self.count * bcount / tot) / tot
+        self.count += bcount
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.clamp((x - self.mean) / torch.sqrt(self.var + 1e-8), -10, 10)
+
+
+def _trunk(flat_size: int, h1: int, h2: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(flat_size, h1), nn.Tanh(),
+        nn.Linear(h1, h2), nn.Tanh(),
+    )
+
+
 class ActorCritic(nn.Module):
-    """Shared trunk, three policy heads and a value head."""
+    """SEPARATE actor and critic trunks, three policy heads, one value head.
+
+    They were shared, and that was measurably wrong: the value loss produced
+    a gradient 23x the policy's, almost all of it in the shared trunk, and
+    ``max_grad_norm`` then scaled the whole thing down by 0.4. The critic
+    learned beautifully (explained variance 0.91) while the actor did not
+    move at all - KL 0.00001 over 146 updates. Separating them costs one
+    extra trunk of compute, which is nothing next to the simulator.
+    """
 
     def __init__(self, flat_size: int, hidden: tuple[int, int] = HIDDEN_SIZES):
         super().__init__()
         self.flat_size = flat_size
         self.hidden = tuple(hidden)
         h1, h2 = self.hidden
-        self.trunk = nn.Sequential(
-            nn.Linear(flat_size, h1),
-            nn.Tanh(),
-            nn.Linear(h1, h2),
-            nn.Tanh(),
-        )
+        self.norm = RunningNorm(flat_size)
+        self.trunk = _trunk(flat_size, h1, h2)
+        self.critic_trunk = _trunk(flat_size, h1, h2)
         self.play_head = nn.Linear(h2, 2)
         self.slot_head = nn.Linear(h2, HAND_SIZE)
         self.tile_head = nn.Linear(h2, TILE_COUNT)
@@ -91,13 +138,22 @@ class ActorCritic(nn.Module):
             nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor):
+        x = self.norm(x)
         z = self.trunk(x)
         return (
             self.play_head(z),
             self.slot_head(z),
             self.tile_head(z),
-            self.value_head(z).squeeze(-1),
+            self.value_head(self.critic_trunk(x)).squeeze(-1),
         )
+
+    def actor_parameters(self):
+        for m in (self.trunk, self.play_head, self.slot_head, self.tile_head):
+            yield from m.parameters()
+
+    def critic_parameters(self):
+        yield from self.critic_trunk.parameters()
+        yield from self.value_head.parameters()
 
     # ----- masks -----
 

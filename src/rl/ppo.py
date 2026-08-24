@@ -201,7 +201,15 @@ class PPO:
 
                 self.opt.zero_grad(set_to_none=True)
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
+                # Clipped SEPARATELY. Clipping the combined norm let the
+                # critic's much larger gradient consume the budget and scale
+                # the policy's away - the actor then never moved.
+                nn.utils.clip_grad_norm_(
+                    list(self.net.actor_parameters()), cfg.max_grad_norm
+                )
+                nn.utils.clip_grad_norm_(
+                    list(self.net.critic_parameters()), cfg.max_grad_norm
+                )
                 self.opt.step()
 
                 stats = {

@@ -117,6 +117,8 @@ def train(args) -> None:
         lr=args.lr,
         ent_coef=args.ent_coef,
         gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        vf_coef=args.vf_coef,
         seed=args.seed,
     )
     seed_everything(cfg.seed)
@@ -165,6 +167,9 @@ def train(args) -> None:
 
         for step in range(cfg.rollout_steps):
             global_step += cfg.num_envs
+            # Normaliser statistics come from the data the policy actually
+            # sees, and are frozen at eval so a benchmark is reproducible.
+            net.norm.update(next_obs)
             rollout.obs[step] = next_obs
             rollout.done[step] = next_done
 
@@ -271,6 +276,10 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--gamma", type=float, default=0.997)
     p.add_argument("--ent-coef", type=float, default=0.01)
+    p.add_argument("--gae-lambda", type=float, default=0.95,
+                   help="credit horizon is ~1/(1-lambda*gamma) STEPS; at the "
+                        "default that is ~19 steps against ~700-step episodes")
+    p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", default="models/ppo.pt")
