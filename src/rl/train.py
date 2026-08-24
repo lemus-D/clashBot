@@ -77,6 +77,26 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[ActorCritic, dict]
     return net, ckpt
 
 
+class MetricLog:
+    """One JSON line per update, beside the checkpoint.
+
+    Console output scrolls away and cannot be compared across runs. The
+    interesting question after a run is almost never "what was the final
+    number" but "WHEN did it stop improving, and what else moved at that
+    point" - which needs the whole series, not the last line.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        # Truncate: a run owns its log, appending would interleave two runs.
+        open(path, "w", encoding="utf-8").close()
+
+    def write(self, kind: str, **fields) -> None:
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": kind, **fields}) + "\n")
+
+
 def build_env(args, cfg: PPOConfig) -> VecSimEnv:
     return VecSimEnv(
         num_envs=cfg.num_envs,
@@ -117,10 +137,12 @@ def train(args) -> None:
             "noise": not args.no_noise, "stats": not args.no_randomize,
         },
     }
+    stem = os.path.splitext(args.out)[0]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-    with open(os.path.splitext(args.out)[0] + ".config.json", "w",
-              encoding="utf-8") as f:
+    with open(stem + ".config.json", "w", encoding="utf-8") as f:
         json.dump(run_cfg, f, indent=2)
+    log = MetricLog(stem + ".metrics.jsonl")
+    log.write("config", **run_cfg)
     print(json.dumps(run_cfg, indent=2), flush=True)
 
     rollout = Rollout(cfg.rollout_steps, cfg.num_envs, envs.flat_size, device,
@@ -194,6 +216,13 @@ def train(args) -> None:
             ln = float(np.mean([e["length"] for e in recent]))
         else:
             wr = ret = ln = float("nan")
+        log.write(
+            "update", update=update, step=global_step, sps=sps, lr=lr,
+            win_rate=None if np.isnan(wr) else wr,
+            mean_return=None if np.isnan(ret) else ret,
+            mean_length=None if np.isnan(ln) else ln,
+            episodes_seen=len(recent), train_seconds=train_time, **stats,
+        )
         print(
             f"upd {update:4d}/{cfg.num_updates}  step {global_step:>9,}  "
             f"{sps:6.0f}/s  lr {lr:.2e}  win {100 * wr:4.0f}%  "
@@ -211,6 +240,8 @@ def train(args) -> None:
             print(f"\n  EVAL @ step {global_step:,}")
             print(format_results(results), flush=True)
             score = headline(results)
+            log.write("eval", update=update, step=global_step,
+                      headline=score, results=[asdict(r) for r in results])
             save_checkpoint(args.out, net, cfg, global_step,
                             {"eval": [asdict(r) for r in results]})
             if score > best:
