@@ -322,20 +322,22 @@ speculatively generalize for cases that don't exist yet.)
       once its half is clear, the defenders that SURVIVED are already paid
       for, so it adds support behind the most advanced one. It also holds a
       `reserve` and chips only above 9 elixir.
-    - RandomPolicy baseline, 80 episodes, sampled decks + noise + levels
-      (the training condition): idle 100% win / bigspender 32% /
-      control 24% / cycler 20% / tankandsupport 19%, matches ~130-190s.
-      At n=80 the middle three are within noise of each other.
-      STALE: measured before the placement-mask fix, so the random policy was
-      sampling from a mask that offered illegal tiles. Re-baseline before
-      quoting these against anything new.
+    - RandomPolicy baseline, 100 episodes PER OPPONENT, sampled decks +
+      noise + levels (the training condition): bigspender 35% /
+      control 36% / cycler 27% / tankandsupport 27%, 31% overall.
+      Measured 2026-08-25, post placement-mask fix, via
+      `python -m src.sim.run --episodes 400 --opponent <the four>`.
+      Supersedes an n=80 pre-fix baseline that read 24% overall - it was
+      both stale AND undersampled.
     - Control concedes the FEWEST crowns (1.27 vs 1.49-1.64) but does not
       win most - it defends well and closes badly, because the reserve and
       the 9-elixir chip gate make it passive. Honest characterisation, not a
       bug; tune it only with a re-baseline.
-    - `bigspender` stays the EASIEST rung: dumping elixir the moment it
-      passes 5 starves its own defence. That is the archetype behaving
-      correctly.
+    - `bigspender` stays the EASIEST rung for a TRAINED policy (run2 57%):
+      dumping elixir the moment it passes 5 starves its own defence. That is
+      the archetype behaving correctly. Against the RANDOM policy it and
+      `control` tie at ~35% - punishing a dumped push takes a policy that
+      answers it, so this rung only separates once something is learning.
     - Re-baseline after ANY sim-fidelity change — the yardstick is the
       opponents' BEHAVIOUR, which is frozen, not the numbers it produces.
       This has moved a lot as fidelity improved: 2-17% with the broken stat
@@ -411,24 +413,51 @@ speculatively generalize for cases that don't exist yet.)
       (19 -> 250 steps) moved KL around noisily and win rate not at all.
     The one measurement that DID pay was gradient norms per loss term, which
     found the critic driving the shared trunk 23:1.
-  - RESULT SO FAR (`run1`, gamma 0.999, lambda 0.99, killed at 206/488
-    updates): eval headline 20% -> 27% -> 31% -> 34% -> 33% against a 24%
-    random baseline, then FLAT from update ~120. Critic fine (ev 0.83), KL
-    healthy (~0.007), no draw-rate blowup so the trade reward is not being
-    farmed. Trained against the BROKEN placement mask - see above.
-  - The mask fix did NOT move the checkpoint's benchmark: 33% before (64
-    scored games), 35% after (120), which is inside the noise at those
-    sample sizes. Refused placements went 60% -> 0% and the headline stayed
-    put. Whether the fix unblocks TRAINING is untested - `run1` is only being
-    re-evaluated under corrected rules, not retrained.
-  - OPEN QUESTION, and the most likely ceiling: entropy moved only
-    5.72 -> 5.61 over 206 updates, so the tile head is still near-uniform
-    over 144 tiles. The policy is learning WHEN to play and not WHERE. A
-    3963-float MLP predicting 144 independent tile logits is a poor fit for
-    a spatial problem; a conv over the 9x16 grid would let it generalise
-    "near my tower" instead of learning 144 unrelated numbers. Try that
-    before more hyperparameter work. The mask fix leaving the headline flat
-    is weak evidence FOR this being architectural.
+  - RESULTS. Quote these ONLY at 100 episodes per opponent (400 scored
+    games), full randomization, which is the training condition:
+
+        policy        steps   overall  bigspndr  control  cycler  tank+sup
+        random          -       31%      35        36       27      27
+        run1          819k      44%      49        45       43      41
+        run2          2.0M      50%      57        52       49      41
+        run2.best     1.64M     50%      49        57       49      45
+
+    Learning is real and large: run2 is +19pp over random, ~5 sigma at
+    n=400. Darwin's bar is 60-70%.
+  - EVERY WIN RATE PREVIOUSLY RECORDED HERE WAS A 16-GAME READ AND WAS
+    WRONG (the diagnostics - entropy, ev, KL, play_rate - were fine).
+    `run1` reads 35% at n=16 and 44% at n=100; the "20 -> 27 -> 31 -> 34 ->
+    33, FLAT from update ~120" curve and run2's apparent 25% -> 48% jump
+    were both sampling noise. The old "plateau" was largely a measurement
+    artifact, not a ceiling. Benchmark with
+    `--eval-only CKPT --eval-episodes 100`; the in-training `--eval-every`
+    passes default to 16 and are a progress indicator, NOT a result.
+  - `run2` is the first run ever taken to COMPLETION: 488/488 updates, 2M
+    steps, ~700 sps, ~50 min on the 4070. Same hyperparameters as `run1`
+    (gamma 0.999, lambda 0.99, seed 7) so the placement-mask fix was the
+    only difference. Critic ev 0.82-0.94, KL ~0.000 by the end (LR annealed
+    to 6e-7), play_rate ~0.042, no draw-rate blowup.
+    - Training past run1's kill point is worth +5pp (44 -> 50), but that is
+      only ~1.5 sigma at n=400. Suggestive, not established.
+    - `run2` and `run2.best` (update 400) TIE at 50%, so the last 88
+      updates and the tail of the LR anneal bought nothing.
+  - The placement-mask fix shows NO training effect. Two independent
+    measurements now: re-evaluating `run1` under corrected rules moved the
+    headline 33% -> 35% at n=16 (refusals 60% -> 0%), and `run2` tracks
+    `run1` across run1's whole range. The mask was a real bug and worth
+    fixing; it was not the thing holding the win rate down.
+  - OPEN QUESTION, and still the most likely ceiling: entropy moved only
+    5.72 -> 5.64 (max 7.05) across the FULL 2M steps, so the tile head is
+    near-uniform over 144 tiles. The policy gained 19pp over random without
+    ever learning WHERE to place - it learned WHEN. A 3963-float MLP
+    predicting 144 independent tile logits is a poor fit for a spatial
+    problem; a conv over the 9x16 grid would let it generalise "near my
+    tower" instead of learning 144 unrelated numbers. Try that before more
+    hyperparameter work.
+  - `tankandsupport` is 41% for BOTH runs - the only opponent that did not
+    move across 1.2M extra steps, and now the clearest single target. Note
+    it is also the hardest for the random policy (27%), so the archetype is
+    genuinely the top rung, not a quirk of one checkpoint.
   - `docs/ideas/placement-shaping.md` holds the unbuilt ideas for the same
     problem: a potential-based spatial reward gradient, and scripted
     opponents that punish bad placement. Thoughts, not plans.
