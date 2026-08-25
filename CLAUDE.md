@@ -89,10 +89,25 @@ speculatively generalize for cases that don't exist yet.)
     use a princess tower vanishing from detections as a destruction signal —
     same unreliability. Tower state comes from the HP bar.
 - SPELL PLACEMENT: troops may only be deployed on the friendly half (plus a
-  lane opened by a destroyed tower); SPELLS may be cast ANYWHERE. The rule
-  lives in `GameBoard.is_placeable(..., spell=...)`, and which cards are
-  spells is hand-maintained in `cards.py` as `SPELL_CARDS` (validated against
-  `CARD_CLASSES` at import) - the detector cannot tell you, same as cost.
+  lane opened by a destroyed tower); SPELLS may be cast ANYWHERE. Which cards
+  are spells is hand-maintained in `cards.py` as `SPELL_CARDS` (validated
+  against `CARD_CLASSES` at import) - the detector cannot tell you, same as
+  cost.
+  - ONE IMPLEMENTATION: `board.placement_allowed()`, written in the PLACER's
+    own frame. `GameBoard.is_placeable` is a thin wrapper;
+    `Simulation.is_placeable` mirrors the enemy's tiles into that frame and
+    calls the same function. Do not write a second copy - there was one, and
+    the two drifted in both directions at once (see below).
+  - An activated enemy king tower does NOT unlock the enemy half. The board
+    used to grant that and the simulator never did, so the observation's mask
+    opened the whole enemy half the moment the enemy king took ~2% chip
+    damage. 60% of `run1`'s placement attempts were refused by the env, all
+    on the SAME tile, because deterministic eval re-picks its top-ranked tile
+    every step. Territory expands only when a princess tower is DESTROYED.
+  - `RIVER_ROW` (7, in the placer's frame) never takes ground troops, even
+    once its lane opens. The simulator was missing this one.
+  - `tests/test_sim_engine.py::TestMaskAgreesWithEnv` compares the
+    observation mask against the env tile-by-tile in three states. Keep it.
   - The observation carries the TROOP mask plus a per-slot `hand_is_spell`
     (4,) flag, not four full 144-tile masks: spell-vs-troop is the only
     card-dependent rule, so 4 floats say what 4x144 would.
@@ -311,6 +326,9 @@ speculatively generalize for cases that don't exist yet.)
       (the training condition): idle 100% win / bigspender 32% /
       control 24% / cycler 20% / tankandsupport 19%, matches ~130-190s.
       At n=80 the middle three are within noise of each other.
+      STALE: measured before the placement-mask fix, so the random policy was
+      sampling from a mask that offered illegal tiles. Re-baseline before
+      quoting these against anything new.
     - Control concedes the FEWEST crowns (1.27 vs 1.49-1.64) but does not
       win most - it defends well and closes badly, because the reserve and
       the 9-elixir chip gate make it passive. Honest characterisation, not a
@@ -335,6 +353,16 @@ speculatively generalize for cases that don't exist yet.)
     Noise events are RECORDED by `env.py`, never inferred by comparing the
     two panels - jitter moves a unit to a neighbouring tile and would be
     mislabelled a phantom.
+    - `--policy models/run1.pt` watches a trained checkpoint instead of the
+      random baseline (deterministic, matching the benchmark; `--sample` for
+      the stochastic policy). `--opponent` takes a name, a comma list, or
+      `all` and round-robins episodes through them.
+    - A third REWARD panel appears whenever a `RewardTrace` is passed:
+      running return, per-source cumulative split, the % of steps paying
+      nothing, and a per-step sparkline. Recent placements are ringed on the
+      TRUTH panel, refused ones crossed. This is what found the mask bug -
+      the per-source split made a constant `invalid_action` drip obvious
+      where a single scalar reward had hidden it.
 - RL training (`src/rl/`): PPO against the scripted opponent pool.
   `python -m src.rl.train --total-steps 2000000 --out models/ppo.pt`,
   `--smoke` for a wiring check, `--eval-only CKPT` to benchmark. ~660
@@ -387,14 +415,26 @@ speculatively generalize for cases that don't exist yet.)
     updates): eval headline 20% -> 27% -> 31% -> 34% -> 33% against a 24%
     random baseline, then FLAT from update ~120. Critic fine (ev 0.83), KL
     healthy (~0.007), no draw-rate blowup so the trade reward is not being
-    farmed.
+    farmed. Trained against the BROKEN placement mask - see above.
+  - The mask fix did NOT move the checkpoint's benchmark: 33% before (64
+    scored games), 35% after (120), which is inside the noise at those
+    sample sizes. Refused placements went 60% -> 0% and the headline stayed
+    put. Whether the fix unblocks TRAINING is untested - `run1` is only being
+    re-evaluated under corrected rules, not retrained.
   - OPEN QUESTION, and the most likely ceiling: entropy moved only
     5.72 -> 5.61 over 206 updates, so the tile head is still near-uniform
     over 144 tiles. The policy is learning WHEN to play and not WHERE. A
     3963-float MLP predicting 144 independent tile logits is a poor fit for
     a spatial problem; a conv over the 9x16 grid would let it generalise
     "near my tower" instead of learning 144 unrelated numbers. Try that
-    before more hyperparameter work.
+    before more hyperparameter work. The mask fix leaving the headline flat
+    is weak evidence FOR this being architectural.
+  - `docs/ideas/placement-shaping.md` holds the unbuilt ideas for the same
+    problem: a potential-based spatial reward gradient, and scripted
+    opponents that punish bad placement. Thoughts, not plans.
+  - Per-game numbers vary a LOT at n=16: the same checkpoint scored cycler
+    at 19% and 50% on two different seed sets. Do not read a 16-game
+    per-opponent number as a result.
   - `play_rate` is logged every update. ~0.026 is the sustainable rate given
     elixir regen, so a value far below that is no-op collapse and a value
     far above it means the affordability mask is broken.
