@@ -233,7 +233,9 @@ def train(args) -> None:
             f"{sps:6.0f}/s  lr {lr:.2e}  win {100 * wr:4.0f}%  "
             f"ret {ret:7.2f}  len {ln:5.0f}  "
             f"pl {stats['policy_loss']:+.3f}  vl {stats['value_loss']:.3f}  "
-            f"ent {stats['entropy']:.3f}  play {stats['play_rate']:.3f}  "
+            f"ent {stats['entropy']:.3f}"
+            f"[p {stats['entropy_play']:.2f} s {stats['entropy_slot']:.2f} "
+            f"t {stats['entropy_tile']:.2f}]  play {stats['play_rate']:.3f}  "
             f"kl {stats['approx_kl']:.4f}  "
             f"ev {stats['explained_variance']:+.2f}",
             flush=True,

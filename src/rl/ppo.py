@@ -163,7 +163,7 @@ class PPO:
                 mb = idx[start:start + cfg.minibatch_size]
                 mb_t = torch.as_tensor(mb, device=self.device)
 
-                newlogprob, entropy, newvalue = self.net.evaluate(
+                newlogprob, entropy, newvalue, ent_parts = self.net.evaluate(
                     obs[mb_t], play[mb_t], slot[mb_t], tile[mb_t],
                     slot_mask[mb_t], tile_mask[mb_t],
                 )
@@ -218,6 +218,10 @@ class PPO:
                     "entropy": ent_loss.item(),
                     "approx_kl": approx_kl,
                     "clipfrac": float(np.mean(clipfracs)),
+                    # Per-head, so a placement head frozen at uniform is
+                    # visible in the log rather than hidden in the sum.
+                    **{f"entropy_{k}": v.mean().item()
+                       for k, v in ent_parts.items()},
                 }
 
             if cfg.target_kl is not None and stats.get("approx_kl", 0) > cfg.target_kl:

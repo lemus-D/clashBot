@@ -219,7 +219,11 @@ class ActorCritic(nn.Module):
         slot_mask: torch.Tensor,
         tile_mask: torch.Tensor,
     ):
-        """Log-prob, entropy and value of stored actions, for the PPO update."""
+        """Log-prob, entropy, value and per-head entropies of stored actions.
+
+        The per-head dict is what makes a frozen placement head visible; see
+        the comment on ``parts`` below.
+        """
         play_logits, slot_logits, tile_logits, value = self(obs)
 
         can_play = slot_mask.any(dim=-1)
@@ -243,10 +247,17 @@ class ActorCritic(nn.Module):
         # choice, i.e. no exploration pressure at all on the hardest
         # decision in the problem. Unweighted keeps those heads exploring
         # whether or not the policy is currently playing much.
-        entropy = (
-            play_dist.entropy() + slot_dist.entropy() + tile_dist.entropy()
-        )
-        return logprob, entropy, value
+        play_ent = play_dist.entropy()
+        slot_ent = slot_dist.entropy()
+        tile_ent = tile_dist.entropy()
+        entropy = play_ent + slot_ent + tile_ent
+        # Per-head, because the SUM hides which head is actually exploring.
+        # Measured on run1/run2: play collapses to ~1% of its maximum while
+        # slot and tile sit at ~96% of theirs, i.e. only one of the three
+        # heads ever learned anything. That went unnoticed for two runs
+        # because the sum alone looks like a healthy 5.7 of 7.05.
+        parts = {"play": play_ent, "slot": slot_ent, "tile": tile_ent}
+        return logprob, entropy, value, parts
 
 
 def to_action(play: int, slot: int, tile: int) -> Action:

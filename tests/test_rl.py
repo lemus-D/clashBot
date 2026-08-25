@@ -141,8 +141,12 @@ class TestLogProbConsistency:
         play, slot, tile, logprob, _, slot_mask, tile_mask = m.act(
             obs, playable, spells, tiles
         )
-        again, entropy, value = m.evaluate(
+        again, entropy, value, parts = m.evaluate(
             obs, play, slot, tile, slot_mask, tile_mask
+        )
+        assert set(parts) == {"play", "slot", "tile"}
+        assert torch.allclose(
+            parts["play"] + parts["slot"] + parts["tile"], entropy, atol=1e-5
         )
         assert torch.allclose(logprob, again, atol=1e-5)
         assert torch.isfinite(entropy).all() and (entropy >= 0).all()
@@ -156,9 +160,9 @@ class TestLogProbConsistency:
         tile_mask = torch.ones(n, TILE_COUNT, dtype=torch.bool)
         play = torch.zeros(n, dtype=torch.long)
 
-        a, _, _ = m.evaluate(obs, play, torch.zeros(n, dtype=torch.long),
-                             torch.zeros(n, dtype=torch.long), slot_mask, tile_mask)
-        b, _, _ = m.evaluate(obs, play, torch.full((n,), 3, dtype=torch.long),
+        a, *_ = m.evaluate(obs, play, torch.zeros(n, dtype=torch.long),
+                           torch.zeros(n, dtype=torch.long), slot_mask, tile_mask)
+        b, *_ = m.evaluate(obs, play, torch.full((n,), 3, dtype=torch.long),
                              torch.full((n,), 99, dtype=torch.long),
                              slot_mask, tile_mask)
         assert torch.allclose(a, b)
@@ -169,7 +173,7 @@ class TestLogProbConsistency:
         choice. Unweighted keeps them exploring."""
         m = net()
         n = 16
-        _, entropy, _ = m.evaluate(
+        _, entropy, _, _ = m.evaluate(
             batch(n), torch.zeros(n, dtype=torch.long),
             torch.zeros(n, dtype=torch.long), torch.zeros(n, dtype=torch.long),
             torch.ones(n, HAND_SIZE, dtype=torch.bool),
