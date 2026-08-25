@@ -128,7 +128,6 @@ class ObservationBuilder:
         playable_mask = board.get_placeable_mask(
             enemy_left_tower_alive=state.is_enemy_left_alive(),
             enemy_right_tower_alive=state.is_enemy_right_alive(),
-            enemy_king_active=state.is_enemy_king_active(),
         ).astype(np.float32)
 
         return {

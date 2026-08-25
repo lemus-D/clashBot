@@ -267,31 +267,40 @@ class Simulation:
     def is_placeable(
         self, friendly: bool, tile_x: int, tile_y: int, name: str | None = None
     ) -> bool:
-        """Own half only, widening into a lane whose tower has fallen.
+        """Whether ``friendly`` may deploy at this ABSOLUTE tile.
 
-        Mirrors ``GameBoard.is_placeable`` in effect: a side may deploy on its
-        own half, plus the opposing quadrant behind any tower it destroyed.
+        Delegates to ``board.placement_allowed`` - the one implementation of
+        the rule. This used to be a second copy, and the two drifted: the
+        board unlocked the enemy half on king activation and this did not,
+        while this allowed the riverbank row and the board did not. See
+        ``placement_allowed`` for what that cost.
+
+        The enemy's tiles are MIRRORED into the placer's frame, so there is
+        one coordinate convention and left/right lanes swap with it.
 
         SPELLS are exempt - they may be cast anywhere. Pass ``name`` so this
         can tell which rule applies; without it the troop rule is assumed,
         which is the safe default for a mask.
         """
+        from ..game.board import placement_allowed
         from ..game.cards import is_spell
 
-        if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
-            return False
-        if name is not None and is_spell(name):
-            return True
-        own_half = tile_y >= arena.FRIENDLY_HALF_START_ROW if friendly else tile_y < arena.FRIENDLY_HALF_START_ROW
-        if own_half:
-            return True
-
-        left_key = "enemy_left" if friendly else "friendly_left"
-        right_key = "enemy_right" if friendly else "friendly_right"
-        left_gone = left_key in self.destroyed_towers
-        right_gone = right_key in self.destroyed_towers
-        on_left = tile_x < ARENA_COLS // 2
-        return (left_gone and on_left) or (right_gone and not on_left)
+        spell = name is not None and is_spell(name)
+        if friendly:
+            tx, ty = tile_x, tile_y
+            left_open = "enemy_left" in self.destroyed_towers
+            right_open = "enemy_right" in self.destroyed_towers
+        else:
+            # Mirroring flips x, so the lane a destroyed FRIENDLY left tower
+            # opens is on the enemy's right.
+            tx = ARENA_COLS - 1 - tile_x
+            ty = ARENA_ROWS - 1 - tile_y
+            left_open = "friendly_right" in self.destroyed_towers
+            right_open = "friendly_left" in self.destroyed_towers
+        return placement_allowed(
+            tx, ty, left_lane_open=left_open, right_lane_open=right_open,
+            spell=spell,
+        )
 
     def deploy(self, friendly: bool, name: str, tile_x: int, tile_y: int) -> bool:
         """Place a card. Returns False if it was not affordable or legal."""

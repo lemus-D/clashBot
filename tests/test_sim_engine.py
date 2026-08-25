@@ -324,6 +324,88 @@ class TestPlacement:
         assert sim.deploy(True, "knight", 4, 12)
         assert sim.elixir[True] == pytest.approx(7.0)
 
+    def test_riverbank_row_is_never_placeable_for_troops(self):
+        """Row 7 stays shut even once its lane opens."""
+        sim = Simulation(seed=1)
+        tower = next(t for t in sim.towers(False) if t.tower_key == "enemy_left")
+        sim._damage(tower, tower.hp)
+        assert sim.is_placeable(True, 1, 6)
+        assert not sim.is_placeable(True, 1, 7)
+        assert sim.is_placeable(True, 1, 7, name="arrows"), "spells go anywhere"
+
+    def test_enemy_king_activation_grants_no_ground(self):
+        """King activation makes it shoot; it does not open the enemy half.
+
+        The board's mask used to grant this and the simulator never did, so
+        the policy aimed at tiles the env then refused. Pinned on both sides
+        by ``test_mask_matches_the_env``.
+        """
+        sim = Simulation(seed=1)
+        king = next(t for t in sim.towers(False) if t.tower_key == "enemy_king")
+        sim._damage(king, king.hp * 0.5)
+        assert not sim.is_placeable(True, 1, 3)
+        assert not sim.is_placeable(True, 7, 3)
+
+
+class TestMaskAgreesWithEnv:
+    """The observation's ``playable_mask`` and the env's acceptance are two
+    reads of ONE rule. When they drifted, 60% of a trained policy's
+    placements were refused and it retried the same tile every step.
+
+    Noise is OFF here. With it on the mask is *allowed* to lag - an occluded
+    tower bar holds its previous value, exactly as the vision pipeline does -
+    and tower state is only re-read on a step, so these settle the sim with a
+    no-op before comparing.
+    """
+
+    @staticmethod
+    def _settle(env) -> None:
+        from src.env.actions import Action
+
+        env.step(Action.no_op())
+
+    @staticmethod
+    def _check(env) -> None:
+        from src.game.board import ARENA_COLS, ARENA_ROWS
+
+        obs = env.observe()
+        for y in range(ARENA_ROWS):
+            for x in range(ARENA_COLS):
+                masked = obs["playable_mask"][y][x] > 0.5
+                allowed = env.sim.is_placeable(True, x, y, name="knight")
+                assert masked == allowed, (
+                    f"tile ({x}, {y}): mask says {masked}, env says {allowed}"
+                )
+
+    def test_mask_matches_the_env(self):
+        from src.sim.env import ObservationNoise, SimEnv
+
+        env = SimEnv(seed=3, noise=ObservationNoise.off())
+        env.reset()
+        self._check(env)
+
+    def test_mask_matches_the_env_with_a_damaged_king(self):
+        from src.sim.env import ObservationNoise, SimEnv
+
+        env = SimEnv(seed=3, noise=ObservationNoise.off())
+        env.reset()
+        king = next(t for t in env.sim.towers(False) if t.tower_key == "enemy_king")
+        env.sim._damage(king, king.hp * 0.5)
+        self._settle(env)
+        self._check(env)
+
+    def test_mask_matches_the_env_with_a_lane_open(self):
+        from src.sim.env import ObservationNoise, SimEnv
+
+        env = SimEnv(seed=3, noise=ObservationNoise.off())
+        env.reset()
+        tower = next(
+            t for t in env.sim.towers(False) if t.tower_key == "enemy_left"
+        )
+        env.sim._damage(tower, tower.hp)
+        self._settle(env)
+        self._check(env)
+
     def test_deploy_refused_without_elixir(self):
         sim = Simulation(seed=1)
         sim.elixir[True] = 1.0

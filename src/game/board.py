@@ -32,6 +32,64 @@ HAND_SIZE = 4
 
 FRIENDLY_HALF_START_ROW = 8
 
+#: The row immediately across the river from the placer's own half. The river
+#: straddles the boundary between rows 7 and 8 (``arena.RIVER_Y`` 8.0, half
+#: width 0.5), so row 7 is riverbank on the far side and never takes ground
+#: troops. Expressed in the PLACER's frame, so it mirrors for the enemy.
+RIVER_ROW = FRIENDLY_HALF_START_ROW - 1
+
+
+def placement_allowed(
+    tile_x: int,
+    tile_y: int,
+    *,
+    left_lane_open: bool = False,
+    right_lane_open: bool = False,
+    spell: bool = False,
+) -> bool:
+    """THE placement rule, in the placer's own frame. One implementation.
+
+    Coordinates are the placer's: own half is rows 8-15, the enemy is rows
+    0-7. The simulator mirrors the enemy's tiles into this frame rather than
+    keeping a second copy of the rule - two implementations drifted once
+    already and cost a training run (see below).
+
+    Troop rule: own half, plus the far quadrant behind a destroyed enemy
+    princess tower. ``RIVER_ROW`` never takes ground troops.
+
+    SPELL rule: anywhere in the arena. A spell whose only legal targets were
+    on your own half could never hit an enemy tower, which made Fireball and
+    Arrows strictly dead cards.
+
+    NOT a rule, deliberately: an activated enemy king tower does NOT unlock
+    the enemy half. ``GameBoard.is_placeable`` used to grant that, the
+    simulator never did, and the observation's mask therefore opened the
+    whole enemy half as soon as the enemy king took ~2% chip damage. The
+    policy aimed at tiles the env then refused - 60% of run1's placement
+    attempts, all of them retried on the same tile every step because
+    evaluation is deterministic. In the real game, deployment territory
+    expands only when a princess tower is DESTROYED; king activation makes
+    it shoot and grants no ground.
+    """
+    if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
+        return False
+    if spell:
+        return True
+    if tile_y == RIVER_ROW:
+        return False
+    if tile_y >= FRIENDLY_HALF_START_ROW:
+        return True
+
+    # The centre column belongs to neither lane, so it stays shut until a
+    # tower on one side or the other actually falls.
+    midline = ARENA_COLS // 2
+    if tile_x < midline and left_lane_open:
+        return True
+    if tile_x > midline and right_lane_open:
+        return True
+    return False
+
+
 # The arena and the hand use SEPARATE class lists, both generated from the
 # detector - see ``classes.py`` for why they are not one list. Briefly:
 # Goblin Brawler is an arena unit with no card, so a shared list gives the
@@ -94,43 +152,26 @@ class GameBoard:
         tile_y: int,
         enemy_left_tower_alive: bool = True,
         enemy_right_tower_alive: bool = True,
-        enemy_king_active: bool = False,
         spell: bool = False,
     ) -> bool:
         """Whether the friendly side may place this card here.
 
-        Troop rule: rows 8-15 (friendly half). When an enemy princess
-        tower falls, the corresponding top quadrant unlocks. Activating
-        the enemy king tower unlocks the full enemy half. Bridge row 7 is
-        never placeable for ground units.
-
-        SPELL rule: anywhere in the arena. A spell whose only legal targets
-        were on your own half could never hit an enemy tower, which made
-        Fireball and Arrows strictly dead cards.
+        Thin wrapper over :func:`placement_allowed` - see it for the rule.
+        This signature stays in the vision pipeline's terms (which enemy
+        towers are still standing) and converts to open lanes.
         """
-        if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
-            return False
-        if spell:
-            return True
-        if tile_y == 7:
-            return False
-        if tile_y >= FRIENDLY_HALF_START_ROW:
-            return True
-        if enemy_king_active:
-            return True
-
-        midline = ARENA_COLS // 2
-        if tile_x < midline and not enemy_left_tower_alive:
-            return True
-        if tile_x > midline and not enemy_right_tower_alive:
-            return True
-        return False
+        return placement_allowed(
+            tile_x,
+            tile_y,
+            left_lane_open=not enemy_left_tower_alive,
+            right_lane_open=not enemy_right_tower_alive,
+            spell=spell,
+        )
 
     def get_placeable_mask(
         self,
         enemy_left_tower_alive: bool = True,
         enemy_right_tower_alive: bool = True,
-        enemy_king_active: bool = False,
         spell: bool = False,
     ) -> np.ndarray:
         """Tile mask for TROOPS by default; ``spell=True`` gives the whole
@@ -146,7 +187,6 @@ class GameBoard:
                     y,
                     enemy_left_tower_alive,
                     enemy_right_tower_alive,
-                    enemy_king_active,
                     spell=spell,
                 ):
                     mask[y, x] = 1
