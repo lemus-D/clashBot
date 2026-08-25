@@ -366,6 +366,35 @@ speculatively generalize for cases that don't exist yet.)
   - Checkpoints carry the observation `schema_hash` and refuse to load
     across a change. The schema has moved four times; a silent load would
     read the wrong channels while appearing to work.
+  - REWARD SHAPING was the thing that unblocked learning, and it was found by
+    MEASURING the reward distribution rather than reasoning about it. Before
+    the trade reward: 91% of steps produced exactly zero reward and 52% of an
+    episode's whole signal was the win/loss bit after ~700 decisions. After:
+    78% silent, terminal down to 25%. `info["reward_parts"]` exists so this
+    can be re-audited; the single scalar is what hid it.
+  - Three hypotheses were tested and DISPROVED before that. Do not re-try
+    them without new evidence:
+    - "ent_coef too high" - the entropy GRADIENT measures 0.000, because at
+      maximum entropy it vanishes. Flat entropy is a SYMPTOM of a frozen
+      policy, not a cause.
+    - "rollout window too short" - quadrupling `rollout_steps` changed
+      nothing; the credit horizon is set by lambda, not the window.
+    - "credit horizon too short" - sweeping `gae_lambda` 0.95 -> 0.999
+      (19 -> 250 steps) moved KL around noisily and win rate not at all.
+    The one measurement that DID pay was gradient norms per loss term, which
+    found the critic driving the shared trunk 23:1.
+  - RESULT SO FAR (`run1`, gamma 0.999, lambda 0.99, killed at 206/488
+    updates): eval headline 20% -> 27% -> 31% -> 34% -> 33% against a 24%
+    random baseline, then FLAT from update ~120. Critic fine (ev 0.83), KL
+    healthy (~0.007), no draw-rate blowup so the trade reward is not being
+    farmed.
+  - OPEN QUESTION, and the most likely ceiling: entropy moved only
+    5.72 -> 5.61 over 206 updates, so the tile head is still near-uniform
+    over 144 tiles. The policy is learning WHEN to play and not WHERE. A
+    3963-float MLP predicting 144 independent tile logits is a poor fit for
+    a spatial problem; a conv over the 9x16 grid would let it generalise
+    "near my tower" instead of learning 144 unrelated numbers. Try that
+    before more hyperparameter work.
   - `play_rate` is logged every update. ~0.026 is the sustainable rate given
     elixir regen, so a value far below that is no-op collapse and a value
     far above it means the affordability mask is broken.
