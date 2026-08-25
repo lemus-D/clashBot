@@ -448,20 +448,44 @@ speculatively generalize for cases that don't exist yet.)
       75-float non-spatial slice is normalised (`_VectorNorm`), which still
       accepts the FULL observation so `net.norm.update(obs)` is unchanged.
   - ENTROPY IS LOGGED PER HEAD (`entropy_play` / `_slot` / `_tile`), not
-    just summed. The sum hid the single most important fact about both
-    completed runs: only ONE of the three heads ever learned. play collapses
-    to ~1% of its maximum while slot sits at ~96% and tile at ~97% of what
-    its mask allows. A summed 5.7 of 7.05 looks healthy and is not.
-    - The tile ceiling is `ln(~87)`, NOT `ln(144)` - the mask only offers
-      about 87 legal tiles - so normalise against the mask or the head looks
-      less frozen than it is.
-    - The SLOT head being equally frozen is the standing argument against
-      the conv being sufficient: it is a 4-way choice with no spatial
-      structure at all, so if the real problem is that neither placement
-      head receives a usable gradient, a conv improves sample efficiency of
-      a signal that is not there. If tile entropy stays pinned under `conv`,
-      that is the refutation, and `docs/ideas/placement-shaping.md` (which
-      manufactures the missing signal) becomes the answer instead.
+    just summed, because the sum hides which head is exploring: play
+    collapses to ~1-2% of its maximum while slot sits at ~95% and tile at
+    ~97% of what its mask allows. A summed 5.7 of 7.05 looks healthy.
+    - The tile ceiling is `ln(~87)`, NOT `ln(144)` - the mask offers about 87
+      legal tiles - so normalise against the mask, not the tile count.
+    - DO NOT READ HIGH TILE ENTROPY AS "THE HEAD LEARNED NOTHING". That
+      inference was recorded here as fact and it was wrong. The benchmark
+      plays DETERMINISTICALLY, so logits that sit close together - high
+      entropy - can still RANK tiles perfectly well. It is also partly
+      enforced: `ent_coef` is applied unweighted precisely to keep these
+      heads exploring. Measured on run3, tile entropy never moved off 4.44
+      all run while the tile logits were plainly input-dependent (spread
+      across observations 0.21 against 0.31 across tiles).
+    - To ask whether placement is actually learned, measure the
+      DETERMINISTIC choice - which tiles argmax picks, and the top1-minus-
+      median logit margin. That is what drives the benchmark. run2 (mlp)
+      used 21 of 144 tiles with margin +0.92; run3 (conv) used 8 with margin
+      +0.19 and put 72% of placements on r12c3.
+  - THE CONV EXPERIMENT: built, run to completion, and it did NOT unlock
+    placement. Result recorded above (tied with mlp). What it actually did
+    was find a better DEFAULT tile - r12c3, directly in front of the
+    friendly princess towers, against the mlp's r14c6 behind them - and
+    concentrate harder on it. Neither architecture learned
+    context-dependent placement.
+    - The per-tile bias is NOT doing the work, which was the obvious
+      suspicion: its std across tiles is 0.029 against the conv path's
+      0.306, and the final argmax never equals the bias's own argmax.
+    - run3 also LEARNS SLOWER and is less stable: 0% at update 40 (the mlp
+      was at 20%), and a collapse to 18% at update 320 that recovered by
+      360. Neither mlp run did that.
+  - SO THE CEILING IS PROBABLY NOT ARCHITECTURAL. Two very different
+    function classes - a 4.36M-parameter flat MLP and a 137k-parameter conv
+    - converge to the same ~50%. The slot head stays frozen at ~95% of max
+    entropy in BOTH, and it is a 4-way choice with no spatial structure at
+    all, so no architecture can explain it. That points at the LEARNING
+    SIGNAL, not the function class: `docs/ideas/placement-shaping.md`
+    (potential-based spatial reward, opponents that punish bad placement) is
+    the next thing to try, and it is still unbuilt.
   - REWARD SHAPING was the thing that unblocked learning, and it was found by
     MEASURING the reward distribution rather than reasoning about it. Before
     the trade reward: 91% of steps produced exactly zero reward and 52% of an
@@ -479,17 +503,32 @@ speculatively generalize for cases that don't exist yet.)
       (19 -> 250 steps) moved KL around noisily and win rate not at all.
     The one measurement that DID pay was gradient norms per loss term, which
     found the critic driving the shared trunk 23:1.
-  - RESULTS. Quote these ONLY at 100 episodes per opponent (400 scored
-    games), full randomization, which is the training condition:
+  - RESULTS, full randomization (the training condition). n is per opponent;
+    overall EXCLUDES idle, which anything working beats:
 
-        policy        steps   overall  bigspndr  control  cycler  tank+sup
-        random          -       31%      35        36       27      27
-        run1          819k      44%      49        45       43      41
-        run2          2.0M      50%      57        52       49      41
-        run2.best     1.64M     50%      49        57       49      45
+        policy      arch  steps    n    overall  bigspnd control cycler tank
+        random       -      -     100     31%      35      36     27     27
+        run1        mlp   819k    100     44%      49      45     43     41
+        run2        mlp   2.0M    200     49%      56      51     46     44
+        run3        conv  2.0M    200     51%      56      57     44     47
+        run3.best   conv  1.97M   200     51%      55      60     46     45
 
-    Learning is real and large: run2 is +19pp over random, ~5 sigma at
-    n=400. Darwin's bar is 60-70%.
+    Learning over random is real and large (+19pp, many sigma). The
+    architecture difference is NOT: run3 vs run2 is 2pp on 800 scored games
+    each, 0.8 sigma. Treat conv and mlp as TIED. Darwin's bar is 60-70%.
+  - SAMPLE SIZE HAS BURNED THIS PROJECT THREE TIMES, each time in the same
+    direction - a promising number shrinking as n grew:
+        run1  read 35% at n=16,   44% at n=100.
+        run3  read 55% at n=100,  51% at n=200.
+    n=400 total scored games CANNOT resolve a 2-5pp difference: the SE of a
+    difference of two 50% rates at n=400 each is ~3.5pp. Do not quote an
+    architecture or hyperparameter comparison at less than n=200/opponent,
+    and expect to need far more for small effects.
+    - The cheap fix is PAIRED analysis, and it is not implemented. `evaluate`
+      already uses a fixed `EVAL_SEED`, so two policies play the SAME games -
+      but only aggregate counts come back, so the pairing is thrown away. Per
+      episode win/loss would make the same games far more sensitive at no
+      extra compute.
   - EVERY WIN RATE PREVIOUSLY RECORDED HERE WAS A 16-GAME READ AND WAS
     WRONG (the diagnostics - entropy, ev, KL, play_rate - were fine).
     `run1` reads 35% at n=16 and 44% at n=100; the "20 -> 27 -> 31 -> 34 ->
