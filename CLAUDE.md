@@ -396,6 +396,72 @@ speculatively generalize for cases that don't exist yet.)
   - Checkpoints carry the observation `schema_hash` and refuse to load
     across a change. The schema has moved four times; a silent load would
     read the wrong channels while appearing to work.
+  - TWO ARCHITECTURES, `--arch {mlp,conv}`, both in `policy.py` behind a
+    shared `FactoredPolicy` base that owns ALL the masking. Default is
+    `conv`. A checkpoint records which one built it; one with no `arch`
+    field predates the split and is an MLP (run1 and run2 both load).
+    - `mlp` is the original flat baseline. Its `tile_head` is
+      `Linear(256, 144)`: 144 independent weight vectors with nothing
+      connecting tile 37 to tile 38, so a lesson learned at one tile
+      teaches its neighbour nothing. Measured, its tile head never left
+      ~97% of the entropy its mask allows, across two full runs.
+    - `conv` runs a 3x3 stack over the 9x16 arena and makes the tile head a
+      1x1 conv, so all 144 logits come from ONE shared kernel and every
+      placement trains it. 137k parameters against the MLP's 4.36M - the
+      MLP's tile head alone is bigger than the whole conv net.
+    - NO SCHEMA CHANGE. Everything the conv stack reads is already in the
+      observation or is a constant, so `schema_hash` is unmoved and no
+      recording is invalidated. The arena is recovered from the flat vector
+      via `observation.FIELD_OFFSETS`, never a hardcoded offset.
+    - 33 CHANNELS = 26 arena one-hots + `playable_mask` + 2 coordinate + 2
+      tower footprint + 2 tower HP. The last five are the whole design:
+      - COORDINATE CHANNELS ARE LOAD-BEARING, not a refinement. A conv is
+        translation equivariant and this game is not: row 15 is your king's
+        pocket, row 8 is the bridge. Without them the shared kernel cannot
+        tell those apart and `conv` is strictly WORSE than `mlp`. Same
+        reason for the learned `tile_bias` (144 params added to the
+        logits) - it restores the MLP's one real strength, memorising that
+        a specific tile is special.
+      - TOWER CHANNELS exist because the towers are NOT in `ARENA_CLASSES`
+        (skins make them undetectable, see `IGNORED_ARENA_CLASSES`), so
+        nothing in the arena one-hots ever marks where a tower is. HP is
+        painted at the tower's own tile, which turns "index 0 of a 6-vector"
+        into a LOCAL feature and lets "defend the damaged side" be one
+        pattern learned once for both lanes.
+      - The FOOTPRINT channel is separate from HP because a destroyed tower
+        reads 0 and so does every empty tile. HP alone cannot distinguish
+        "tower dead here" from "no tower here", and late-match play turns
+        on exactly that.
+      - `playable_mask` was already a 16x9 map being flattened away. It
+        carries the river, the friendly half and any lane opened by a
+        destroyed tower - the fixed geometry, for free.
+    - `board.TOWER_TILES` holds the tower tiles because a policy cannot
+      import the simulator; `sim/arena.py` keeps the continuous positions
+      for combat and ASSERTS the two agree, so they cannot drift. Binning
+      is `int()`, the same truncation `sim/env.py` uses for units - a second
+      rounding rule is how the placement predicate drifted. Consequence:
+      the kings are at x=4.5 and read one tile left of centre. Known,
+      accepted for consistency, not a bug to fix twice.
+    - The spatial half BYPASSES `RunningNorm` - one-hots, a boolean mask,
+      coordinates and fill fractions are all already 0..1, and normalising
+      a sparse one-hot by its own tiny variance amplifies noise. Only the
+      75-float non-spatial slice is normalised (`_VectorNorm`), which still
+      accepts the FULL observation so `net.norm.update(obs)` is unchanged.
+  - ENTROPY IS LOGGED PER HEAD (`entropy_play` / `_slot` / `_tile`), not
+    just summed. The sum hid the single most important fact about both
+    completed runs: only ONE of the three heads ever learned. play collapses
+    to ~1% of its maximum while slot sits at ~96% and tile at ~97% of what
+    its mask allows. A summed 5.7 of 7.05 looks healthy and is not.
+    - The tile ceiling is `ln(~87)`, NOT `ln(144)` - the mask only offers
+      about 87 legal tiles - so normalise against the mask or the head looks
+      less frozen than it is.
+    - The SLOT head being equally frozen is the standing argument against
+      the conv being sufficient: it is a 4-way choice with no spatial
+      structure at all, so if the real problem is that neither placement
+      head receives a usable gradient, a conv improves sample efficiency of
+      a signal that is not there. If tile entropy stays pinned under `conv`,
+      that is the refutation, and `docs/ideas/placement-shaping.md` (which
+      manufactures the missing signal) becomes the answer instead.
   - REWARD SHAPING was the thing that unblocked learning, and it was found by
     MEASURING the reward distribution rather than reasoning about it. Before
     the trade reward: 91% of steps produced exactly zero reward and 52% of an
@@ -501,7 +567,8 @@ speculatively generalize for cases that don't exist yet.)
 - Regenerate the class manifest: `python -m src.main --derive-classes`
   (needs API_KEY; announces any schema change it causes).
 - Train a policy: `python -m src.rl.train --total-steps 2000000
-  --out models/ppo.pt` (add `--smoke` for a fast wiring check).
+  --out models/ppo.pt` (add `--smoke` for a fast wiring check,
+  `--arch mlp` for the flat baseline instead of the default conv).
   Benchmark one: `python -m src.rl.train --eval-only models/ppo.pt`.
 - Tests: `pip install -r requirements-dev.txt` then `pytest`. Covers the
   class manifest, observation encoding, the simulator and the RL stack -

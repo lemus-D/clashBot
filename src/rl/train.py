@@ -30,7 +30,7 @@ from ..game.board import HAND_SIZE
 from ..sim.env import DeckSpread, LevelSpread, ObservationNoise
 from ..sim.opponents import OPPONENTS
 from .evaluate import BENCHMARK, evaluate, format_results, headline
-from .policy import TILE_COUNT, ActorCritic, to_action
+from .policy import ARCHITECTURES, TILE_COUNT, ActorCritic, to_action
 from .ppo import PPO, PPOConfig, Rollout, compute_gae
 from .vec_env import VecSimEnv
 
@@ -44,6 +44,10 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+#: Reverse of ``ARCHITECTURES``, so a checkpoint records which class built it.
+ARCH_BY_CLASS = {cls: name for name, cls in ARCHITECTURES.items()}
+
+
 def save_checkpoint(path: str, net: ActorCritic, cfg: PPOConfig,
                     global_step: int, extra: dict) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
@@ -55,6 +59,7 @@ def save_checkpoint(path: str, net: ActorCritic, cfg: PPOConfig,
             "schema_hash": schema_hash(),
             "schema": schema_descriptor(),
             "ppo_config": asdict(cfg),
+            "arch": ARCH_BY_CLASS[type(net)],
             "global_step": global_step,
             **extra,
         },
@@ -72,7 +77,15 @@ def load_checkpoint(path: str, device: torch.device) -> tuple[ActorCritic, dict]
             f"the weights would be reading the wrong inputs. Retrain, or "
             f"check out the revision that produced it."
         )
-    net = ActorCritic(ckpt["flat_size"], tuple(ckpt["hidden"])).to(device)
+    # Checkpoints written before the conv architecture existed have no
+    # "arch" field and are all MLPs.
+    arch = ckpt.get("arch", "mlp")
+    if arch not in ARCHITECTURES:
+        raise ValueError(
+            f"{path} records architecture {arch!r}, which this code does not "
+            f"have. Known: {sorted(ARCHITECTURES)}."
+        )
+    net = ARCHITECTURES[arch](ckpt["flat_size"], tuple(ckpt["hidden"])).to(device)
     net.load_state_dict(ckpt["model_state"])
     return net, ckpt
 
@@ -125,12 +138,13 @@ def train(args) -> None:
     device = torch.device(args.device)
 
     envs = build_env(args, cfg)
-    net = ActorCritic(envs.flat_size).to(device)
+    net = ARCHITECTURES[args.arch](envs.flat_size).to(device)
     algo = PPO(net, cfg, device)
 
     run_cfg = {
         "ppo": asdict(cfg),
         "opponents": list(args.opponents),
+        "arch": args.arch,
         "schema_hash": schema_hash(),
         "obs_flat_size": envs.flat_size,
         "device": str(device),
@@ -285,6 +299,10 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", default="models/ppo.pt")
+    p.add_argument("--arch", default="conv", choices=sorted(ARCHITECTURES),
+                   help="conv shares one kernel across all 144 tiles so "
+                        "placement generalises; mlp is the flat baseline "
+                        "whose tile head never left ~97%% of max entropy")
     p.add_argument("--opponents", nargs="+", default=list(DEFAULT_OPPONENTS),
                    choices=sorted(OPPONENTS))
     p.add_argument("--benchmark", nargs="+", default=list(BENCHMARK),

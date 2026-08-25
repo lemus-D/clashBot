@@ -18,6 +18,7 @@ import torch
 from src.env.actions import Action
 from src.env.observation import ObservationBuilder, schema_hash
 from src.game.board import ARENA_COLS, ARENA_ROWS, HAND_SIZE
+from src.game.cards import Troop
 from src.rl.evaluate import BENCHMARK, evaluate, format_results, headline
 from src.rl.policy import NEG, TILE_COUNT, ActorCritic, to_action
 from src.rl.ppo import PPO, PPOConfig, Rollout, compute_gae
@@ -358,3 +359,339 @@ class TestCheckpoint:
         assert ckpt["global_step"] == 1234
         for a, b in zip(original.parameters(), loaded.parameters()):
             assert torch.allclose(a, b)
+
+class TestTowerTiles:
+    """``board.TOWER_TILES`` duplicates the simulator's tower positions on
+    purpose - a policy cannot import the simulator - so the thing worth
+    testing is that the duplicate cannot drift."""
+
+    def test_covers_every_tower_key(self):
+        from src.game.board import TOWER_TILES
+        from src.game.state import TOWER_KEYS
+
+        assert set(TOWER_TILES) == set(TOWER_KEYS)
+
+    def test_agrees_with_the_simulators_float_positions(self):
+        from src.game.board import TOWER_TILES
+        from src.sim.arena import TOWERS_BY_KEY
+
+        for key, spec in TOWERS_BY_KEY.items():
+            assert TOWER_TILES[key] == (int(spec.y), int(spec.x)), key
+
+    def test_friendly_towers_are_on_the_friendly_half(self):
+        from src.game.board import FRIENDLY_HALF_START_ROW, TOWER_TILES
+
+        for key, (row, _) in TOWER_TILES.items():
+            if key.startswith("friendly"):
+                assert row >= FRIENDLY_HALF_START_ROW, key
+            else:
+                assert row < FRIENDLY_HALF_START_ROW, key
+
+
+class TestSpatialInput:
+    """The conv architecture reconstructs 2-D structure from the FLAT
+    observation. A wrong reshape or permute is silent - it transposes the
+    board and the policy trains on a mirrored world - so these assert
+    against observations built by the real encoder, not synthetic tensors.
+    """
+
+    def spatial(self, flat):
+        from src.rl.policy import _SpatialInput
+
+        enc = _SpatialInput()
+        return enc(torch.as_tensor(flat, dtype=torch.float32).unsqueeze(0))[0]
+
+    def test_arena_channel_lands_on_the_same_tile_the_encoder_wrote(self):
+        from src.game.board import GameBoard
+        from src.game.classes import ARENA_CLASSES, ARENA_INDEX
+        from src.game.state import GameState
+
+        board = GameBoard(monitor_width=1000, monitor_height=1600)
+        board.troops_in_arena[9][2] = Troop("knight", "blue", 2, 9)
+        board.troops_in_arena[3][4] = Troop("knight", "red", 4, 3)
+        flat = ObservationBuilder.flatten(
+            ObservationBuilder().build(board, GameState())
+        )
+
+        chans = self.spatial(flat)
+        n = len(ARENA_CLASSES)
+        idx = ARENA_INDEX["knight"]
+        # Friendly knight at row 9 col 2, enemy at row 3 col 4. A transposed
+        # permute would put these at (2, 9) and (4, 3) and pass every
+        # shape-only check.
+        assert chans[idx, 9, 2] == 1.0
+        assert chans[n + idx, 3, 4] == 1.0
+        assert chans[idx].sum() == 1.0
+        assert chans[n + idx].sum() == 1.0
+
+    def test_playable_mask_channel_matches_the_observation(self):
+        from src.game.board import GameBoard
+        from src.game.state import GameState
+        from src.rl.policy import _SpatialInput
+
+        obs = ObservationBuilder().build(
+            GameBoard(monitor_width=1000, monitor_height=1600), GameState()
+        )
+        flat = ObservationBuilder.flatten(obs)
+        chans = self.spatial(flat)
+
+        enc = _SpatialInput()
+        mask_channel = chans[enc.arena_channels]
+        expected = np.asarray(obs["playable_mask"], dtype=np.float32)
+        assert np.allclose(mask_channel.numpy(), expected)
+        # It must not be uniform, or the test would pass on a zeroed channel.
+        assert 0 < expected.sum() < expected.size
+
+    def test_coordinate_channels_are_row_and_column(self):
+        from src.rl.policy import _SpatialInput
+
+        enc = _SpatialInput()
+        row_c, col_c = enc.coords
+        assert row_c[0, 0] == 0.0 and row_c[ARENA_ROWS - 1, 0] == 1.0
+        assert col_c[0, 0] == 0.0 and col_c[0, ARENA_COLS - 1] == 1.0
+        # Row varies down, column varies across - swapping them is the
+        # mistake that makes the conv blind to which half it is in.
+        assert (row_c[5] == row_c[5, 0]).all()
+        assert (col_c[:, 5] == col_c[0, 5]).all()
+
+    def test_tower_hp_is_painted_at_the_tower_tile(self):
+        from src.game.board import GameBoard, TOWER_TILES
+        from src.game.state import GameState
+        from src.rl.policy import _SpatialInput
+
+        state = GameState()
+        state.set_tower_hp("friendly_left", 0.25)
+        state.set_tower_hp("enemy_right", 0.75)
+        flat = ObservationBuilder.flatten(ObservationBuilder().build(
+            GameBoard(monitor_width=1000, monitor_height=1600), state
+        ))
+        chans = self.spatial(flat)
+
+        enc = _SpatialInput()
+        friendly_hp = chans[enc.arena_channels + 5]
+        enemy_hp = chans[enc.arena_channels + 6]
+
+        fr, fc = TOWER_TILES["friendly_left"]
+        er, ec = TOWER_TILES["enemy_right"]
+        assert friendly_hp[fr, fc] == pytest.approx(0.25)
+        assert enemy_hp[er, ec] == pytest.approx(0.75)
+        # A friendly tower must not bleed into the enemy channel.
+        assert enemy_hp[fr, fc] == 0.0
+        assert friendly_hp[er, ec] == 0.0
+
+    def test_footprint_separates_a_destroyed_tower_from_empty_ground(self):
+        """HP 0 is what a dead tower reads AND what every empty tile reads.
+        The footprint channel is the only thing that tells them apart, and
+        late-match play turns on that distinction."""
+        from src.game.board import GameBoard, TOWER_TILES
+        from src.game.state import GameState
+        from src.rl.policy import _SpatialInput
+
+        state = GameState()
+        # Written directly, NOT via set_tower_hp: a single 0 reading is
+        # debounced there on purpose, because an occluded bar also reads 0.
+        # That debounce is tested elsewhere and is not what this is about.
+        state.tower_hp["friendly_left"] = 0.0
+        flat = ObservationBuilder.flatten(ObservationBuilder().build(
+            GameBoard(monitor_width=1000, monitor_height=1600), state
+        ))
+        chans = self.spatial(flat)
+        enc = _SpatialInput()
+
+        footprint = chans[enc.arena_channels + 3]
+        hp = chans[enc.arena_channels + 5]
+        row, col = TOWER_TILES["friendly_left"]
+
+        assert hp[row, col] == 0.0            # destroyed
+        assert footprint[row, col] == 1.0     # but a tower IS here
+        assert footprint[0, 0] == 0.0         # and here it is not
+        assert footprint.sum() == 3.0         # three friendly towers
+
+    def test_channel_count_is_the_documented_layout(self):
+        from src.game.classes import ARENA_CLASSES
+        from src.rl.policy import _SpatialInput
+
+        enc = _SpatialInput()
+        assert enc.channels == len(ARENA_CLASSES) * 2 + 7
+
+
+class TestConvPolicy:
+    def conv(self):
+        from src.rl.policy import ConvActorCritic
+
+        torch.manual_seed(0)
+        return ConvActorCritic(FLAT).to(DEVICE)
+
+    def test_head_shapes_match_the_mlp(self):
+        n = 8
+        obs = torch.rand(n, FLAT)
+        play, slot, tile, value = self.conv()(obs)
+        assert play.shape == (n, 2)
+        assert slot.shape == (n, HAND_SIZE)
+        assert tile.shape == (n, TILE_COUNT)
+        assert value.shape == (n,)
+        assert torch.isfinite(tile).all()
+
+    def test_it_is_a_drop_in_for_the_mlp_on_the_same_observation(self):
+        """Same interface, same masks, same schema. If this breaks, the conv
+        net cannot be swapped in without touching the rollout code."""
+        m = self.conv()
+        n = 8
+        obs = torch.rand(n, FLAT)
+        playable = torch.ones(n, HAND_SIZE)
+        spells = torch.zeros(n, HAND_SIZE)
+        tiles = torch.ones(n, TILE_COUNT)
+
+        play, slot, tile, logprob, _, slot_mask, tile_mask = m.act(
+            obs, playable, spells, tiles
+        )
+        again, entropy, value, parts = m.evaluate(
+            obs, play, slot, tile, slot_mask, tile_mask
+        )
+        assert torch.allclose(logprob, again, atol=1e-5)
+        assert set(parts) == {"play", "slot", "tile"}
+        assert torch.isfinite(entropy).all()
+
+    def test_actor_and_critic_parameters_are_disjoint_and_complete(self):
+        """The separate-trunk split is load-bearing: the two are clipped
+        independently because a shared trunk let the critic's gradient scale
+        the actor's away."""
+        m = self.conv()
+        actor = {id(p) for p in m.actor_parameters()}
+        critic = {id(p) for p in m.critic_parameters()}
+        assert not actor & critic
+        assert actor | critic == {id(p) for p in m.parameters()}
+
+    def test_the_tile_head_shares_weights_across_tiles(self):
+        """The whole point: 144 logits from one kernel plus a 144-element
+        bias, not 144 independent weight vectors. The MLP's tile head alone
+        is larger than the entire conv network."""
+        from src.rl.policy import ActorCritic
+
+        m = self.conv()
+        shared = m.tile_conv.weight.numel() + m.tile_conv.bias.numel()
+        per_tile = m.tile_bias.numel()
+        mlp_tile = ActorCritic(FLAT).tile_head.weight.numel()
+
+        assert per_tile == TILE_COUNT
+        assert shared + per_tile < mlp_tile / 100
+
+    def test_gradient_reaches_the_tile_head_and_the_bias(self):
+        m = self.conv()
+        obs = torch.rand(4, FLAT)
+        _, _, tile, _ = m(obs)
+        tile.sum().backward()
+        assert m.tile_conv.weight.grad is not None
+        assert m.tile_bias.grad is not None
+        assert m.tile_bias.grad.abs().sum() > 0
+        assert m.trunk.board[0].weight.grad.abs().sum() > 0
+
+    def test_running_norm_takes_the_full_observation(self):
+        """``train.py`` calls ``net.norm.update(obs)`` with the whole flat
+        vector for both architectures; the conv net normalises only its
+        non-spatial slice but must accept the same argument."""
+        m = self.conv()
+        obs = torch.rand(16, FLAT) * 10
+        m.norm.update(obs)
+        out = m.norm(obs)
+        assert out.shape == (16, m.vec_size)
+        assert torch.isfinite(out).all()
+
+    def test_spatial_channels_are_not_normalised_away(self):
+        """The spatial half is already 0..1, so it bypasses RunningNorm. If
+        it were routed through it, a sparse one-hot divided by its own tiny
+        variance would blow up."""
+        m = self.conv()
+        obs = torch.rand(64, FLAT)
+        for _ in range(5):
+            m.norm.update(obs)
+        chans = m.spatial(obs)
+        assert chans.max() <= 1.0 + 1e-6
+        assert chans.min() >= 0.0 - 1e-6
+
+
+class TestArchitectureCheckpoints:
+    def test_conv_checkpoint_round_trips(self, tmp_path):
+        from src.rl.policy import ConvActorCritic
+        from src.rl.train import load_checkpoint, save_checkpoint
+
+        torch.manual_seed(0)
+        net = ConvActorCritic(FLAT).to(DEVICE)
+        cfg = PPOConfig(total_steps=1024, num_envs=2, rollout_steps=16)
+        path = str(tmp_path / "conv.pt")
+        save_checkpoint(path, net, cfg, 1234, {})
+
+        loaded, ckpt = load_checkpoint(path, DEVICE)
+        assert ckpt["arch"] == "conv"
+        assert isinstance(loaded, ConvActorCritic)
+
+        obs = torch.rand(4, FLAT)
+        net.eval(), loaded.eval()
+        with torch.no_grad():
+            for a, b in zip(net(obs), loaded(obs)):
+                assert torch.allclose(a, b, atol=1e-6)
+
+    def test_a_checkpoint_without_an_arch_field_loads_as_the_mlp(self, tmp_path):
+        """run1 and run2 predate the conv architecture and record no arch.
+        They have to keep loading, or two measured baselines become
+        unreadable."""
+        from src.rl.train import load_checkpoint, save_checkpoint
+
+        torch.manual_seed(0)
+        net = ActorCritic(FLAT).to(DEVICE)
+        cfg = PPOConfig(total_steps=1024, num_envs=2, rollout_steps=16)
+        path = str(tmp_path / "legacy.pt")
+        save_checkpoint(path, net, cfg, 7, {})
+
+        blob = torch.load(path, map_location=DEVICE, weights_only=False)
+        del blob["arch"]
+        torch.save(blob, path)
+
+        loaded, _ = load_checkpoint(path, DEVICE)
+        assert isinstance(loaded, ActorCritic)
+
+    def test_an_unknown_arch_is_refused(self, tmp_path):
+        from src.rl.train import load_checkpoint, save_checkpoint
+
+        net = ActorCritic(FLAT).to(DEVICE)
+        cfg = PPOConfig(total_steps=1024, num_envs=2, rollout_steps=16)
+        path = str(tmp_path / "future.pt")
+        save_checkpoint(path, net, cfg, 7, {})
+        blob = torch.load(path, map_location=DEVICE, weights_only=False)
+        blob["arch"] = "transformer"
+        torch.save(blob, path)
+
+        with pytest.raises(ValueError, match="transformer"):
+            load_checkpoint(path, DEVICE)
+
+
+class TestConvPPOIntegration:
+    def test_a_ppo_update_runs_end_to_end_on_the_conv_net(self):
+        """Cheap wiring check that the conv net survives a real update: the
+        per-head entropies come back, the tile bias actually moves, and
+        nothing NaNs."""
+        from src.rl.policy import ConvActorCritic
+
+        torch.manual_seed(0)
+        cfg = PPOConfig(total_steps=256, num_envs=4, rollout_steps=16,
+                        minibatches=2, update_epochs=1)
+        net = ConvActorCritic(FLAT).to(DEVICE)
+        algo = PPO(net, cfg, DEVICE)
+
+        r = Rollout(cfg.rollout_steps, cfg.num_envs, FLAT, DEVICE,
+                    TILE_COUNT, HAND_SIZE)
+        r.obs.uniform_(0, 1)
+        r.reward.normal_()
+        r.slot_mask[:] = True
+        r.tile_mask[:] = True
+        r.logprob.normal_()
+
+        before = net.tile_bias.detach().clone()
+        adv, ret = compute_gae(r, torch.zeros(cfg.num_envs),
+                               torch.zeros(cfg.num_envs), 0.99, 0.95)
+        stats = algo.update(r, adv, ret)
+
+        for key in ("entropy_play", "entropy_slot", "entropy_tile"):
+            assert key in stats and np.isfinite(stats[key])
+        assert np.isfinite(stats["policy_loss"])
+        assert not torch.equal(before, net.tile_bias.detach())

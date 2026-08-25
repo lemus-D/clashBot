@@ -73,6 +73,41 @@ OBSERVATION_SHAPES: dict[str, tuple[int, ...]] = {
 }
 
 
+def _field_offsets() -> dict[str, tuple[int, int]]:
+    """``{field: (offset, size)}`` into the vector ``flatten()`` produces.
+
+    ``flatten()`` concatenates in ``OBSERVATION_SHAPES`` key order, so the
+    offsets are derivable rather than magic numbers. The conv policy needs
+    them to recover ``arena`` and ``playable_mask`` as 2-D maps from a flat
+    observation; hardcoding 67 and 3819 in the network would silently read
+    the wrong channels the next time a field is added.
+    """
+    out: dict[str, tuple[int, int]] = {}
+    offset = 0
+    for key, shape in OBSERVATION_SHAPES.items():
+        size = int(np.prod(shape)) if shape else 1
+        out[key] = (offset, size)
+        offset += size
+    return out
+
+
+FIELD_OFFSETS: dict[str, tuple[int, int]] = _field_offsets()
+
+
+def field_indices(*names: str) -> np.ndarray:
+    """Flat indices of ``names``, in the order given."""
+    return np.concatenate([
+        np.arange(FIELD_OFFSETS[k][0], FIELD_OFFSETS[k][0] + FIELD_OFFSETS[k][1])
+        for k in names
+    ])
+
+
+def field_indices_excluding(*names: str) -> np.ndarray:
+    """Flat indices of every field EXCEPT ``names``, in flatten order."""
+    keep = [k for k in OBSERVATION_SHAPES if k not in names]
+    return field_indices(*keep)
+
+
 def schema_descriptor() -> dict:
     """Everything needed to interpret — or later migrate — a flattened
     observation: both class lists (the one-hot channel meanings) and the

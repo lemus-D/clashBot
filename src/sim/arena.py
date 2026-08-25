@@ -14,7 +14,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..game.board import ARENA_COLS, ARENA_ROWS, FRIENDLY_HALF_START_ROW
+from ..game.board import (
+    ARENA_COLS,
+    ARENA_ROWS,
+    FRIENDLY_HALF_START_ROW,
+    TOWER_TILES,
+)
 from ..game.state import TOWER_KEYS
 
 # The river runs along the boundary between the last enemy row and the first
@@ -62,6 +67,15 @@ TOWERS_BY_KEY: dict[str, TowerSpec] = {t.key: t for t in TOWERS}
 assert set(TOWERS_BY_KEY) == set(TOWER_KEYS), (
     f"Simulator towers {sorted(TOWERS_BY_KEY)} do not match the observation's "
     f"TOWER_KEYS {sorted(TOWER_KEYS)}."
+)
+
+# ``board.TOWER_TILES`` is the same six towers as TILES, for the conv policy's
+# spatial channels. It is a separate constant because a policy cannot import
+# the simulator, so this asserts the two can never drift.
+assert {k: (int(t.y), int(t.x)) for k, t in TOWERS_BY_KEY.items()} == TOWER_TILES, (
+    f"Simulator tower tiles "
+    f"{ {k: (int(t.y), int(t.x)) for k, t in TOWERS_BY_KEY.items()} } "
+    f"disagree with board.TOWER_TILES {TOWER_TILES}. One of the two moved."
 )
 
 

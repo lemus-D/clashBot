@@ -38,6 +38,29 @@ FRIENDLY_HALF_START_ROW = 8
 #: troops. Expressed in the PLACER's frame, so it mirrors for the enemy.
 RIVER_ROW = FRIENDLY_HALF_START_ROW - 1
 
+#: Which TILE each tower stands on, in the PLACER's frame, keyed by
+#: ``state.TOWER_KEYS``. Lives here rather than in ``sim/arena.py`` because
+#: both backends need it and a policy cannot import the simulator: the arena
+#: geometry is the same whether the state came from vision or from the sim.
+#:
+#: ``sim/arena.py`` holds the same towers as CONTINUOUS positions for combat
+#: and asserts these tiles agree with ``int()`` of them, so the two cannot
+#: drift. ``int()`` is deliberate - it is the same truncation ``sim/env.py``
+#: uses to bin units into the arena tensor, and a second rounding rule is
+#: exactly the kind of duplicate that drifted in the placement predicate.
+#:
+#: The kings sit at x=4.5, so truncation puts them in column 4 and they read
+#: one tile left of centre. Kept for consistency with how units are binned
+#: rather than special-cased.
+TOWER_TILES: dict[str, tuple[int, int]] = {
+    "friendly_left": (13, 2),
+    "friendly_right": (13, 7),
+    "friendly_king": (14, 4),
+    "enemy_left": (3, 2),
+    "enemy_right": (3, 7),
+    "enemy_king": (1, 4),
+}
+
 
 def placement_allowed(
     tile_x: int,
