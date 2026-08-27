@@ -124,8 +124,17 @@ ceiling rather than the floor).
 > BUILT: `punisher` and `controlplus`, in a `PUNISHER_POOL` scored separately
 > from the frozen four. They read where the policy places and exploit it -
 > spells priced in elixir on stacked units, pushes down whichever lane the
-> policy left empty. See `docs/punisher-opponents.md` for the design, the
-> measurements, and the one bug that mattered.
+> policy left empty.
+>
+> **They are harder and that is all that has been shown.** `punisher` holds a
+> random policy to 18.0% against `cycler`'s 27.0%, the hardest frozen bot. But
+> the probe that asks whether placement is worth MORE against them came back
+> flat: concentrating on one tile pays +15.0pp against the frozen four and
+> +17.5pp against the punishers, a difference well inside its ~6.9pp SE. So
+> the premise of §4 above is not yet confirmed by this work, and the pool
+> should not be quoted as the answer to it. See
+> `docs/punisher-opponents.md` §4 for why that probe cannot settle it and what
+> would.
 >
 > The frozen pool was NOT touched, so every number in §1 stands as recorded -
 > re-measured, random still scores 31.0% overall against it. Nothing has been
