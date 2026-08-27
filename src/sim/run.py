@@ -19,8 +19,15 @@ import numpy as np
 
 from ..env.actions import Action
 from ..game.board import ARENA_COLS, ARENA_ROWS, HAND_SIZE
-from .env import DeckSpread, STEP_PERIOD_SEC, LevelSpread, ObservationNoise, SimEnv
-from .opponents import OPPONENTS, make_opponent
+from .env import (
+    ArchetypeDeckSpread,
+    DeckSpread,
+    STEP_PERIOD_SEC,
+    LevelSpread,
+    ObservationNoise,
+    SimEnv,
+)
+from .opponents import BASELINE_POOL, OPPONENTS, PUNISHER_POOL, make_opponent
 from .units import stats_confidence_report
 
 # Real play manages roughly this many matches an hour: ~3 min a match plus
@@ -119,17 +126,34 @@ def make_policy(args):
     return RandomSimPolicy(seed=args.seed)
 
 
+#: Named groups accepted by ``--opponent``. ``baseline`` is the frozen four
+#: every recorded win rate was measured against; ``punishers`` is the
+#: placement-punishing pair, which has no recorded baseline yet. Keeping them
+#: separately addressable is what stops the two being averaged together into
+#: a number that means nothing.
+OPPONENT_GROUPS: dict[str, tuple[str, ...]] = {
+    "baseline": BASELINE_POOL,
+    "punishers": PUNISHER_POOL,
+}
+
+
 def parse_opponents(spec: str) -> tuple[str, ...]:
-    """``all``, or a comma-separated list. Episodes round-robin through it."""
+    """A group name, ``all``, or a comma-separated list.
+
+    Episodes round-robin through whatever comes back.
+    """
     if spec == "all":
         # Every real archetype. ``idle`` plays nothing, so it is only useful
         # when asked for by name.
         return tuple(n for n in sorted(OPPONENTS) if n != "idle")
+    if spec in OPPONENT_GROUPS:
+        return OPPONENT_GROUPS[spec]
     names = tuple(n.strip() for n in spec.split(",") if n.strip())
     unknown = [n for n in names if n not in OPPONENTS]
     if unknown:
         raise SystemExit(
             f"Unknown opponent(s) {unknown}. Have: {sorted(OPPONENTS)}, "
+            f"a group in {sorted(OPPONENT_GROUPS)}, "
             f"or 'all' for every archetype except idle."
         )
     if not names:
@@ -148,6 +172,10 @@ def make_env(args, opponent: str, index: int = 0) -> SimEnv:
             troop_spread=args.level_spread, tower_spread=args.level_spread
         ),
         decks=DeckSpread.off() if args.no_decks else DeckSpread(),
+        # Structured decks are opponent-only and opt-in: turning them on for
+        # the frozen four would change the episodes their recorded numbers
+        # were measured on.
+        opponent_decks=ArchetypeDeckSpread() if args.structured_decks else None,
         opponent=make_opponent(opponent, seed=seed),
     )
 
@@ -281,6 +309,10 @@ def main() -> None:
                         "(evaluation, not training)")
     p.add_argument("--level-spread", type=int, default=1,
                    help="+/- card and tower levels sampled per episode")
+    p.add_argument("--structured-decks", action="store_true",
+                   help="give the OPPONENT a role-structured deck (tank, two "
+                        "spells, building, mini tank, swarm, air defense). "
+                        "Opponent-only; the policy's deck is unaffected.")
     p.add_argument("--no-decks", action="store_true",
                    help="fixed default deck instead of sampling one per "
                         "episode (evaluation, not training)")

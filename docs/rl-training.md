@@ -116,11 +116,21 @@ Evidence:
    choose well.
 
 **Next lead:** `docs/ideas/placement-shaping.md` — a potential-based spatial
-reward gradient, and/or scripted opponents that punish bad placement. Both
-still unbuilt. The second is the more attractive framing (it cannot be farmed
-and it raises the ceiling rather than the floor) but it changes the frozen
-opponent pool, which invalidates every number in section 1 and forces a
-re-baseline.
+reward gradient, and/or scripted opponents that punish bad placement. The
+second is the more attractive framing (it cannot be farmed and it raises the
+ceiling rather than the floor).
+
+> **Update — branch `punisher-opponents`.** The punisher opponents are now
+> BUILT: `punisher` and `controlplus`, in a `PUNISHER_POOL` scored separately
+> from the frozen four. They read where the policy places and exploit it -
+> spells priced in elixir on stacked units, pushes down whichever lane the
+> policy left empty. See `docs/punisher-opponents.md` for the design, the
+> measurements, and the one bug that mattered.
+>
+> The frozen pool was NOT touched, so every number in §1 stands as recorded -
+> re-measured, random still scores 31.0% overall against it. Nothing has been
+> trained against the new pool yet, so it has no policy baseline at all; the
+> reward-shaping half of this idea is still unbuilt.
 
 ---
 

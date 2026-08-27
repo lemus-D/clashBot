@@ -27,14 +27,43 @@ import torch
 
 from ..env.observation import schema_descriptor, schema_hash
 from ..game.board import HAND_SIZE
-from ..sim.env import DeckSpread, LevelSpread, ObservationNoise
-from ..sim.opponents import OPPONENTS
+from ..sim.env import (
+    ArchetypeDeckSpread,
+    DeckSpread,
+    LevelSpread,
+    ObservationNoise,
+)
+from ..sim.opponents import BASELINE_POOL, OPPONENTS, PUNISHER_POOL
 from .evaluate import BENCHMARK, evaluate, format_results, headline
 from .policy import ARCHITECTURES, TILE_COUNT, ActorCritic, to_action
 from .ppo import PPO, PPOConfig, Rollout, compute_gae
 from .vec_env import VecSimEnv
 
-DEFAULT_OPPONENTS = ("bigspender", "cycler", "tankandsupport", "control")
+#: Training pool. The frozen four by default - every recorded result was
+#: trained against exactly these. ``--opponents punishers`` swaps in the
+#: placement-punishing pair, which is a DIFFERENT experiment: nothing
+#: trained against that pool is comparable to a number in
+#: docs/rl-training.md §1 without re-baselining.
+DEFAULT_OPPONENTS = BASELINE_POOL
+
+OPPONENT_GROUPS: dict[str, tuple[str, ...]] = {
+    "baseline": BASELINE_POOL,
+    "punishers": PUNISHER_POOL,
+}
+
+
+def resolve_opponents(names: list[str]) -> tuple[str, ...]:
+    """Expand group names in ``--opponents`` / ``--benchmark``."""
+    out: list[str] = []
+    for n in names:
+        out.extend(OPPONENT_GROUPS.get(n, (n,)))
+    unknown = [n for n in out if n not in OPPONENTS]
+    if unknown:
+        raise SystemExit(
+            f"Unknown opponent(s) {unknown}. Have: {sorted(OPPONENTS)}, "
+            f"or a group in {sorted(OPPONENT_GROUPS)}."
+        )
+    return tuple(dict.fromkeys(out))
 
 
 def seed_everything(seed: int) -> None:
@@ -114,11 +143,14 @@ def build_env(args, cfg: PPOConfig) -> VecSimEnv:
     return VecSimEnv(
         num_envs=cfg.num_envs,
         seed=cfg.seed,
-        opponents=tuple(args.opponents),
+        opponents=resolve_opponents(args.opponents),
         randomize_scale=0.0 if args.no_randomize else 1.0,
         noise=ObservationNoise.off() if args.no_noise else ObservationNoise(),
         levels=LevelSpread.off() if args.no_levels else LevelSpread(),
         decks=DeckSpread.off() if args.no_decks else DeckSpread(),
+        opponent_decks=(
+            ArchetypeDeckSpread() if args.structured_decks else None
+        ),
     )
 
 
@@ -143,7 +175,8 @@ def train(args) -> None:
 
     run_cfg = {
         "ppo": asdict(cfg),
-        "opponents": list(args.opponents),
+        "opponents": list(resolve_opponents(args.opponents)),
+        "structured_decks": bool(args.structured_decks),
         "arch": args.arch,
         "schema_hash": schema_hash(),
         "obs_flat_size": envs.flat_size,
@@ -256,7 +289,7 @@ def train(args) -> None:
         )
 
         if args.eval_every and update % args.eval_every == 0:
-            results = evaluate(net, device, tuple(args.benchmark),
+            results = evaluate(net, device, resolve_opponents(args.benchmark),
                                episodes=args.eval_episodes)
             print(f"\n  EVAL @ step {global_step:,}")
             print(format_results(results), flush=True)
@@ -277,7 +310,7 @@ def train(args) -> None:
 
     save_checkpoint(args.out, net, cfg, global_step, {})
     print(f"\nsaved {args.out}")
-    results = evaluate(net, device, tuple(args.benchmark),
+    results = evaluate(net, device, resolve_opponents(args.benchmark),
                        episodes=args.eval_episodes)
     print("FINAL")
     print(format_results(results))
@@ -303,15 +336,27 @@ def main() -> None:
                    help="conv shares one kernel across all 144 tiles so "
                         "placement generalises; mlp is the flat baseline "
                         "whose tile head never left ~97%% of max entropy")
+    # Groups are valid choices alongside individual names; resolve_opponents
+    # expands them. Without them here argparse rejects "punishers" before the
+    # expansion ever runs.
+    pool_choices = sorted(set(OPPONENTS) | set(OPPONENT_GROUPS))
     p.add_argument("--opponents", nargs="+", default=list(DEFAULT_OPPONENTS),
-                   choices=sorted(OPPONENTS))
+                   choices=pool_choices,
+                   help="opponent names, or a group: "
+                        + ", ".join(sorted(OPPONENT_GROUPS)))
     p.add_argument("--benchmark", nargs="+", default=list(BENCHMARK),
-                   choices=sorted(OPPONENTS))
+                   choices=pool_choices,
+                   help="what to score against; keep the default to stay "
+                        "comparable with docs/rl-training.md")
     p.add_argument("--eval-every", type=int, default=10,
                    help="updates between benchmark runs (0 to disable)")
     p.add_argument("--eval-episodes", type=int, default=30)
     p.add_argument("--eval-only", default=None, metavar="CHECKPOINT",
                    help="benchmark an existing checkpoint and exit")
+    p.add_argument("--structured-decks", action="store_true",
+                   help="give OPPONENTS role-structured decks (tank, two "
+                        "spells, building, mini tank, swarm, air defense). "
+                        "The policy's own deck is unaffected.")
     p.add_argument("--no-decks", action="store_true")
     p.add_argument("--no-levels", action="store_true")
     p.add_argument("--no-noise", action="store_true")
@@ -333,7 +378,7 @@ def main() -> None:
         net, ckpt = load_checkpoint(args.eval_only, device)
         print(f"{args.eval_only}  step {ckpt.get('global_step', '?'):,}")
         print(format_results(
-            evaluate(net, device, tuple(args.benchmark),
+            evaluate(net, device, resolve_opponents(args.benchmark),
                      episodes=args.eval_episodes)
         ))
         return

@@ -90,6 +90,21 @@ deployment backend.
 - Scripted opponents are FROZEN - the only stable yardstick (self-play sits at
   ~50% by construction). Never tune one to beat the current policy; re-baseline
   after ANY sim-fidelity change.
+- TWO POOLS, scored separately. `BASELINE_POOL` is the frozen four every number
+  in `docs/rl-training.md` §1 was measured against - do not touch them, ever.
+  `PUNISHER_POOL` (`punisher`, `controlplus`) READS where the policy places and
+  exploits it; it exists to make placement matter to the win rate. Numbers
+  against one pool mean nothing against the other. `--opponent baseline` /
+  `punishers` on both CLIs; see `docs/punisher-opponents.md`.
+- Opponent decks: `--structured-decks` gives the OPPONENT a role-structured
+  deck (tank / 2 spells / building / mini tank / swarm / air defense). It is
+  opponent-only and opt-in precisely so the frozen four keep seeing their
+  recorded episodes. It also makes a bot that cannot use spells WORSE, since
+  two of its eight cards become dead weight.
+- Spell value is measured in ELIXIR, never in bodies. A swarm card is several
+  bodies for one payment, so a body count reads 3 Goblins (2 elixir) as a
+  bigger prize than a Musketeer (4). Getting this wrong cost 11pp and made a
+  spell-casting bot worse than the same bot with spells disabled.
 
 ### RL
 - Read `docs/rl-training.md` first. Condensed: ~50% overall vs 31% random; conv

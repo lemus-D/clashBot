@@ -327,9 +327,30 @@ class TestEvaluate:
         assert "OVERALL (ex-idle)" in format_results(results)
 
     def test_the_benchmark_covers_every_registered_opponent(self):
+        """Every bot must be scored by SOME named pool.
+
+        This used to assert one benchmark held every opponent. It cannot any
+        more: the frozen four and the placement-punishing pair are measured
+        separately on purpose, because a win rate is only comparable to
+        another win rate scored against the same opponents. The invariant
+        that still matters is that nothing is registered and then never
+        scored, so the union is what gets checked.
+        """
+        from src.rl.evaluate import BENCHMARKS
         from src.sim.opponents import OPPONENTS
 
-        assert set(BENCHMARK) == set(OPPONENTS)
+        covered = {name for pool in BENCHMARKS.values() for name in pool}
+        assert covered == set(OPPONENTS), (
+            f"Opponents registered but in no benchmark pool: "
+            f"{sorted(set(OPPONENTS) - covered)}; pooled but not registered: "
+            f"{sorted(covered - set(OPPONENTS))}."
+        )
+
+    def test_the_frozen_benchmark_has_not_changed(self):
+        """docs/rl-training.md §1 is only quotable while this holds."""
+        assert BENCHMARK == (
+            "idle", "bigspender", "control", "cycler", "tankandsupport"
+        )
 
 
 class TestCheckpoint:

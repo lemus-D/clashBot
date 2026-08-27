@@ -52,6 +52,9 @@ class VecSimEnv:
     noise: ObservationNoise = field(default_factory=ObservationNoise)
     levels: LevelSpread = field(default_factory=LevelSpread)
     decks: DeckSpread = field(default_factory=DeckSpread)
+    #: Opponent-only deck sampler; None means "same as ``decks``", which
+    #: is what the frozen pool's recorded numbers assume.
+    opponent_decks: object | None = None
 
     def __post_init__(self) -> None:
         self.envs: list[SimEnv] = []
@@ -68,6 +71,7 @@ class VecSimEnv:
                 noise=self.noise,
                 levels=self.levels,
                 decks=self.decks,
+                opponent_decks=self.opponent_decks,
             ))
         self._obs = [env.reset() for env in self.envs]
         self.episode_returns = np.zeros(self.num_envs, dtype=np.float64)

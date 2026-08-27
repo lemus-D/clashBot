@@ -31,7 +31,25 @@ from .vec_env import VecSimEnv
 #: policy was trained on.
 EVAL_SEED = 777_000
 
+#: THE FROZEN BENCHMARK. Every win rate in docs/rl-training.md §1 was measured
+#: against exactly these five, so this tuple must not gain or lose a member -
+#: a number scored against a different pool is not comparable to a recorded
+#: one, however similar the pools look.
 BENCHMARK = ("idle", "bigspender", "control", "cycler", "tankandsupport")
+
+#: The placement-punishing pool, scored SEPARATELY. These bots read where the
+#: policy places and exploit it (spells on clumps, pushes down the lane it
+#: left open), which the frozen four do not do at all. Results here start
+#: from no baseline: random and any existing checkpoint must be re-scored
+#: against this pool before a number against it means anything.
+PUNISHER_BENCHMARK = ("idle", "controlplus", "punisher")
+
+#: Named pools for the CLI. Every registered opponent must appear in at least
+#: one of these, so a bot cannot be added and then silently never scored.
+BENCHMARKS: dict[str, tuple[str, ...]] = {
+    "baseline": BENCHMARK,
+    "punisher": PUNISHER_BENCHMARK,
+}
 
 
 @dataclass

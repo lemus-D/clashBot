@@ -30,9 +30,10 @@ from ..game.board import ARENA_COLS, ARENA_ROWS, GameBoard, HAND_SIZE
 from ..game.cards import SPELL_CARDS, Card, Troop, get_card_cost, is_spell
 from ..game.classes import ARENA_CLASSES, CARD_CLASSES
 from ..game.state import TOWER_KEYS
-from . import engine
+from . import engine, roles
+from .arena import TOWERS
 from .engine import Simulation
-from .opponents import OpponentView, UnitView
+from .opponents import LANES, OpponentView, UnitView
 from .units import LEVELS, STANDARD_LEVEL, UNIT_STATS, randomize, stats_at_level
 
 # Measured from real recordings: ClashEnv.step_period_sec is 0.25 and the
@@ -79,6 +80,38 @@ def _mirror(tile_x: int, tile_y: int) -> tuple[int, int]:
     return ARENA_COLS - 1 - tile_x, ARENA_ROWS - 1 - tile_y
 
 
+def _lane_towers() -> dict[int, tuple[str, str]]:
+    """Opponent-frame lane -> ``(tower it attacks, tower defending it)``.
+
+    DERIVED FROM GEOMETRY, not written down. Mirroring through the arena
+    centre SWAPS left and right, so the opponent's left lane attacks the
+    princess tower the rest of the codebase calls ``friendly_right``. That is
+    exactly the kind of fact that is easy to assert backwards and impossible
+    to notice afterwards - a bot aiming at the healthier tower still looks
+    like it is playing, it just never closes a match out.
+
+    So each lane is mirrored into real coordinates and matched to the nearest
+    princess tower by x. Move the lanes or the towers and this follows.
+    """
+    princesses = [t for t in TOWERS if not t.is_king]
+    out: dict[int, tuple[str, str]] = {}
+    for lane in LANES:
+        real_x, _ = _mirror(lane, 0)
+        attacks = min(
+            (t for t in princesses if t.friendly),
+            key=lambda t: abs(t.x - real_x),
+        )
+        defends = min(
+            (t for t in princesses if not t.friendly),
+            key=lambda t: abs(t.x - real_x),
+        )
+        out[lane] = (attacks.key, defends.key)
+    return out
+
+
+LANE_TOWERS: dict[int, tuple[str, str]] = _lane_towers()
+
+
 # Names a false-positive detection may take. Staged units are excluded: the
 # detector has never seen them, so it cannot invent one.
 _PHANTOM_NAMES: tuple[str, ...] = tuple(ARENA_CLASSES)
@@ -123,6 +156,126 @@ class DeckSpread:
                 return tuple(pick)
         # Pathological pool (almost all spells): fall back rather than spin.
         return DEFAULT_DECK
+
+
+#: Roles every structured deck fills, in the order they are drawn. Each entry
+#: is ``(label, predicate, count)``. Order matters: the scarcest roles are
+#: claimed first, so a card that could fill two of them is not spent on the
+#: one with more alternatives.
+_DECK_ROLES: tuple[tuple[str, object, int], ...] = (
+    ("tank", roles.is_tank, 1),
+    ("spell", roles.is_spell, 2),
+    ("building", roles.is_building, 1),
+    ("mini_tank", roles.is_mini_tank, 1),
+    ("swarm", roles.is_swarm, 1),
+)
+
+
+@dataclass
+class ArchetypeDeckSpread:
+    """Per-episode decks with a fixed ROLE STRUCTURE rather than 8 random cards.
+
+    ``DeckSpread`` samples 8 of 12 uniformly, which produces decks a human
+    would never take to ladder: no win condition, four supports and a spell,
+    or two buildings and nothing that can attack. A scripted opponent handed
+    one of those cannot demonstrate good play no matter how well it is
+    written, because the deck cannot express it.
+
+    The structure is one tank, two spells, a building, a mini tank, a swarm,
+    an air-defense TROOP if nothing already drawn shoots air, then filler to
+    ``size``. That is a coherent beatdown shell.
+
+    THIS IS OPT-IN AND OPPONENT-ONLY. ``SimEnv.decks`` still governs the
+    policy's deck and the frozen opponents' decks; only the pool that asks
+    for structured decks gets them. Swapping the global sampler would change
+    what ``bigspender``/``cycler``/``tankandsupport``/``control`` are handed
+    each episode, and every benchmark number recorded against them assumes
+    those episodes are unchanged.
+
+    A NARROWING is expected and accepted. With today's 12-card pool exactly
+    one card clears ``TANK_HP_MIN`` and exactly two are spells, so Giant,
+    Arrows and Fireball appear in every structured deck - three of the eight
+    slots are constant. The remaining five still vary (see
+    ``distinct_decks``). That trade buys opponents that always have a win
+    condition and always have an answer, which is the point of building them.
+    """
+
+    enabled: bool = True
+    size: int = 8
+
+    def __post_init__(self) -> None:
+        if not self.enabled:
+            return
+        pool = list(CARD_CLASSES)
+        missing = [
+            f"{label} (need {count}, pool has "
+            f"{sum(1 for c in pool if pred(c))})"
+            for label, pred, count in _DECK_ROLES
+            if sum(1 for c in pool if pred(c)) < count
+        ]
+        if missing:
+            raise ValueError(
+                "The card pool cannot fill a structured deck: "
+                + "; ".join(missing)
+                + f". Pool is {sorted(pool)}. Either widen the pool or use "
+                "DeckSpread, which has no role requirements."
+            )
+        if self.size < HAND_SIZE + 1:
+            raise ValueError(
+                f"Deck needs more than {HAND_SIZE} cards to cycle; "
+                f"got size={self.size}."
+            )
+
+    @classmethod
+    def off(cls) -> "ArchetypeDeckSpread":
+        return cls(enabled=False)
+
+    def sample(self, rng: random.Random) -> tuple[str, ...]:
+        if not self.enabled:
+            return DEFAULT_DECK
+
+        pool = list(CARD_CLASSES)
+        picked: list[str] = []
+
+        def take(candidates: list[str]) -> None:
+            available = [c for c in candidates if c not in picked]
+            if available:
+                picked.append(rng.choice(available))
+
+        for _label, pred, count in _DECK_ROLES:
+            for _ in range(count):
+                take([c for c in pool if pred(c)])
+
+        # Air defense only if nothing drawn already shoots air. A swarm of
+        # Minions or Spear Goblins covers this slot on its own, which is why
+        # it is conditional rather than a fixed sixth role.
+        if not any(roles.is_air_defense(c) for c in picked):
+            take([c for c in pool if roles.is_air_defense(c)])
+
+        # Filler to size. Troops first: a deck topped up with the last two
+        # spells in the pool would stall, having nothing left to place.
+        rest = [c for c in pool if c not in picked]
+        rng.shuffle(rest)
+        rest.sort(key=lambda c: roles.is_spell(c))
+        picked.extend(rest[: max(0, self.size - len(picked))])
+
+        if len(picked) < HAND_SIZE + 1:
+            raise ValueError(
+                f"Structured deck came out too small to cycle: {picked!r}. "
+                f"The pool {sorted(pool)} has {len(pool)} cards; a deck needs "
+                f"more than {HAND_SIZE}."
+            )
+        return tuple(picked)
+
+    def distinct_decks(self, trials: int = 2000, seed: int = 0) -> int:
+        """How many distinct decks this actually produces. For tests and docs.
+
+        Sampled rather than derived: the conditional air-defense slot makes
+        the exact count awkward to compute in closed form and trivial to
+        measure.
+        """
+        rng = random.Random(seed)
+        return len({tuple(sorted(self.sample(rng))) for _ in range(trials)})
 
 
 @dataclass
@@ -282,6 +435,13 @@ class SimEnv:
     noise: ObservationNoise = field(default_factory=ObservationNoise)
     levels: LevelSpread = field(default_factory=LevelSpread)
     decks: DeckSpread = field(default_factory=DeckSpread)
+    #: Sampler for the OPPONENT's deck only. ``None`` means "same as
+    #: ``decks``", which is the historical behaviour and the only setting
+    #: under which the frozen opponents see the episodes their recorded
+    #: benchmark numbers were measured on. ``ArchetypeDeckSpread()`` here
+    #: gives the opponent a role-structured deck without touching the
+    #: policy's.
+    opponent_decks: object | None = None
 
     sim: Simulation = field(init=False)
     board: GameBoard = field(init=False)
@@ -318,8 +478,13 @@ class SimEnv:
             enemy_stats=randomize(e_units, self._rng, self.randomize_scale),
         )
         # Both sides draw independently - ladder does not mirror decks.
+        # The opponent's sampler defaults to the policy's, so the draw order
+        # off ``self._rng`` is byte-for-byte what it was before
+        # ``opponent_decks`` existed and the frozen opponents still see their
+        # recorded episodes.
         self._deck = Deck(self.decks.sample(self._rng), self._rng)
-        self._opp_deck = Deck(self.decks.sample(self._rng), self._rng)
+        opp_spread = self.opponent_decks or self.decks
+        self._opp_deck = Deck(opp_spread.sample(self._rng), self._rng)
 
         # Pixel dimensions are irrelevant here - the sim works in tiles and
         # never converts. GameBoard just needs non-degenerate values.
@@ -489,6 +654,11 @@ class SimEnv:
 
         threats = seen(self.sim.units(True))
         own_units = seen(self.sim.units(False))
+        # Tower HP, re-keyed by LANE in the opponent's own frame. A human
+        # player can see both HP bars, so this is not the view cheating - and
+        # it is what lets an opponent finish a tower it has already chipped
+        # instead of splitting damage evenly and closing nothing.
+        hp = self.sim.tower_hp_fractions()
         return OpponentView(
             hand=list(self._opp_deck.hand),
             elixir=self.sim.elixir[False],
@@ -496,6 +666,14 @@ class SimEnv:
             phase=self.sim.phase(),
             threats=threats,
             own_units=own_units,
+            enemy_towers={
+                lane: hp[attacks] for lane, (attacks, _) in LANE_TOWERS.items()
+            },
+            own_towers={
+                lane: hp[defends] for lane, (_, defends) in LANE_TOWERS.items()
+            },
+            enemy_king_hp=hp["friendly_king"],
+            own_king_hp=hp["enemy_king"],
             can_place=lambda tx, ty, name=None: self.sim.is_placeable(
                 False, *_mirror(tx, ty), name=name
             ),
