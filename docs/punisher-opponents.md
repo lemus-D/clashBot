@@ -25,9 +25,16 @@ placed and exploit it. They are the "punisher opponents" half of
 `docs/ideas/placement-shaping.md`; the potential-based reward-shaping half is
 **still unbuilt**.
 
-> **Status: they are harder, but §4 shows they are NOT yet demonstrated to
-> make placement matter more than the frozen four do.** Read §4 before
-> treating this as a working answer to §4 of the training doc.
+> **Status: MEASURED AND NEGATIVE.** They are harder - `punisher` holds a
+> random policy to 18.0% where the hardest frozen bot allows 27.0% - but §4
+> shows they do NOT make placement matter more. Across four fixed tiles the
+> outcome range is 14.7pp against them versus 21.3pp against the frozen four,
+> so the design goal did not happen. Use the pool as a harder yardstick; do
+> not cite it as the answer to §4 of the training doc.
+>
+> §4 also turned up a lead worth more than the pool: concentrating on one tile
+> BEATS spreading in this simulator, on three of four tiles tried. If that
+> holds, `run3`'s concentrated placement is rational rather than broken.
 
 ---
 
@@ -109,7 +116,7 @@ than 3 elixir. A policy that dribbles single cheap units gets nothing back.
 
 ---
 
-## 4. Do they make placement matter? NOT SHOWN
+## 4. Do they make placement matter? NO
 
 **Read this before quoting anything above as a success.**
 
@@ -130,7 +137,7 @@ The deltas are **the same**. The 2.5pp difference is far inside the ~6.9pp SE
 at this n, and it points the wrong way anyway. Concentrating on one tile is
 worth just as much against the punishers as against the frozen four.
 
-So: harder, yes. Placement-discriminating, not demonstrated.
+So: harder, yes. Placement-discriminating, no.
 
 ### Why this probe cannot settle it
 
@@ -145,13 +152,57 @@ quality with concentration. A real placement punisher should shrink the gap
 between concentrated play and **appropriate** play, not between concentrated
 play and noise.
 
-### What would settle it
+### The tile sweep: run, and it confirms the negative
 
-1. **Vary the tile.** Score the concentrated policy at several fixed tiles,
-   good and bad. If the punishers discriminate, the spread of outcomes ACROSS
-   tiles should widen against them — a good tile should stay good and a bad
-   one get worse. Cheap; `--tile` already exists for it.
-2. **A responsive baseline.** Compare concentrated play against a scripted
+Varying the tile is the comparison the probe above cannot make, so it was run.
+Win rate of the placing policy, n=150 per cell:
+
+| tile | baseline | punishers |
+|------|----------|-----------|
+| *(random spread)* | 34.0% | 22.7% |
+| `c3r12` in front of towers | 48.0% | 36.7% |
+| `c0r15` back corner | 45.3% | 30.0% |
+| `c4r15` behind the king | 33.3% | 22.0% |
+| `c1r8` at the bridge | 26.7% | 23.3% |
+| **range across tiles** | **21.3pp** | **14.7pp** |
+
+Single-cell SE is 4.1pp; SE of a difference 8.2pp.
+
+**The punishers do not discriminate more — if anything less.** Their range
+across tiles is 14.7pp against the frozen four's 21.3pp. That 6.6pp gap is
+itself inside the 8.2pp difference SE, so "they discriminate *less*" is not
+established either. What is clear is that **the design goal — wider
+discrimination — did not happen.** The two pools track each other tile for
+tile, offset by a roughly constant ~11pp.
+
+The one place they diverge is `c1r8`, the bridge: −7.3pp against the frozen
+four but +0.6pp against the punishers. The punishers are *more forgiving* of
+that tile, the opposite of the intent. `MIN_THREAT_TO_ANSWER` is the likely
+cause — declining to answer small threats means a card dribbled at the bridge
+goes unpunished — which would make that heuristic actively counterproductive
+for this pool's purpose even though the ablation showed it helps the win rate.
+
+### The finding that matters more than the pool
+
+**Three of the four fixed tiles beat random spread**, two of them by 11–14pp:
+`c3r12` +14.0, `c0r15` +11.3, `c4r15` −0.7, `c1r8` −7.3. Concentrating on one
+tile is *better play than spreading* in this simulator, almost regardless of
+which tile, and that holds against both pools.
+
+If that survives a proper check, it reframes `docs/rl-training.md` §4.
+`run3`'s 72%-of-placements-on-one-tile has been read as a pathology — a
+symptom of a frozen tile head. It may instead be a **rational adaptation to
+an environment that rewards concentration**, in which case there is no
+placement lesson being missed, and the ~50% ceiling has to be explained some
+other way.
+
+This is one measurement at n=150 over four hand-picked tiles, run against
+scripted bots rather than a trained policy. It is a lead, not a result. But it
+is a cheap one to chase and it bears directly on the standing hypothesis.
+
+### What would still settle the original question
+
+1. **A responsive baseline.** Compare concentrated play against a scripted
    policy that places *appropriately* (defends where the threat is), not
    against random. That is the comparison the hypothesis is actually about.
 3. **The real test:** train against `PUNISHER_POOL` and measure the argmax
@@ -265,19 +316,23 @@ advance, so it cannot lead anything.
 bot's 27.0%, many SE apart. The frozen four are untouched and still reproduce
 31.0%.
 
-**NOT established:** that they make placement matter more (§4). That was the
-point, so treat this branch as unfinished.
+**Measured and NEGATIVE:** they do not make placement matter more (§4). The
+range across fixed tiles is 14.7pp against them versus 21.3pp against the
+frozen four - the design goal did not happen. That was the point of the
+branch, so treat the pool as a harder yardstick, not as the answer to the
+training doc's §4.
 
 **Not done, in the order I would do it:**
 
-0. **Settle §4 with the tile sweep.** Score the concentrated policy at several
-   fixed tiles, good and bad, against both pools (`diagnose placement --tile`).
-   If these bots discriminate on placement, the spread across tiles should be
-   wider against them. This is minutes of compute and it decides whether the
-   rest of the list is worth doing at all.
-1. **Train something against this pool.** Nothing has been. The numbers here
-   are all *random-policy* baselines, which say how hard the bots are but
-   nothing about whether they teach placement. Needs a 2M-step run.
+0. **Check whether concentration is simply correct here** (§4). Three of four
+   fixed tiles beat random spread, two by 11-14pp. If the sim rewards playing
+   one tile, `run3` concentrating is rational rather than broken and the
+   premise of the training doc's §4 needs revisiting. This is the highest-value
+   item on the list and it is cheap.
+1. **Train something against this pool** — only if (0) does not dissolve the
+   question. Nothing has been trained against it. The numbers here are all
+   *random-policy* baselines, which say how hard the bots are but nothing
+   about whether they teach placement. Needs a 2M-step run.
 2. **The paired evaluation** from `docs/rl-training.md` §5.1 — still the
    cheapest useful work in the project, and a prerequisite for trusting any
    comparison between a run trained on this pool and one trained on the frozen
