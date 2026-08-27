@@ -351,6 +351,58 @@ class TestArchetypeDecks:
         assert ArchetypeDeckSpread.off().sample(random.Random(0)) == DEFAULT_DECK
 
 
+class TestPlacementProbe:
+    """The probe is only valid if the two modes differ ONLY in placement."""
+
+    def _obs(self):
+        import numpy as np
+
+        mask = np.zeros((16, 9), dtype=np.float32)
+        mask[8:, :] = 1.0
+        return {
+            "hand_playable": np.ones(4, dtype=np.float32),
+            "hand_is_spell": np.zeros(4, dtype=np.float32),
+            "playable_mask": mask,
+        }
+
+    def test_concentrated_uses_exactly_one_tile(self):
+        from src.rl.diagnose import PlacementProbePolicy
+
+        pol = PlacementProbePolicy(True, (3, 12), no_op_prob=0.0, seed=1)
+        tiles = set()
+        for _ in range(50):
+            a = pol(self._obs())
+            if not a.is_no_op:
+                tiles.add((a.tile_x, a.tile_y))
+        assert tiles == {(3, 12)}
+
+    def test_spread_uses_many_tiles(self):
+        from src.rl.diagnose import PlacementProbePolicy
+
+        pol = PlacementProbePolicy(False, (3, 12), no_op_prob=0.0, seed=1)
+        tiles = set()
+        for _ in range(50):
+            a = pol(self._obs())
+            if not a.is_no_op:
+                tiles.add((a.tile_x, a.tile_y))
+        assert len(tiles) > 10, f"spread policy used only {tiles}"
+
+    def test_both_modes_play_at_the_same_rate(self):
+        """Otherwise the delta measures aggression, not placement.
+
+        Both draw from the same RNG in the same order for the play/slot
+        decision, so with the same seed they play on exactly the same steps.
+        """
+        from src.rl.diagnose import PlacementProbePolicy
+
+        obs = self._obs()
+        a = PlacementProbePolicy(True, (3, 12), no_op_prob=0.7, seed=7)
+        b = PlacementProbePolicy(False, (3, 12), no_op_prob=0.7, seed=7)
+        acted_a = [not a(obs).is_no_op for _ in range(200)]
+        acted_b = [not b(obs).is_no_op for _ in range(200)]
+        assert acted_a == acted_b
+
+
 class TestPoolSelection:
     """Both CLIs must be able to name a pool without listing its members."""
 
