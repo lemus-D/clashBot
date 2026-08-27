@@ -129,6 +129,9 @@ python -m src.main --derive-classes            # regenerate the class manifest
 python -m src.sim.run --watch [--policy models/run3.pt] [--opponent all]
 python -m src.rl.train --total-steps 2000000 --out models/ppo.pt [--arch mlp]
 python -m src.rl.train --eval-only models/ppo.pt --eval-episodes 200
+python -m src.sim.run --episodes 400 --opponent baseline|punishers
+python -m src.rl.diagnose placement --episodes 200   # is placement worth anything?
+python -m src.rl.diagnose tiles models/run3.pt       # argmax spread + logit margin
 pytest
 ```
 
