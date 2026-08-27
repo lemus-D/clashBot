@@ -1,13 +1,31 @@
 # Idea: teaching the policy WHERE to place
 
-Status: **thought, not a plan.** Nothing here is built. Recorded 2026-08-24
-while looking at `run1`, the checkpoint that plateaued at ~33% headline
-against a 24% random baseline.
+Status: **thought, not a plan.** Nothing on this page is built.
 
-The problem it responds to: the policy has learned *when* to play a card and
-not *where*. Entropy on the tile head moved 5.72 -> 5.61 over 206 updates
-against a maximum of ~7.05, i.e. the 144-way tile choice is still close to a
-coin toss after 844k steps.
+> **Updated 2026-08-26 — read this before the rest.** This page was written
+> 2026-08-24 against numbers and an inference that have since been corrected.
+> The ideas below still stand; two of their stated premises do not.
+>
+> - **The framing numbers were wrong.** "~33% headline against a 24% random
+>   baseline" were 16-game reads. Measured properly: random is **31%**, and
+>   the best policy is **~50%**. See `docs/rl-training.md` §1.
+> - **"The policy has learned *when* and not *where*" was inferred from
+>   entropy, and entropy cannot answer that question.** The benchmark plays
+>   deterministically, so flat-looking logits still rank tiles; and
+>   `ent_coef` is unweighted specifically to hold those heads near uniform.
+>   See `docs/rl-training.md` §5.2 for what to measure instead.
+> - **The architectural alternative below has been TRIED and it did not
+>   work.** The conv head was built and run to completion (`run3`) and is
+>   TIED with the flat MLP: 51% vs 49% on 800 scored games each, 0.8 sigma.
+>   See §3 of the training doc.
+> - **The mask disagreement at the bottom of this page is FIXED**, and
+>   fixing it moved the benchmark not at all.
+>
+> Net effect: this page is now the *leading* candidate rather than the
+> fallback. Two very different architectures converge on the same ~50%, and
+> the slot head — a 4-way choice with no spatial structure — is equally
+> frozen in both, so the ceiling looks like the learning signal rather than
+> the function class.
 
 ## Darwin's idea: a spatial gradient on the reward
 
@@ -47,15 +65,23 @@ everything behind the king tower.
   attractive precisely because it is the one slice where the right answer is
   unambiguous.
 
-### The architectural alternative, which is cheaper
+### The architectural alternative, which is cheaper — TRIED, 2026-08-25
 
-Before shaping: the tile head is a `Linear(256, 144)` over a flat trunk. It
-has no idea tile 37 is adjacent to tile 38, so "near my tower" cannot
-generalise — it has to be learned 144 separate times. A conv over the 9x16
-grid builds that adjacency in structurally, and needs no reward change and no
-hand-authored notion of good placement. **This is the cheaper experiment and
-should be tried first** — if the policy still cannot place after it, the
-shaping idea is much better motivated.
+*Original argument, kept for the record:* the tile head is a
+`Linear(256, 144)` over a flat trunk. It has no idea tile 37 is adjacent to
+tile 38, so "near my tower" cannot generalise — it has to be learned 144
+separate times. A conv over the 9x16 grid builds that adjacency in
+structurally, and needs no reward change and no hand-authored notion of good
+placement. This is the cheaper experiment and should be tried first.
+
+**Outcome: built, run to completion, TIED with the MLP.** 51% vs 49% on 800
+scored games each (0.8 sigma). It did not learn context-dependent placement
+— it found a better *default* tile and concentrated harder on it, using 8
+distinct tiles deterministically against the MLP's 21. It also learns slower
+and is less stable. Full detail in `docs/rl-training.md` §3.
+
+So the last clause held: the policy still cannot place, and **the shaping
+idea is now much better motivated.**
 
 ## The counter-idea: opponents that punish bad placement
 
@@ -115,7 +141,19 @@ alone would clear the plateau is untested — `run1` was killed at 206 of 488
 updates, so nobody has yet run this to completion even once. That is a cheaper
 question to answer than either idea on this page.
 
-## Measured while writing this (2026-08-24)
+## Measured while writing this (2026-08-24) — SINCE FIXED, and it changed nothing
+
+**Resolved.** The mask disagreement below was real and was fixed on
+2026-08-25 (one implementation, `board.placement_allowed`, pinned by
+`tests/test_sim_engine.py::TestMaskAgreesWithEnv`). Refused placements went
+60% -> 0%. The benchmark **did not move** — not when re-evaluating `run1`
+under corrected rules, and not in `run2`, which was trained from scratch with
+the fix in place and tracks `run1` across run1's whole range.
+
+So the closing suggestion below — that the tile head's near-uniformity might
+be a *consequence* of the refusals rather than a real limitation — was
+tested and is **false**. Kept for the record.
+
 
 Watching `models/run1.pt` play revealed a concrete defect that is likely
 holding placement back independently of everything above:
