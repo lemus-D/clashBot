@@ -1,195 +1,150 @@
 # CLAUDE.md
 
-Persistent context for Claude Code, loaded at the start of every session.
-Keep this high-signal: things Claude would get wrong without being told.
+High-signal only: what you'd get wrong without being told. The REASONING lives
+in module docstrings - every module has a long one. Read it before changing the
+module; don't re-derive its history from here.
 
-## Project Overview
+## Project
 
-clashBot is a self-improving Clash Royale bot written in Python. Goal: a model
-that plays the game and climbs the ranks via machine learning.
-The backend exposes a gym-like observation / action / reward API over a Roboflow
-vision pipeline, so any policy (random, scripted, RL, imitation) can plug in.
-See ./README.md for the full module map, observation schema, and action space.
+clashBot - a self-improving Clash Royale bot (Python). `ClashEnv` exposes a
+gym-like observation / action / reward API over a Roboflow vision pipeline;
+`SimEnv` is a headless simulator behind the SAME schema, so a policy trained in
+sim runs on BlueStacks unchanged. Sim is the RL training backend, vision the
+deployment backend.
 
-## Project Status & Working Style
+- `README.md` - module map, observation schema, action space, calibration.
+- `docs/rl-training.md` - THE RL record: every result with its sample size,
+  what's settled, what's disproved, how to measure. Read before quoting an RL
+  number or re-running an experiment.
+- `docs/ideas/placement-shaping.md` - unbuilt ideas for the ~50% ceiling; now
+  the leading candidate.
 
-- Early-stage. The current architecture and code quality are known to be rough
-  and are actively being improved — do NOT treat existing patterns as the
-  standard to preserve.
-- When touching code, improving its structure is welcome and encouraged. But
-  keep each change scoped to the task and explain the reasoning before large
-  refactors.
-- No build or test tooling exists yet. Don't assume commands that aren't here.
+## Working style
 
-## Architecture at a Glance
+- Early-stage. Existing patterns are NOT the standard to preserve - improving
+  structure is welcome, but keep changes scoped and explain before refactors.
+- Terminal answers: brief, result first. Followups will be asked.
+- Measure before proposing a fix; one change per run. Nearly every "obvious"
+  cause here has been disproved by measurement.
+- Between two designs, lay out both and let me choose. ALWAYS ask before adding
+  a dependency. Fail loud - specific exceptions, never quiet degradation.
+- No build/test tooling beyond `pytest`.
 
-(Current state — under active revision. Describe and improve it as it is; don't
-speculatively generalize for cases that don't exist yet.)
+## Traps
 
-- Core loop: `ClashEnv` in `src/env/environment.py` — reset / step / observe /
-  close, reward shaping, JSONL recording. This is the contract everything else
-  serves. `observe()` is the passive perceive-only cycle (used by `step` and
-  the demo recorder).
-- Observation: `src/env/observation.py` — structured dict; `flatten()` gives a
-  1-D float32 array for MLP policies.
-- Actions: `src/env/actions.py` — 577 discrete choices (NO_OP + hand x tile);
-  `index_to_action` / `action_to_index` convert.
-- Vision (`src/vision/`): Roboflow model (`troop-counter/8`); screen capture
-  via `mss` / `pywinctl` in `capture.py`; match lifecycle (menu / in-match /
-  postmatch + auto-rematch) in `lifecycle.py`; the match timer is the ONLY
-  remaining OCR (`ocr.py`, Tesseract/`tesserocr`; required, raises on missing
-  install, but a single unreadable frame is `None` and the caller decides).
-- Tower HP is the FILL FRACTION of the on-screen HP bar (`src/vision/towers.py`),
-  normalized 0.0-1.0, measured column-wise. This replaced EasyOCR on the HP
-  digits (~84ms/cycle, only ~36-54% of frames legible) and deleted the learned
-  max-HP denominator, whose one 5147 misread used to poison a whole match.
-  Bars deplete right-to-left. Destroyed reads 0.000 — but so does a bar hidden
-  behind a fight, so destruction needs a sustained run of absences (debounced
-  in `state.py`, retracted if the tower reads again). Kings are excluded from
-  destruction inference: a king kill is the banner's verdict, not vision's.
-  Do NOT reuse the old HP-number regions for the bars — the princess number is
-  drawn above the bar, and the offset differs per tower.
-- Elixir is READ, not simulated: `src/vision/elixir.py` classifies the HUD
-  count against 11 reference crops (`src/assets/templates/elixir/0..10.png`,
-  captured by `--calibrate elixir`) rather than OCR'ing it — an 11-way choice
-  at a fixed position, so matching is exact where OCR could misread. The
-  display shows the FLOOR, which is the conservative direction for
-  affordability. `GameState.set_elixir` makes the reading authoritative and
-  demotes the simulation to carrying the fraction between reads. Templates
-  are stamped with the region they were captured against; a stamp that
-  disagrees with `ELIXIR_DIGIT_REGION` raises rather than reading nothing.
-- Game model (`src/game/`): `board.py` (9x16 arena, hand, placement rules),
-  `state.py` (time, elixir, tower HP, crowns), `cards.py`.
-- NAMING CONTRACT: `TROOP_CLASSES` (board.py) and `CARD_COSTS` (cards.py) keys
-  MUST equal the Roboflow model's class names with the `blue`/`red`/`card`
-  prefix stripped and `normalize_name` applied. The model uses SINGULAR names
-  (`card minion`, not `card minions`). A mismatch is silent in effect and was
-  a real bug: four plural entries meant Minions/Archers/Spear Goblins/Goblins
-  never entered the arena tensor at all. Both sides now warn once per distinct
-  unknown name. To re-derive the list, read `get_model(...).class_names` — do
-  not hand-write it. `king tower` / `princess tower` are real model classes
-  deliberately excluded via `_IGNORED_ARENA_CLASSES`: tower SKINS change how
-  towers look, so those two detect unreliably. Don't add them, and don't try
-  to use a princess tower vanishing from detections as a destruction signal —
-  same unreliability. Tower state comes from the HP bar.
-- Match clock: elixir is simulated but time is NOT trusted to simulation. The
-  match is detected from the elixir bar, which is already up during the 3-2-1
-  countdown, so `start_match()`'s stamp is ~5s early; `anchor_match_clock()`
-  re-derives `match_start_time` from the first trustworthy `MatchTimerReader`
-  reading (once per match) and `ClashEnv` raises if that never happens.
-  `get_current_match_time()` is clamped to 300s for `time_norm`;
-  `get_elapsed_seconds()` is the uncapped one for timeouts.
-- Recording format (`record_format: 2`, defined in `env/environment.py`, used
-  by BOTH `--record` and `--record-human`): a `{"type": "meta", ...}` header
-  (record_format + observation `schema_hash` + `schema_descriptor()`), then two
-  independent timestamped streams — `{"type": "obs", "t": ...}` per perception
-  cycle and `{"type": "act", "t": ...}` per placement. NOT one line per step: a
-  cycle is ~0.3s and a human can place several cards inside one. No-ops are not
-  written. Pairing is offline (`dataset.py`): each action binds to the nearest
-  observation captured strictly before it; an obs may take N actions (N rows)
-  or none (a no-op row). `obs.t` is frame-capture time, `act.t` is issue /
-  drag-release time. Format-1 files and cross-schema data are refused on both
-  append and load; checkpoints also carry the schema hash.
-- Imitation learning (`src/imitation/`): `recorder.py` records human play —
-  pynput mouse watcher maps hand→arena drags to timestamped actions while
-  `env.observe()` runs passively; adds `"source": "human"`.
-  `dataset.py` loads and pairs demos with no-op downsampling; `model.py` is a
-  factored-head net (shared MLP trunk → play/slot/tile heads, NOT one 577-way
-  softmax); `train.py` trains it; `policy.py` runs a checkpoint with
-  inference-time masking of unaffordable slots and unplaceable tiles.
-  PyTorch; this machine has an RTX 4070 — use the cu128 CUDA build, at the
-  torch version torchvision pins (see requirements.txt for the command).
-- Crown score: `src/vision/crowns.py` reads how many crowns each side won off
-  the POSTMATCH screen, once per match, and `GameState.set_final_crowns`
-  overwrites the mid-match inferred tally with it (that tally comes from
-  tower-destruction debouncing and drifts). Crowns are counted as connected
-  GOLD BLOBS, not fixed slot positions, because the winner's row is drawn
-  larger. Rows do NOT move — friendly/blue is always the bottom one — so each
-  region is one fixed side; boxing them in the wrong order during calibration
-  transposes the score. Cushion colour (magenta=enemy, blue=friendly) is
-  checked only to confirm the frame really is the postmatch screen, which is
-  what keeps a crown score from being read off an in-match frame if the
-  lifecycle state is wrong. Terminal reward scales with the crown margin
-  (`TERMINAL_BASE_REWARD` +/- `CROWN_MARGIN_REWARD` per crown): a 3-crown win
-  pays +14, a 1-crown win +10.
-- Entry point: `src/main.py` — CLI driver: `RandomPolicy`, `--debug`,
-  `--record`, `--record-human`, `--calibrate`.
-- Debug overlay: `src/debug/overlay.py`. Calibration wizard: `src/calibrate.py`.
-- Per-machine constants are marked `CALIBRATE` (capture crop, hand card pixel
-  positions, tower HP-bar regions, match timer region, elixir digit region,
-  postmatch crown rows, lifecycle samples). Keep them centralized there.
-- `src/calibrate.py` has six phases, selectable individually by name
-  (`viewport` / `hand` / `towers` / `timer` / `crowns` / `elixir`); bare
-  `--calibrate` runs all six. `crowns` is the one phase wanting the POSTMATCH
-  screen rather than a live match. Phases 2-6 report fractions of the CROPPED viewport, so when
-  `viewport` is skipped the frame comes from `ScreenCapture` with the committed
-  `WINDOW_CROP_*` — never from the raw window grab, or every fraction is wrong.
-  `elixir` is the only phase that also WRITES files (the reference crops), and
-  its live preview must not sit over the game viewport: `grab()` re-reads the
-  window rect every call, so an overlapping window gets captured instead.
+### Schemas
+- The `ClashEnv` API and the observation / action / recording schemas are
+  load-bearing: recordings and checkpoints carry a `schema_hash` and refuse to
+  load across a change. Announce schema changes explicitly.
+- `src/game/classes.py` is GENERATED (`--derive-classes` -> `class_manifest.json`).
+  Never hand-write it - that broke twice, silently zeroing observation values.
+  Order is APPEND-ONLY; dead classes kept, never dropped or sorted. Two index
+  spaces: `ARENA_CLASSES` (13) and `CARD_CLASSES` (12) overlap, neither
+  contains the other.
+- `CARD_COSTS` / `SPELL_CARDS` stay hand-written - a detector knows what a card
+  looks like, not what it costs or whether it's a spell.
 
-## Setup & Commands
+### Vision
+- Tower HP is the HP-bar FILL FRACTION, not OCR. `king tower`/`princess tower`
+  ARE model classes but are excluded (`IGNORED_ARENA_CLASSES`) - skins make
+  them unreliable; a vanished tower detection is never a destruction signal.
+- Elixir is READ (11 reference crops), not simulated. Time is NOT trusted to
+  simulation - `anchor_match_clock()` re-derives the start from the timer OCR
+  (the only remaining OCR, and a hard requirement).
+- Postmatch: the episode does NOT end on the first POSTMATCH frame - the OK
+  button renders before the result animates in. Win/loss is decided by label
+  COLOUR, not template score; the templates are one word in two colours and
+  each scores high on the other.
+- Per-machine pixel values live only at `CALIBRATE` markers. Six calibration
+  phases; see README.
 
-- Python 3.10+. Create venv and install: `python -m venv .venv` →
-  `.venv\Scripts\activate` → `pip install -r requirements.txt`
-- Config: copy `.env.example` to `.env`, set Roboflow `API_KEY`.
-- Run: `python -m src.main` (add `--debug` for overlay, `--record logs/run.jsonl
-  --episodes N` to record).
-- Calibrate: `python -m src.main --calibrate` for all four phases, or
-  `--calibrate <viewport|hand|towers|timer>` for one (`towers` / `timer` need a
-  live match on screen).
-- Record human demos: `python -m src.main --record-human demos/run.jsonl
-  --episodes N` — human plays in BlueStacks (drag-style placement only).
-- Train imitation policy: `python -m src.imitation.train demos/run.jsonl
-  --out models/imitation.pt`; run it:
-  `python -m src.main --policy imitation --weights models/imitation.pt`.
-- Build: none yet. Tests: none yet. (Flag if you think one is needed.)
+### Placement
+- Troops: friendly half only, plus a lane opened by a DESTROYED tower (an
+  activated enemy king unlocks nothing). Spells: anywhere. `RIVER_ROW` never
+  takes ground troops.
+- ONE implementation: `board.placement_allowed()`; `GameBoard.is_placeable` and
+  `Simulation.is_placeable` are thin wrappers. A second copy existed and the
+  two drifted in both directions at once.
+- Anything masking tiles MUST resolve the slot FIRST, then pick the mask.
+  Masking first forbids every legal spell target on the enemy half - that bug
+  made 2 of 12 cards worthless.
+- `tests/test_sim_engine.py::TestMaskAgreesWithEnv` guards this. Keep it.
 
-## Coding Practices
+### Simulator
+- Sim fidelity is the CEILING on everything trained here. Stats are all `wiki`:
+  the NUMBERS are real, the simulation built on them is unvalidated.
+- `src/sim/units.py` is GENERATED by `tools/derive_unit_stats.py` (RoyaleAPI
+  cr-api-data, normalised to tournament standard = displayed level 11). Add a
+  unit by editing that script, never the JSON. Per-level arrays start at each
+  card's OWN level 1 - index by rarity (`LEVEL_INDEX`) or you mix power levels.
+  Anything hand-entered here must state its provenance.
+- STAGED CARDS (14) are deliberately absent from the class manifest; adding
+  them early gives each a permanently-zero input channel (reverted in 309117a).
+- `env.py` does NOT build observations - it fills a real `GameBoard` plus a
+  `_SimStateAdapter` and calls the real `ObservationBuilder`. Keep that seam.
+- Step cadence is 0.25s, MEASURED off real recordings; don't change it
+  independently of the real loop. Engine ticks at 20 Hz.
+- LEVEL IS HIDDEN STATE by construction - the detector reports no level. Never
+  add absolute HP to the observation. TRAIN with decks/levels/noise on,
+  EVALUATE with `--no-decks --no-levels --no-randomize` so runs compare.
+- Scripted opponents are FROZEN - the only stable yardstick (self-play sits at
+  ~50% by construction). Never tune one to beat the current policy; re-baseline
+  after ANY sim-fidelity change.
+- TWO POOLS, scored separately. `BASELINE_POOL` is the frozen four every number
+  in `docs/rl-training.md` §1 was measured against - do not touch them, ever.
+  `PUNISHER_POOL` (`punisher`, `controlplus`) READS where the policy places and
+  exploits it; it exists to make placement matter to the win rate. Numbers
+  against one pool mean nothing against the other. `--opponent baseline` /
+  `punishers` on both CLIs; see `docs/punisher-opponents.md`.
+- Opponent decks: `--structured-decks` gives the OPPONENT a role-structured
+  deck (tank / 2 spells / building / mini tank / swarm / air defense). It is
+  opponent-only and opt-in precisely so the frozen four keep seeing their
+  recorded episodes. It also makes a bot that cannot use spells WORSE, since
+  two of its eight cards become dead weight.
+- Spell value is measured in ELIXIR, never in bodies. A swarm card is several
+  bodies for one payment, so a body count reads 3 Goblins (2 elixir) as a
+  bigger prize than a Musketeer (4). Getting this wrong cost 11pp and made a
+  spell-casting bot worse than the same bot with spells disabled.
 
-- Match Python 3.10+ idioms; use type hints on public functions.
-- Naming: PascalCase for classes; snake_case for functions and variables.
-- Keep the `ClashEnv` API and the observation / action schemas stable unless
-  deliberately changing them — recorded JSONL and policies depend on them. Call
-  out any schema or shape change explicitly.
-- Separate concerns: capture/vision, game-state modeling, env/reward, and policy
-  should stay decoupled; don't let them bleed into each other.
-- Fail loud, not silent: raise specific, descriptive exceptions rather than
-  swallowing errors or quietly degrading. Messages should say what failed and
-  what was expected. Tesseract (the match timer) and the elixir reference
-  crops are hard requirements, not an exception to this rule.
+### RL
+- Read `docs/rl-training.md` first. Condensed: ~50% overall vs 31% random; conv
+  and mlp are TIED, so the ceiling isn't architectural; the slot head is frozen
+  too, which points at the LEARNING SIGNAL. Darwin's bar is 60-70%.
+- Masks are STORED with the rollout, not rebuilt at update time. Masked logits
+  use a large FINITE negative, not `-inf`. Entropy sums heads UNWEIGHTED and is
+  logged PER HEAD - the sum hides which head is exploring.
+- Do NOT read high tile entropy as "the head learned nothing"; the benchmark is
+  deterministic. Measure the argmax distribution and the logit margin.
+- SAMPLE SIZE has burned this project three times, always the same direction.
+  Never quote a comparison below n=200/opponent; `--eval-every` defaults to 16
+  and is a progress indicator, not a result.
 
-### Conciseness & Scope
+## Commands
 
-- Write the simplest thing that solves the actual requirement (YAGNI) — don't
-  build for hypothetical future needs.
-- Solve the problem in front of you, not every edge case you can imagine. Handle
-  real, known cases; fail clearly on the rest.
-- Don't add config options, layers, or generality "just in case."
-- Fewer moving parts is better. Reach for a new abstraction only when real
-  duplication or complexity justifies it.
-- When responding in terminal, brevity and conciseness is important if followups are needed for further clarification they will be asked
+```
+python -m src.main [--debug] [--record logs/x.jsonl --episodes N]
+python -m src.main --record-human demos/x.jsonl --episodes N
+python -m src.main --calibrate [viewport|hand|towers|timer|crowns|elixir]
+python -m src.main --derive-classes            # regenerate the class manifest
+python -m src.sim.run --watch [--policy models/run3.pt] [--opponent all]
+python -m src.rl.train --total-steps 2000000 --out models/ppo.pt [--arch mlp]
+python -m src.rl.train --eval-only models/ppo.pt --eval-episodes 200
+python -m src.sim.run --episodes 400 --opponent baseline|punishers
+python -m src.rl.diagnose placement --episodes 200   # is placement worth anything?
+python -m src.rl.diagnose tiles models/run3.pt       # argmax spread + logit margin
+pytest
+```
 
-## Machine Learning Notes
+Setup: venv + `pip install -r requirements.txt`; `.env.example` -> `.env` with
+the Roboflow `API_KEY`. PyTorch: cu128 build (RTX 4070) at the version
+torchvision pins.
 
-- Make runs reproducible: seed RNGs and log the config used for a run.
-- Observation and reward changes ripple into recorded data and trained policies
-  — note when shapes or semantics change so old runs/policies aren't silently
-  misread.
+## Conventions
 
-## Git & Commits
-
-- One logical change per commit; don't bundle unrelated edits.
-- Never commit `.env` / secrets, `logs/` recordings, downloaded model files, or
-  the `.venv`.
-
-## Always / Never
-
-- ALWAYS keep the env API and observation/action schemas consistent unless the
-  task is explicitly to change them — and announce schema changes.
-- ALWAYS ask before adding a new dependency.
-- Prefer improving the rough existing code over preserving it, but keep changes
-  scoped and explain them first.
-- When unsure between two designs, lay out both and let me choose.
-- NEVER hardcode per-machine pixel values outside the marked `CALIBRATE` spots.
-- NEVER commit secrets, recordings, model files, or the venv.
+- Python 3.10+ idioms, type hints on public functions. PascalCase classes,
+  snake_case functions and variables. Seed RNGs and log each run's config.
+- Keep capture/vision, game-state, env/reward and policy decoupled.
+- YAGNI - simplest thing that solves the actual requirement; no options or
+  abstractions "just in case". Handle real cases, fail clearly on the rest.
+- One logical change per commit. NEVER commit `.env`, `logs/` recordings, model
+  files, or `.venv`.

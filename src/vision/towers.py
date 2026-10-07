@@ -81,12 +81,12 @@ from .hud import crop_region
 # 0.000, while a king at 1000/2532 read 0.374 against an expected 0.395 - a
 # residual inside the ~2%-per-pixel resolution, not a calibration error.
 TOWER_BAR_REGIONS: dict[str, tuple[float, float, float, float]] = {
-    "enemy_king":  (0.4483, 0.0277, 0.1494, 0.0194),
-    "enemy_left":  (0.2036, 0.1470, 0.1100, 0.0092),
-    "enemy_right":  (0.7258, 0.1460, 0.1100, 0.0102),
-    "friendly_king":  (0.4483, 0.7505, 0.1494, 0.0176),
-    "friendly_left":  (0.2036, 0.6174, 0.1117, 0.0129),
-    "friendly_right":  (0.7258, 0.6174, 0.1100, 0.0129),
+    "enemy_king":  (0.4486, 0.0296, 0.1524, 0.0114),
+    "enemy_left":  (0.2003, 0.1430, 0.1130, 0.0105),
+    "enemy_right":  (0.7295, 0.1430, 0.1147, 0.0114),
+    "friendly_king":  (0.4486, 0.7531, 0.1524, 0.0143),
+    "friendly_left":  (0.2003, 0.6187, 0.1147, 0.0114),
+    "friendly_right":  (0.7312, 0.6177, 0.1130, 0.0133),
 }
 
 # Hue ranges (OpenCV 0-179) of the two sides' bar fill, measured on real

@@ -6,9 +6,18 @@ Two layered signals:
    is checked first and short-circuits: it costs microseconds, whereas
    the template sweep below is four full-frame passes.
 2. Template matching against PNGs in ``src/assets/templates/``
-   (battle button, OK button, victory/defeat banners), for the frames
-   where the elixir bar is absent. Banner colors are the fallback when
-   no template hits.
+   (battle button, OK button, victory/defeat labels), for the frames
+   where the elixir bar is absent. Crown-row cushion colour is the
+   fallback when no template hits.
+
+Win/loss is decided by COLOUR, not by which template scored higher.
+``victory.png`` and ``defeat.png`` are the same word - "Winner!" - drawn
+over whichever side won, cyan over the friendly row and pink over the
+enemy one. ``matchTemplate`` keys on shape, so each template scores high
+on the other's label (measured 0.897 vs 0.750 on a real victory screen,
+a 0.147 gap around a 0.80 threshold) and the scores alone are close to a
+coin flip. The matched label's colour is not close: 45% cyan / 0% pink
+on that same frame, exactly inverted on a defeat.
 
 Per-machine coordinates and thresholds are module-level constants
 marked ``CALIBRATE``.
@@ -31,6 +40,9 @@ import cv2
 import numpy as np
 import pyautogui
 
+from .crowns import CROWN_ROW_REGIONS, MIN_CUSHION_FRAC, cushion_fraction
+from .hud import crop_region
+
 
 # ----- lifecycle states -----
 
@@ -40,9 +52,6 @@ STATE_POSTMATCH = "POSTMATCH"
 
 # ----- calibration -----
 
-# (x_frac, y_frac) pixel sampled for the postmatch banner color. CALIBRATE.
-VICTORY_BANNER_SAMPLE = (0.50, 0.20)
-
 # In-match detection: fraction of magenta pixels inside the left part of
 # the elixir bar. A patch is far more robust than a single pixel - the
 # bar is thin and crossed by white segment ticks. (x0, y0, x1, y1)
@@ -50,10 +59,11 @@ VICTORY_BANNER_SAMPLE = (0.50, 0.20)
 ELIXIR_BAR_PATCH = (0.20, 0.955, 0.40, 0.978)
 ELIXIR_MAGENTA_MIN_FRAC = 0.10
 
-# Reference colors in BGR; tolerance is per-channel L1 distance.
-COLOR_VICTORY_GOLD = (60, 200, 235)
-COLOR_DEFEAT_BLUE = (200, 110, 60)
-COLOR_TOLERANCE = 60
+# Share of the matched "Winner!" label that must carry one side's colour
+# for that colour to decide the outcome. Measured 0.45 for the winning
+# side against 0.00 for the other, so this sits far clear of both. Below
+# it the label is still animating in and the template scores decide.
+WINNER_LABEL_MIN_FRAC = 0.10
 
 # Fallback click targets when template matching fails (fractions of
 # monitor). CALIBRATE.
@@ -87,50 +97,54 @@ TEMPLATE_MATCH_THRESHOLD = 0.80
 # guessed at from the state alone.
 PATH_ELIXIR_GATE = "elixir_gate"        # magenta fraction cleared the gate
 PATH_TEMPLATE_SWEEP = "template_sweep"  # a template scored over threshold
-PATH_BANNER_COLOR = "banner_color"      # colour fallback matched a banner
+PATH_CUSHION_COLOR = "cushion_color"    # both crown rows showed their cushion
 PATH_HYSTERESIS = "hysteresis"          # no signal; previous state kept
 PATH_DEFAULT_MENU = "default_menu"      # no signal and no state to keep
 
 
-def _color_distance(a, b) -> float:
-    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1])) + abs(int(a[2]) - int(b[2]))
-
-
 @dataclass(frozen=True)
-class BannerSample:
-    """The postmatch banner pixel and its distance to each reference colour.
+class WinnerLabel:
+    """Colour evidence read where the "Winner!" template matched.
 
-    Both the state fallback and the win/loss readout are decided purely
-    from these two distances, so sampling once and passing this around
-    replaces two independent re-samples of the same pixel and makes the
-    numbers recordable.
+    Both postmatch templates are the same glyphs in different colours, so
+    their scores barely separate a win from a loss while their colours
+    separate it completely. The label's position comes free from the
+    template match, which is why this needs no calibrated coordinate of
+    its own - unlike the fixed banner pixel it replaces, which sampled
+    the enemy crown cushion and never matched either reference colour.
     """
 
-    bgr: tuple[int, int, int]
-    dist_victory: float
-    dist_defeat: float
+    cyan_frac: float
+    pink_frac: float
 
     @classmethod
-    def at(cls, frame: np.ndarray, frac_xy: tuple[float, float]) -> "BannerSample":
-        px = _sample_pixel(frame, frac_xy)
+    def at(
+        cls,
+        frame: np.ndarray,
+        centre_frac: tuple[float, float],
+        size_hw: tuple[int, int],
+    ) -> "WinnerLabel":
+        h, w = frame.shape[:2]
+        th, tw = size_hw
+        cx, cy = int(centre_frac[0] * w), int(centre_frac[1] * h)
+        y0, y1 = max(0, cy - th // 2), min(h, cy + th // 2)
+        x0, x1 = max(0, cx - tw // 2), min(w, cx + tw // 2)
+        patch = frame[y0:y1, x0:x1]
+        if patch.size == 0:
+            return cls(0.0, 0.0)
+        b = patch[..., 0].astype(int)
+        g = patch[..., 1].astype(int)
+        r = patch[..., 2].astype(int)
         return cls(
-            bgr=(int(px[0]), int(px[1]), int(px[2])),
-            dist_victory=_color_distance(px, COLOR_VICTORY_GOLD),
-            dist_defeat=_color_distance(px, COLOR_DEFEAT_BLUE),
-        )
-
-    def matches_a_banner(self) -> bool:
-        return (
-            self.dist_victory <= COLOR_TOLERANCE
-            or self.dist_defeat <= COLOR_TOLERANCE
+            cyan_frac=float(((g > 120) & (b > 120) & (r < g - 40)).mean()),
+            pink_frac=float(((b > 120) & (r > 120) & (g < r - 40)).mean()),
         )
 
     def result(self) -> str | None:
-        if self.dist_victory <= COLOR_TOLERANCE:
-            return "win"
-        if self.dist_defeat <= COLOR_TOLERANCE:
-            return "loss"
-        return None
+        """"win" / "loss", or None while the label is still animating in."""
+        if max(self.cyan_frac, self.pink_frac) < WINNER_LABEL_MIN_FRAC:
+            return None
+        return "win" if self.cyan_frac > self.pink_frac else "loss"
 
 
 @dataclass
@@ -147,14 +161,7 @@ class LifecycleSignals:
     path: str = PATH_HYSTERESIS
     elixir_magenta_frac: float = 0.0
     elixir_bar_visible: bool = False
-    banner: BannerSample | None = None
-
-
-def _sample_pixel(frame: np.ndarray, frac_xy) -> np.ndarray:
-    h, w = frame.shape[:2]
-    x = int(np.clip(frac_xy[0] * w, 0, w - 1))
-    y = int(np.clip(frac_xy[1] * h, 0, h - 1))
-    return frame[y, x]
+    winner_label: WinnerLabel | None = None
 
 
 class MatchLifecycle:
@@ -218,20 +225,33 @@ class MatchLifecycle:
                 elixir_bar_visible=True,
             )
 
-        hits = {k: self._locate_template(frame, k)[0] for k in TEMPLATE_FILES}
+        located = {k: self._locate_template(frame, k) for k in TEMPLATE_FILES}
+        hits = {k: score for k, (score, _loc) in located.items()}
 
         victory_hit = hits["victory"] >= TEMPLATE_MATCH_THRESHOLD
         defeat_hit = hits["defeat"] >= TEMPLATE_MATCH_THRESHOLD
         ok_hit = hits["ok_button"] >= TEMPLATE_MATCH_THRESHOLD
         battle_hit = hits["battle_button"] >= TEMPLATE_MATCH_THRESHOLD
 
+        # Which template scored higher only says where the label is; the two
+        # match the same glyphs, so both land on the same spot either way.
+        # The colour there is what says whose label it is.
+        best = "victory" if hits["victory"] >= hits["defeat"] else "defeat"
         result: str | None = None
-        if victory_hit:
-            result = "win"
-        elif defeat_hit:
-            result = "loss"
+        label: WinnerLabel | None = None
+        if victory_hit or defeat_hit:
+            loc = located[best][1]
+            if loc is not None:
+                label = WinnerLabel.at(
+                    frame, loc, self._templates[best].shape[:2]
+                )
+                result = label.result()
+            # No decisive colour means the label is mid-animation. Fall back
+            # to the higher score - a comparison, never if/elif priority,
+            # which used to hand every double hit to "win".
+            if result is None:
+                result = "win" if best == "victory" else "loss"
 
-        banner: BannerSample | None = None
         if victory_hit or defeat_hit or ok_hit:
             state = STATE_POSTMATCH
             path = PATH_TEMPLATE_SWEEP
@@ -239,9 +259,7 @@ class MatchLifecycle:
             state = STATE_MENU
             path = PATH_TEMPLATE_SWEEP
         else:
-            state, path, banner = self._color_based_state(frame)
-            if state == STATE_POSTMATCH and banner is not None:
-                result = result or banner.result()
+            state, path = self._color_based_state(frame)
 
         self._last_state = state
         return LifecycleSignals(
@@ -251,28 +269,46 @@ class MatchLifecycle:
             path=path,
             elixir_magenta_frac=magenta_frac,
             elixir_bar_visible=bar_visible,
-            banner=banner,
+            winner_label=label,
         )
 
-    def _color_based_state(
-        self, frame: np.ndarray
-    ) -> tuple[str, str, BannerSample | None]:
-        """State from banner colour alone, plus the verdict path and the
-        banner sample it was read from (None when no pixel was sampled)."""
+    def _color_based_state(self, frame: np.ndarray) -> tuple[str, str]:
+        """State from colour alone, plus the verdict path, for frames where
+        no template hit."""
         if frame is None or frame.size == 0:
-            return self._last_state, PATH_HYSTERESIS, None
+            return self._last_state, PATH_HYSTERESIS
         if self._elixir_bar_visible(frame)[0]:
-            return STATE_IN_MATCH, PATH_ELIXIR_GATE, None
-
-        banner = BannerSample.at(frame, VICTORY_BANNER_SAMPLE)
-        if banner.matches_a_banner():
-            return STATE_POSTMATCH, PATH_BANNER_COLOR, banner
+            return STATE_IN_MATCH, PATH_ELIXIR_GATE
+        if self._postmatch_by_cushion(frame):
+            return STATE_POSTMATCH, PATH_CUSHION_COLOR
 
         # Bias toward keeping the previous state instead of bouncing to MENU
         # on a single noisy frame.
         if self._last_state == STATE_IN_MATCH:
-            return STATE_IN_MATCH, PATH_HYSTERESIS, banner
-        return STATE_MENU, PATH_DEFAULT_MENU, banner
+            return STATE_IN_MATCH, PATH_HYSTERESIS
+        return STATE_MENU, PATH_DEFAULT_MENU
+
+    @staticmethod
+    def _postmatch_by_cushion(frame: np.ndarray) -> bool:
+        """True when both crown rows show their own side's cushion colour.
+
+        This replaced a single gold/blue banner pixel that could not detect
+        a postmatch screen at all: on a real victory frame it sampled the
+        enemy crown cushion, 251 away from its victory reference against a
+        tolerance of 60. The crown rows are already calibrated and already
+        validated for exactly this question by ``PostMatchCrownReader``, so
+        the fallback reuses them rather than carrying a second, unchecked
+        coordinate. Measured 53% / 36% cushion on a real postmatch screen
+        against 0.8% on an in-match one.
+        """
+        return all(
+            cushion_fraction(
+                crop_region(frame, region, f"CROWN_ROW_REGIONS[{side!r}]"),
+                side,
+            )
+            >= MIN_CUSHION_FRAC
+            for side, region in CROWN_ROW_REGIONS.items()
+        )
 
     @staticmethod
     def _elixir_bar_visible(frame: np.ndarray) -> tuple[bool, float]:

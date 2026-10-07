@@ -35,6 +35,7 @@ from ..env.environment import (
     ClashEnv,
     act_record,
     default_reward,
+    diag_record,
     obs_record,
     open_record_jsonl,
     write_record,
@@ -227,6 +228,11 @@ def _write_obs(
             source="human",
         ),
     )
+    # Same diagnostics line ``ClashEnv.step`` writes. Human demos went
+    # without it, which is why the first session's three mislabelled
+    # outcomes had to be diagnosed from a screenshot instead of from the
+    # template scores on the frames that actually decided them.
+    write_record(out, diag_record(t=env.frame_time, step=step, signals=signals))
 
 
 def _record_episode(env: ClashEnv, watcher: MouseWatcher, out) -> None:
@@ -272,10 +278,13 @@ def _record_episode(env: ClashEnv, watcher: MouseWatcher, out) -> None:
         obs, signals = env.observe()
         done = env.resolve_done(signals)
 
+        # Terminal term on the closing step only, from the result the env
+        # adopted rather than this frame's signals — the outcome is often
+        # read a frame or two into the postmatch settle window.
         reward = default_reward(
             prev_tower_hp,
             env.state,
-            signals.result,
+            env.state.match_result if done else None,
             ActionResult(success=True, reason="human"),
         )
 

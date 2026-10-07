@@ -14,7 +14,15 @@ import logging
 
 import numpy as np
 
-from .cards import Card, Troop, normalize_name
+from .cards import Card, Troop, is_spell
+from .classes import (
+    ARENA_CLASSES,
+    ARENA_INDEX,
+    CARD_CLASSES,
+    CARD_INDEX,
+    IGNORED_ARENA_CLASSES,
+    normalize_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -24,51 +32,96 @@ HAND_SIZE = 4
 
 FRIENDLY_HALF_START_ROW = 8
 
-# These MUST match the detector's class names once the blue/red/card prefix
-# is stripped and ``normalize_name`` is applied, or the troop is silently
-# dropped from the arena tensor. Taken from ``troop-counter/8``'s own class
-# list rather than written by hand: the model says "minion", not "minions",
-# and four plural entries here (archers/goblins/minions/speargoblins) were
-# dead channels that never matched anything while the corresponding troops
-# vanished from every observation.
-#
-# The model ALSO emits "king tower" and "princess tower" as arena objects.
-# They are deliberately excluded, for a reason that is not obvious from the
-# class list: TOWER SKINS change how towers look, so those two classes detect
-# unreliably and cannot be trusted. That also rules out the tempting idea of
-# using a princess tower vanishing from detections as a positive
-# destruction signal - it would inherit the same unreliability. Tower state
-# comes from the HP bar instead (``src/vision/towers.py``), and the towers
-# are static anyway, so channels for them would add 4 x 144 values of no new
-# information. See ``_IGNORED_ARENA_CLASSES``.
-TROOP_CLASSES: tuple[str, ...] = (
-    "goblin",
-    "speargoblin",
-    "arrows",
-    "archer",
-    "minion",
-    "knight",
-    "goblinhut",
-    "goblincage",
-    "goblinbrawler",
-    "musketeer",
-    "fireball",
-    "minipekka",
-    "giant",
-)
+#: The row immediately across the river from the placer's own half. The river
+#: straddles the boundary between rows 7 and 8 (``arena.RIVER_Y`` 8.0, half
+#: width 0.5), so row 7 is riverbank on the far side and never takes ground
+#: troops. Expressed in the PLACER's frame, so it mirrors for the enemy.
+RIVER_ROW = FRIENDLY_HALF_START_ROW - 1
 
-# Detector arena classes that are real but intentionally not observation
-# channels. Listed explicitly so they do not trip the unknown-troop warning:
-# an unknown name is a bug, these are a decision.
-_IGNORED_ARENA_CLASSES: frozenset[str] = frozenset({"kingtower", "princesstower"})
+#: Which TILE each tower stands on, in the PLACER's frame, keyed by
+#: ``state.TOWER_KEYS``. Lives here rather than in ``sim/arena.py`` because
+#: both backends need it and a policy cannot import the simulator: the arena
+#: geometry is the same whether the state came from vision or from the sim.
+#:
+#: ``sim/arena.py`` holds the same towers as CONTINUOUS positions for combat
+#: and asserts these tiles agree with ``int()`` of them, so the two cannot
+#: drift. ``int()`` is deliberate - it is the same truncation ``sim/env.py``
+#: uses to bin units into the arena tensor, and a second rounding rule is
+#: exactly the kind of duplicate that drifted in the placement predicate.
+#:
+#: The kings sit at x=4.5, so truncation puts them in column 4 and they read
+#: one tile left of centre. Kept for consistency with how units are binned
+#: rather than special-cased.
+TOWER_TILES: dict[str, tuple[int, int]] = {
+    "friendly_left": (13, 2),
+    "friendly_right": (13, 7),
+    "friendly_king": (14, 4),
+    "enemy_left": (3, 2),
+    "enemy_right": (3, 7),
+    "enemy_king": (1, 4),
+}
+
+
+def placement_allowed(
+    tile_x: int,
+    tile_y: int,
+    *,
+    left_lane_open: bool = False,
+    right_lane_open: bool = False,
+    spell: bool = False,
+) -> bool:
+    """THE placement rule, in the placer's own frame. One implementation.
+
+    Coordinates are the placer's: own half is rows 8-15, the enemy is rows
+    0-7. The simulator mirrors the enemy's tiles into this frame rather than
+    keeping a second copy of the rule - two implementations drifted once
+    already and cost a training run (see below).
+
+    Troop rule: own half, plus the far quadrant behind a destroyed enemy
+    princess tower. ``RIVER_ROW`` never takes ground troops.
+
+    SPELL rule: anywhere in the arena. A spell whose only legal targets were
+    on your own half could never hit an enemy tower, which made Fireball and
+    Arrows strictly dead cards.
+
+    NOT a rule, deliberately: an activated enemy king tower does NOT unlock
+    the enemy half. ``GameBoard.is_placeable`` used to grant that, the
+    simulator never did, and the observation's mask therefore opened the
+    whole enemy half as soon as the enemy king took ~2% chip damage. The
+    policy aimed at tiles the env then refused - 60% of run1's placement
+    attempts, all of them retried on the same tile every step because
+    evaluation is deterministic. In the real game, deployment territory
+    expands only when a princess tower is DESTROYED; king activation makes
+    it shoot and grants no ground.
+    """
+    if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
+        return False
+    if spell:
+        return True
+    if tile_y == RIVER_ROW:
+        return False
+    if tile_y >= FRIENDLY_HALF_START_ROW:
+        return True
+
+    # The centre column belongs to neither lane, so it stays shut until a
+    # tower on one side or the other actually falls.
+    midline = ARENA_COLS // 2
+    if tile_x < midline and left_lane_open:
+        return True
+    if tile_x > midline and right_lane_open:
+        return True
+    return False
+
+
+# The arena and the hand use SEPARATE class lists, both generated from the
+# detector - see ``classes.py`` for why they are not one list. Briefly:
+# Goblin Brawler is an arena unit with no card, so a shared list gives the
+# hand a channel that can never fire, and every spawn-only unit added later
+# would do the same.
 
 # Unencodable troop names already reported, so the warning fires once per
 # distinct name instead of once per tile per frame.
 _warned_unknown_troops: set[str] = set()
-
-_TROOP_INDEX: dict[str, int] = {
-    normalize_name(n): i for i, n in enumerate(TROOP_CLASSES)
-}
 
 
 class GameBoard:
@@ -122,37 +175,33 @@ class GameBoard:
         tile_y: int,
         enemy_left_tower_alive: bool = True,
         enemy_right_tower_alive: bool = True,
-        enemy_king_active: bool = False,
+        spell: bool = False,
     ) -> bool:
-        """Whether the friendly side may place a regular ground troop here.
+        """Whether the friendly side may place this card here.
 
-        Default rule: rows 8-15 (friendly half). When an enemy princess
-        tower falls, the corresponding top quadrant unlocks. Activating
-        the enemy king tower unlocks the full enemy half. Bridge row 7 is
-        never placeable for ground units.
+        Thin wrapper over :func:`placement_allowed` - see it for the rule.
+        This signature stays in the vision pipeline's terms (which enemy
+        towers are still standing) and converts to open lanes.
         """
-        if not (0 <= tile_x < ARENA_COLS and 0 <= tile_y < ARENA_ROWS):
-            return False
-        if tile_y == 7:
-            return False
-        if tile_y >= FRIENDLY_HALF_START_ROW:
-            return True
-        if enemy_king_active:
-            return True
-
-        midline = ARENA_COLS // 2
-        if tile_x < midline and not enemy_left_tower_alive:
-            return True
-        if tile_x > midline and not enemy_right_tower_alive:
-            return True
-        return False
+        return placement_allowed(
+            tile_x,
+            tile_y,
+            left_lane_open=not enemy_left_tower_alive,
+            right_lane_open=not enemy_right_tower_alive,
+            spell=spell,
+        )
 
     def get_placeable_mask(
         self,
         enemy_left_tower_alive: bool = True,
         enemy_right_tower_alive: bool = True,
-        enemy_king_active: bool = False,
+        spell: bool = False,
     ) -> np.ndarray:
+        """Tile mask for TROOPS by default; ``spell=True`` gives the whole
+        arena. The observation carries the troop mask plus a per-slot
+        ``hand_is_spell`` flag rather than four full masks - the only
+        card-dependent rule is spell-vs-troop, so 4 floats say everything
+        that 4x144 would."""
         mask = np.zeros((ARENA_ROWS, ARENA_COLS), dtype=np.uint8)
         for y in range(ARENA_ROWS):
             for x in range(ARENA_COLS):
@@ -161,7 +210,7 @@ class GameBoard:
                     y,
                     enemy_left_tower_alive,
                     enemy_right_tower_alive,
-                    enemy_king_active,
+                    spell=spell,
                 ):
                     mask[y, x] = 1
         return mask
@@ -239,19 +288,19 @@ class GameBoard:
     def to_tensor(self) -> np.ndarray:
         """One-hot encode the arena as ``(ARENA_ROWS, ARENA_COLS, channels)``.
 
-        Channels = ``len(TROOP_CLASSES) * 2`` (blue/friendly first half,
+        Channels = ``len(ARENA_CLASSES) * 2`` (blue/friendly first half,
         red/enemy second half).
 
-        A troop whose name is not in ``TROOP_CLASSES`` cannot be encoded, so
+        A troop whose name is not in ``ARENA_CLASSES`` cannot be encoded, so
         it is omitted - but it is WARNED about once per distinct name, not
         dropped quietly. Silence here hid a real bug: the detector emits
-        singular names ("minion") while this tuple held plurals ("minions"),
-        so four of the most common units never appeared in any observation
-        while the arena - 3744 of the 3963 values in the flattened vector -
-        looked merely empty. Classes in ``_IGNORED_ARENA_CLASSES`` are
-        excluded from the warning because omitting them is a decision.
+        singular names ("minion") while the hand-written list held plurals
+        ("minions"), so four of the most common units never appeared in any
+        observation while the arena - the large majority of the flattened
+        vector - looked merely empty. Classes in ``IGNORED_ARENA_CLASSES``
+        are excluded from the warning because omitting them is a decision.
         """
-        n_classes = len(TROOP_CLASSES)
+        n_classes = len(ARENA_CLASSES)
         tensor = np.zeros((ARENA_ROWS, ARENA_COLS, n_classes * 2), dtype=np.float32)
         for y in range(ARENA_ROWS):
             for x in range(ARENA_COLS):
@@ -259,7 +308,7 @@ class GameBoard:
                 if troop is None:
                     continue
                 key = normalize_name(troop.name)
-                idx = _TROOP_INDEX.get(key)
+                idx = ARENA_INDEX.get(key)
                 if idx is None:
                     self._warn_unknown_troop(troop.name, key)
                     continue
@@ -270,26 +319,44 @@ class GameBoard:
     @staticmethod
     def _warn_unknown_troop(name: str, key: str) -> None:
         """Warn once per distinct unencodable troop name."""
-        if key in _IGNORED_ARENA_CLASSES or key in _warned_unknown_troops:
+        if key in IGNORED_ARENA_CLASSES or key in _warned_unknown_troops:
             return
         _warned_unknown_troops.add(key)
         logger.warning(
-            "Troop '%s' (normalized '%s') is not in TROOP_CLASSES - it is "
-            "being LEFT OUT of the arena observation entirely. The detector "
-            "and TROOP_CLASSES disagree; fix the name list.",
+            "Troop '%s' (normalized '%s') is not in ARENA_CLASSES - it is "
+            "being LEFT OUT of the arena observation entirely. The class "
+            "manifest and the detector disagree; regenerate with "
+            "`python -m src.main --derive-classes`.",
             name,
             key,
         )
 
     def hand_to_tensor(self) -> np.ndarray:
-        """One-hot encode the hand as ``(HAND_SIZE, len(TROOP_CLASSES))``."""
-        out = np.zeros((HAND_SIZE, len(TROOP_CLASSES)), dtype=np.float32)
+        """One-hot encode the hand as ``(HAND_SIZE, len(CARD_CLASSES))``.
+
+        Keyed on CARD_CLASSES, not the arena list: a card that cannot be
+        held (Goblin Brawler, and every spawn-only unit after it) has no
+        slot here at all.
+        """
+        out = np.zeros((HAND_SIZE, len(CARD_CLASSES)), dtype=np.float32)
         for slot, card in enumerate(self.cards_in_hand):
             if card is None:
                 continue
-            idx = _TROOP_INDEX.get(normalize_name(card.name))
+            idx = CARD_INDEX.get(normalize_name(card.name))
             if idx is not None:
                 out[slot, idx] = 1.0
+        return out
+
+    def hand_is_spell(self) -> np.ndarray:
+        """1.0 for each hand slot holding a spell, else 0.0.
+
+        This is what tells a policy that ``playable_mask`` does not apply to
+        that slot - a spell may be cast on any tile.
+        """
+        out = np.zeros((HAND_SIZE,), dtype=np.float32)
+        for i, card in enumerate(self.cards_in_hand):
+            if card is not None and is_spell(card.name):
+                out[i] = 1.0
         return out
 
     def hand_costs(self) -> np.ndarray:
